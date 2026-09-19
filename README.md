@@ -5,6 +5,7 @@
 [![CI][ci-badge]][ci-url]
 [![MSRV][msrv-badge]][msrv-url]
 [![License][license-badge]][license-url]
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Foxia-db%2Foxia-client-rust.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Foxia-db%2Foxia-client-rust?ref=badge_shield)
 
 [crates-badge]: https://img.shields.io/crates/v/oxia-client.svg
 [crates-url]: https://crates.io/crates/oxia-client
@@ -117,3 +118,6 @@ issue, see [SECURITY.md](./SECURITY.md).
 ## License
 
 Licensed under the [Apache License 2.0](./LICENSE).
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Foxia-db%2Foxia-client-rust.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Foxia-db%2Foxia-client-rust?ref=badge_large)
