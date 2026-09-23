@@ -18,7 +18,7 @@ use crate::retry::{retry_delay, retry_until};
 use crate::sequence_updates_manager::SequenceUpdatesManager;
 use crate::server_error::{DecodedStatus, LeaderHint, decode_status};
 use crate::session_manager::SessionManager;
-use crate::shard_manager::{ShardManager, ShardManagerOptions};
+use crate::shard_manager::{ShardManager, ShardManagerOptions, ShardRange};
 use crate::streams::{
     ListStream, Notifications, RangeScanStream, SequenceUpdates, ShardStream, merged,
 };
@@ -27,6 +27,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::future::try_join_all;
+use futures::stream::FuturesUnordered;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -653,7 +655,9 @@ impl OxiaClient {
 
     /// Retries `op` while it fails with `ShardMoved` — for whole-operation
     /// re-routing (broadcasts) where a single failing shard means the shard set
-    /// changed and the operation must be re-issued against the new set.
+    /// changed and the operation must be re-issued against the new set. Only
+    /// for reads: re-issuing a write applies it again on the shards that
+    /// already applied it.
     pub(crate) async fn with_reroute_retry<T, F, Fut>(&self, op: F) -> Result<T, OxiaError>
     where
         F: FnMut() -> Fut,
@@ -1046,34 +1050,81 @@ impl OxiaClient {
         }
     }
 
-    /// Broadcasts a delete-range to every shard, re-issuing against the current
-    /// shard set if one splits or merges mid-flight (idempotent).
+    /// Broadcasts a delete-range to every shard, bounded by the request
+    /// timeout. When a shard splits or merges mid-flight, its copy is re-sent
+    /// only to the shards that took over its hash range: applying a delete
+    /// range twice on a shard is not idempotent, as the second time deletes
+    /// the keys written there since the first.
     pub(crate) async fn broadcast_delete_range(
         &self,
         request: proto::DeleteRangeRequest,
     ) -> Result<(), OxiaError> {
-        self.with_reroute_retry(|| {
+        send_to_every_shard(&self.inner.shard_manager, self.request_timeout(), |shard| {
             let request = request.clone();
             async move {
-                let mut join_set = JoinSet::new();
-                for shard in self.inner.shard_manager.get_shard_ids() {
-                    let client = self.clone();
-                    let request = request.clone();
-                    join_set.spawn(async move {
-                        let response = client
-                            .submit_write(shard, request, WriteOp::DeleteRange)
-                            .await?;
-                        check_status(response.status)
-                    });
-                }
-                while let Some(joined) = join_set.join_next().await {
-                    joined.map_err(|err| OxiaError::Disconnected(err.to_string()))??;
-                }
-                Ok(())
+                let response = self
+                    .submit_write(shard, request, WriteOp::DeleteRange)
+                    .await?;
+                check_status(response.status)
             }
         })
         .await
     }
+}
+
+/// Runs `send` for every shard in the current assignments. Succeeds once every
+/// copy has succeeded; fails with the first error other than
+/// [`OxiaError::ShardMoved`], or with [`OxiaError::Timeout`] once `timeout`
+/// has elapsed.
+///
+/// A copy fails with `ShardMoved` when its shard was split or merged away
+/// before the copy ran. The copy is then sent to that shard's successors, the
+/// shards now owning its hash range, except those that already have a copy in
+/// flight or applied. A successor that is split away in turn gets the same
+/// treatment, by its own range. No other shard is sent a second copy.
+async fn send_to_every_shard<F, Fut>(
+    shard_manager: &ShardManager,
+    timeout: Duration,
+    send: F,
+) -> Result<(), OxiaError>
+where
+    F: Fn(i64) -> Fut,
+    Fut: Future<Output = Result<(), OxiaError>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let send_copy = |range: ShardRange| {
+        let copy = send(range.shard);
+        async move { (range, copy.await) }
+    };
+    let mut copies = FuturesUnordered::new();
+    // The shards with a copy in flight or applied, each covering its range.
+    let mut covered = HashSet::new();
+    for range in shard_manager.get_shard_ranges() {
+        covered.insert(range.shard);
+        copies.push(send_copy(range));
+    }
+    while let Some((range, result)) = tokio::time::timeout_at(deadline, copies.next())
+        .await
+        .map_err(|_| OxiaError::Timeout)?
+    {
+        match result {
+            Ok(()) => {}
+            Err(OxiaError::ShardMoved) => {
+                covered.remove(&range.shard);
+                let successors = shard_manager.get_successors(&range);
+                if successors.is_empty() {
+                    return Err(OxiaError::ShardMoved);
+                }
+                for successor in successors {
+                    if covered.insert(successor.shard) {
+                        copies.push(send_copy(successor));
+                    }
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 fn track(first_err: &mut Option<OxiaError>, result: Result<(), OxiaError>, what: &str) {
@@ -1127,5 +1178,256 @@ pub(crate) fn check_status(status: i32) -> Result<(), OxiaError> {
             "rejected by the server".to_string(),
         )),
         Err(err) => Err(OxiaError::Decode(format!("invalid status code: {err}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio::task::JoinHandle;
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A copy sent by the broadcast: its shard, and the channel the test
+    /// completes it through, as the write batcher would.
+    #[derive(Debug)]
+    struct SentCopy {
+        shard: i64,
+        done: oneshot::Sender<Result<(), OxiaError>>,
+    }
+
+    impl SentCopy {
+        fn complete(self, result: Result<(), OxiaError>) {
+            let _ = self.done.send(result);
+        }
+    }
+
+    /// Runs `send_to_every_shard` in the background, handing every copy it
+    /// sends to the test.
+    fn start_broadcast(
+        shards: Arc<ShardManager>,
+    ) -> (
+        JoinHandle<Result<(), OxiaError>>,
+        UnboundedReceiver<SentCopy>,
+    ) {
+        let (tx, rx) = unbounded_channel();
+        let broadcast = tokio::spawn(async move {
+            send_to_every_shard(&shards, TIMEOUT, |shard| {
+                let (done, result) = oneshot::channel();
+                let _ = tx.send(SentCopy { shard, done });
+                async move {
+                    result.await.unwrap_or_else(|_| {
+                        Err(OxiaError::Disconnected("copy dropped".to_string()))
+                    })
+                }
+            })
+            .await
+        });
+        (broadcast, rx)
+    }
+
+    /// Receives the next `n` copies, ordered by shard.
+    async fn next_copies(copies: &mut UnboundedReceiver<SentCopy>, n: usize) -> Vec<SentCopy> {
+        let mut received = Vec::with_capacity(n);
+        for _ in 0..n {
+            let copy = tokio::time::timeout(Duration::from_secs(1), copies.recv())
+                .await
+                .expect("the broadcast sends a copy")
+                .expect("the broadcast is running");
+            received.push(copy);
+        }
+        received.sort_by_key(|copy| copy.shard);
+        received
+    }
+
+    fn shards_of(copies: &[SentCopy]) -> Vec<i64> {
+        copies.iter().map(|copy| copy.shard).collect()
+    }
+
+    async fn assert_pending(broadcast: &mut JoinHandle<Result<(), OxiaError>>) {
+        let waited = tokio::time::timeout(Duration::from_millis(100), broadcast).await;
+        assert!(waited.is_err(), "the broadcast must still be waiting");
+    }
+
+    /// Waits for the broadcast's result, and checks that it sent no copy the
+    /// test did not receive.
+    async fn finish(
+        broadcast: JoinHandle<Result<(), OxiaError>>,
+        mut copies: UnboundedReceiver<SentCopy>,
+    ) -> Result<(), OxiaError> {
+        let result = tokio::time::timeout(2 * TIMEOUT, broadcast).await;
+        let unexpected: Vec<i64> = std::iter::from_fn(|| copies.try_recv().ok())
+            .map(|copy| copy.shard)
+            .collect();
+        assert!(unexpected.is_empty(), "unexpected copies to {unexpected:?}");
+        result
+            .expect("the broadcast completes")
+            .expect("the broadcast does not panic")
+    }
+
+    /// Shard 0 is split into shards 2 and 3 before its copy runs: the copy is
+    /// re-sent to the two children only, and shard 1, unrelated to the
+    /// split, gets exactly one copy.
+    #[tokio::test(start_paused = true)]
+    async fn split_shard_copy_goes_to_its_children_only() {
+        let shards = ShardManager::detached_for_tests();
+        shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
+        let (broadcast, mut copies) = start_broadcast(shards.clone());
+
+        let [to_0, to_1]: [SentCopy; 2] = next_copies(&mut copies, 2).await.try_into().unwrap();
+        assert_eq!((to_0.shard, to_1.shard), (0, 1));
+        to_1.complete(Ok(()));
+        // The write batcher fails a copy with `ShardMoved` when its shard is
+        // no longer in the assignments.
+        shards.set_assignments_for_tests(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]);
+        to_0.complete(Err(OxiaError::ShardMoved));
+
+        let rerouted = next_copies(&mut copies, 2).await;
+        assert_eq!(shards_of(&rerouted), vec![2, 3]);
+        for copy in rerouted {
+            copy.complete(Ok(()));
+        }
+        finish(broadcast, copies).await.unwrap();
+    }
+
+    /// The broadcast succeeds only once every copy has, the rerouted ones
+    /// included, whatever the order they complete in.
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_waits_for_every_copy() {
+        let shards = ShardManager::detached_for_tests();
+        shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
+        let (mut broadcast, mut copies) = start_broadcast(shards.clone());
+
+        let [to_0, to_1]: [SentCopy; 2] = next_copies(&mut copies, 2).await.try_into().unwrap();
+        shards.set_assignments_for_tests(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]);
+        to_0.complete(Err(OxiaError::ShardMoved));
+        let [to_2, to_3]: [SentCopy; 2] = next_copies(&mut copies, 2).await.try_into().unwrap();
+        assert_eq!((to_2.shard, to_3.shard), (2, 3));
+
+        to_2.complete(Ok(()));
+        assert_pending(&mut broadcast).await;
+        to_1.complete(Ok(()));
+        assert_pending(&mut broadcast).await;
+        to_3.complete(Ok(()));
+        finish(broadcast, copies).await.unwrap();
+    }
+
+    /// Any error but `ShardMoved` fails the broadcast at once, without
+    /// waiting for the copies still in flight.
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_fails_on_the_first_other_error() {
+        let shards = ShardManager::detached_for_tests();
+        shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
+        let (broadcast, mut copies) = start_broadcast(shards.clone());
+
+        let [to_0, to_1]: [SentCopy; 2] = next_copies(&mut copies, 2).await.try_into().unwrap();
+        shards.set_assignments_for_tests(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]);
+        to_0.complete(Err(OxiaError::ShardMoved));
+        let [to_2, to_3]: [SentCopy; 2] = next_copies(&mut copies, 2).await.try_into().unwrap();
+        assert_eq!((to_2.shard, to_3.shard), (2, 3));
+
+        to_3.complete(Err(OxiaError::LeaderNotFound { shard: 3 }));
+        let result = finish(broadcast, copies).await;
+        assert!(
+            matches!(result, Err(OxiaError::LeaderNotFound { shard: 3 })),
+            "got {result:?}"
+        );
+        // The copies to shards 1 and 2 were still in flight.
+        drop((to_1, to_2));
+    }
+
+    /// Shard 3, a child of shard 0, is split in turn before the rerouted copy
+    /// runs: that copy goes to shard 3's own children, by shard 3's range.
+    #[tokio::test(start_paused = true)]
+    async fn nested_split_reroutes_by_the_childs_range() {
+        let shards = ShardManager::detached_for_tests();
+        shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
+        let (mut broadcast, mut copies) = start_broadcast(shards.clone());
+
+        let [to_0, to_1]: [SentCopy; 2] = next_copies(&mut copies, 2).await.try_into().unwrap();
+        to_1.complete(Ok(()));
+        shards.set_assignments_for_tests(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]);
+        to_0.complete(Err(OxiaError::ShardMoved));
+        let [to_2, to_3]: [SentCopy; 2] = next_copies(&mut copies, 2).await.try_into().unwrap();
+        assert_eq!((to_2.shard, to_3.shard), (2, 3));
+
+        shards.set_assignments_for_tests(&[(1, 100, 199), (2, 0, 49), (4, 50, 74), (5, 75, 99)]);
+        to_3.complete(Err(OxiaError::ShardMoved));
+        let rerouted = next_copies(&mut copies, 2).await;
+        assert_eq!(shards_of(&rerouted), vec![4, 5]);
+
+        to_2.complete(Ok(()));
+        let [to_4, to_5]: [SentCopy; 2] = rerouted.try_into().unwrap();
+        to_4.complete(Ok(()));
+        assert_pending(&mut broadcast).await;
+        to_5.complete(Ok(()));
+        finish(broadcast, copies).await.unwrap();
+    }
+
+    /// Assignments listing the children next to the parent they replace
+    /// (published between the coordinator's updates): the parent's copy is
+    /// not re-sent to the children, which have their own.
+    #[tokio::test(start_paused = true)]
+    async fn copy_is_not_resent_to_shards_that_have_one() {
+        let shards = ShardManager::detached_for_tests();
+        shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199), (2, 0, 49), (3, 50, 99)]);
+        let (broadcast, mut copies) = start_broadcast(shards.clone());
+
+        let sent = next_copies(&mut copies, 4).await;
+        assert_eq!(shards_of(&sent), vec![0, 1, 2, 3]);
+        shards.set_assignments_for_tests(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]);
+        for copy in sent {
+            let result = match copy.shard {
+                0 => Err(OxiaError::ShardMoved),
+                _ => Ok(()),
+            };
+            copy.complete(result);
+        }
+        finish(broadcast, copies).await.unwrap();
+    }
+
+    /// A copy whose shard's range has no owner in the assignments cannot be
+    /// rerouted: the broadcast fails with `ShardMoved`.
+    #[tokio::test(start_paused = true)]
+    async fn copy_without_successors_fails_with_shard_moved() {
+        let shards = ShardManager::detached_for_tests();
+        shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
+        let (broadcast, mut copies) = start_broadcast(shards.clone());
+
+        let [to_0, to_1]: [SentCopy; 2] = next_copies(&mut copies, 2).await.try_into().unwrap();
+        to_1.complete(Ok(()));
+        shards.set_assignments_for_tests(&[(1, 100, 199)]);
+        to_0.complete(Err(OxiaError::ShardMoved));
+        let result = finish(broadcast, copies).await;
+        assert!(
+            matches!(result, Err(OxiaError::ShardMoved)),
+            "got {result:?}"
+        );
+    }
+
+    /// The timeout bounds the broadcast as a whole, rerouted copies included.
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_is_bounded_by_the_timeout() {
+        let start = tokio::time::Instant::now();
+        let shards = ShardManager::detached_for_tests();
+        shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
+        let (broadcast, mut copies) = start_broadcast(shards.clone());
+
+        let [to_0, to_1]: [SentCopy; 2] = next_copies(&mut copies, 2).await.try_into().unwrap();
+        to_1.complete(Ok(()));
+        tokio::time::sleep(TIMEOUT / 2).await;
+        shards.set_assignments_for_tests(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]);
+        to_0.complete(Err(OxiaError::ShardMoved));
+        // The rerouted copies never complete.
+        let _rerouted = next_copies(&mut copies, 2).await;
+
+        let result = finish(broadcast, copies).await;
+        assert!(matches!(result, Err(OxiaError::Timeout)), "got {result:?}");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= TIMEOUT && elapsed < TIMEOUT + TIMEOUT / 2,
+            "timed out after {elapsed:?}"
+        );
     }
 }
