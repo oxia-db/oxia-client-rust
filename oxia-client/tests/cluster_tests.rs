@@ -8,7 +8,10 @@
 //! coordinator's admin API — a **live shard split** while a client is
 //! running.
 
-use oxia::{ComparisonType, OxiaClient, OxiaClientBuilder};
+use futures::{StreamExt, TryStreamExt};
+use oxia::{ComparisonType, OxiaClient, OxiaClientBuilder, OxiaError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use testcontainers::core::ports::ContainerPort;
 use testcontainers::core::wait::WaitFor;
@@ -89,8 +92,8 @@ async fn start_cluster(servers: usize, initial_shards: u32) -> Cluster {
 
 impl Cluster {
     /// Splits a shard through the coordinator's admin API, from inside the
-    /// container. The CLI is synchronous: when it returns, the split has
-    /// completed (children elected, parent fenced and deleted).
+    /// container. The CLI returns once the split has started; use
+    /// [`Cluster::wait_until_removed`] to wait for it to complete.
     async fn split_shard(&self, shard: i64) -> String {
         let mut result = self
             .container
@@ -108,6 +111,39 @@ impl Cluster {
             .expect("exec shard split");
         let stdout = result.stdout_to_vec().await.expect("split stdout");
         String::from_utf8_lossy(&stdout).to_string()
+    }
+
+    /// Waits until the coordinator no longer lists `shard` in the namespace
+    /// status: a split parent is deleted once its children have taken over.
+    async fn wait_until_removed(&self, shard: i64) {
+        let entry = format!("\"{shard}\": {{");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut result = self
+                .container
+                .exec(testcontainers::core::ExecCommand::new([
+                    "oxia",
+                    "admin",
+                    "namespace",
+                    "get",
+                    "default",
+                    "--output",
+                    "json",
+                ]))
+                .await
+                .expect("exec namespace get");
+            let stdout = result.stdout_to_vec().await.expect("namespace stdout");
+            let status = String::from_utf8_lossy(&stdout);
+            assert!(status.contains("\"shards\""), "unexpected status: {status}");
+            if !status.contains(&entry) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shard {shard} is still listed: {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -186,7 +222,6 @@ async fn test_multi_node_routing_and_global_order() {
     // interleave the per-shard (per-server) streams into one sorted sequence.
     let listed = client.list("multi/", "multi/~").await.unwrap();
     assert_eq!(listed, keys);
-    use futures::StreamExt;
     let mut scan = client
         .range_scan("multi/", "multi/~")
         .stream()
@@ -263,6 +298,161 @@ async fn test_shard_split_reroutes_live_client() {
     client.put("split/after", "done").await.unwrap();
     let got = client.get("split/after").await.unwrap();
     assert_eq!(got.value.as_deref(), Some(b"done".as_ref()));
+
+    client.close().await.unwrap();
+}
+
+/// A key starting with `prefix` that a two-shard namespace places on its
+/// first shard (`upper == false`) or on its second: the coordinator gives
+/// each half of the hash space to one shard, and a key is routed by the low
+/// 32 bits of its XXH3 hash.
+fn key_in_half(prefix: &str, upper: bool) -> String {
+    (0u32..)
+        .map(|n| format!("{prefix}{n}"))
+        .find(|key| (xxhash_rust::xxh3::xxh3_64(key.as_bytes()) as u32 >= 1 << 31) == upper)
+        .expect("keys land in both halves")
+}
+
+/// One round of `test_delete_range_across_live_split`: a range to delete,
+/// and the keys in it.
+struct Round {
+    start: String,
+    end: String,
+    /// Written before the round: one on shard 0, one on shard 1.
+    before: [String; 2],
+    /// Written on shard 1 during the round, once its copy of the delete range
+    /// has been applied there.
+    late: String,
+}
+
+impl Round {
+    fn new(i: usize) -> Round {
+        let start = format!("dr/{i:05}/");
+        Round {
+            end: format!("{start}~"),
+            before: [
+                key_in_half(&format!("{start}before-"), false),
+                key_in_half(&format!("{start}before-"), true),
+            ],
+            late: key_in_half(&format!("{start}late-"), true),
+            start,
+        }
+    }
+}
+
+async fn is_deleted(client: &OxiaClient, key: &str) -> bool {
+    match client.get(key).await {
+        Ok(_) => false,
+        Err(OxiaError::KeyNotFound) => true,
+        Err(e) => panic!("get {key}: {e}"),
+    }
+}
+
+/// A delete range without a partition key, across a live split of one of
+/// two shards. The split shard's copy goes to its children only: the other
+/// shard applies the delete range once, so a key written there after that,
+/// while the delete range is still pending on the splitting shard, is not
+/// deleted by a second application. The keys written before the delete
+/// range are gone from every shard, the children included.
+#[tokio::test]
+async fn test_delete_range_across_live_split() {
+    const ROUNDS: usize = 1000;
+    let cluster = start_cluster(2, 2).await;
+    let client = connect_with_retry(&cluster.address).await;
+
+    // Write every round's first keys up front: a round must be able to start
+    // while shard 0 takes no writes, as the split completes.
+    let rounds: Arc<Vec<Round>> = Arc::new((0..ROUNDS).map(Round::new).collect());
+    futures::stream::iter(rounds.iter().flat_map(|round| &round.before))
+        .map(|key| client.put(key.clone(), "before").into_future())
+        .buffer_unordered(64)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // Writes to shard 0 without pause, so that a write reaches the parent
+    // while it rejects writes as the split completes. The write batcher then
+    // holds the shard's writes back for its retry backoff, the copy of the
+    // delete range in progress included, until they fail with `ShardMoved`
+    // once the children have taken over.
+    let writer = tokio::spawn({
+        let client = client.clone();
+        let stop = stop.clone();
+        async move {
+            let mut n = 0;
+            while !stop.load(Ordering::SeqCst) {
+                let key = key_in_half(&format!("load/{n}-"), false);
+                client.put(key, "x").await.expect("write during the split");
+                n += 1;
+            }
+        }
+    });
+    // Runs rounds until stopped, and returns how many it ran. Apart from its
+    // delete range, a round only touches shard 1, so rounds keep starting
+    // while shard 0 rejects writes.
+    let prober = tokio::spawn({
+        let client = client.clone();
+        let rounds = rounds.clone();
+        let stop = stop.clone();
+        async move {
+            for (i, round) in rounds.iter().enumerate() {
+                if stop.load(Ordering::SeqCst) {
+                    return i;
+                }
+                let mut delete = client
+                    .delete_range(round.start.clone(), round.end.clone())
+                    .into_future();
+                // Polled once, the delete range has a copy queued for every
+                // shard.
+                assert!(futures::poll!(&mut delete).is_pending());
+                // Once shard 1 has applied its copy (not merely queued it: the
+                // server applies a batch's puts before its delete ranges),
+                // write a key there in the range, while the copy for shard 0
+                // may still be held back.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !is_deleted(&client, &round.before[1]).await {
+                    assert!(
+                        Instant::now() < deadline,
+                        "round {i}: shard 1 did not apply the delete range"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                client
+                    .put(round.late.clone(), "late")
+                    .await
+                    .expect("late put");
+                delete.await.expect("delete range across the split");
+                assert!(
+                    !is_deleted(&client, &round.late).await,
+                    "round {i}: shard 1 applied the delete range a second time"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the split did not complete within {ROUNDS} rounds");
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let split_output = cluster.split_shard(0).await;
+    assert!(
+        split_output.contains("\"Error\":null"),
+        "split must succeed, got: {split_output}"
+    );
+    cluster.wait_until_removed(0).await;
+    // A few more rounds, against the children.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.store(true, Ordering::SeqCst);
+    writer.await.expect("writer");
+    let ran = prober.await.expect("prober");
+
+    // Every round deleted its range on shard 0, or on the children.
+    for (i, round) in rounds[..ran].iter().enumerate() {
+        assert!(
+            is_deleted(&client, &round.before[0]).await,
+            "round {i}: the delete range missed shard 0 or its children"
+        );
+    }
 
     client.close().await.unwrap();
 }
