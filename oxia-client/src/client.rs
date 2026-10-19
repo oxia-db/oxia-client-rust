@@ -1097,7 +1097,8 @@ fn check_end_inclusive(requested: bool, included: Option<bool>) -> Result<(), Ox
 }
 
 /// Reduces two per-shard get results to the winner for the comparison type,
-/// comparing their keys in the key order of the namespace.
+/// comparing them in the key order of the namespace: through an index, by
+/// their secondary keys first ([`GetResult::compare_keys`]).
 fn pick_get_winner(
     a: GetResult,
     b: GetResult,

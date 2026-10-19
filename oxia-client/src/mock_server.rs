@@ -69,6 +69,10 @@ pub(crate) struct Behavior {
     /// or a range scan of a shard returns all of them, one per response,
     /// whatever its range.
     pub(crate) shard_keys: HashMap<i64, Vec<&'static str>>,
+    /// The secondary keys of the records, by key: a get or a range scan
+    /// through an index returns a record with its secondary key, like the
+    /// servers with oxia-db/oxia#1508, and without one if it has none here.
+    pub(crate) secondary_keys: HashMap<&'static str, &'static str>,
     /// The shards whose leader includes the end of the range of a list or a
     /// range scan that asks for it, like a server with
     /// FEATURE_RANGE_END_INCLUSIVE: their responses say so, and they send one
@@ -87,6 +91,7 @@ impl Default for Behavior {
             shards: 1,
             key_sorting: proto::KeySorting::Unknown,
             shard_keys: HashMap::new(),
+            secondary_keys: HashMap::new(),
             end_inclusive_shards: Vec::new(),
         }
     }
@@ -192,14 +197,15 @@ fn ok_version() -> proto::Version {
     }
 }
 
-/// The record of `key`, as a get or a range scan finds it.
-fn record(key: &str) -> proto::GetResponse {
+/// The record of `key`, as a get or a range scan finds it, with its secondary
+/// key when the read goes through an index.
+fn record(key: &str, secondary_key: Option<&str>) -> proto::GetResponse {
     proto::GetResponse {
         status: proto::Status::Ok as i32,
         version: Some(ok_version()),
         value: Some(bytes::Bytes::from(key.to_string())),
         key: Some(key.to_string()),
-        secondary_index_key: None,
+        secondary_index_key: secondary_key.map(String::from),
     }
 }
 
@@ -268,6 +274,16 @@ impl Service {
             .and_then(|shard| behavior.shard_keys.get(&shard))
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The scripted secondary key of the record of `key`, which a read
+    /// through an index returns with it.
+    fn secondary_key(&self, key: &str, through_index: bool) -> Option<&'static str> {
+        if !through_index {
+            return None;
+        }
+        let behavior = self.state.behavior.lock().expect("behavior lock");
+        behavior.secondary_keys.get(key).copied()
     }
 
     /// The keys of the responses of a shard to a list or a range scan, and
@@ -419,8 +435,11 @@ impl OxiaService for Service {
                 let response = proto::ReadResponse {
                     gets: gets
                         .iter()
-                        .map(|_| match found {
-                            Some(key) => record(key),
+                        .map(|get| match found {
+                            Some(key) => record(
+                                key,
+                                self.secondary_key(key, get.secondary_index_name.is_some()),
+                            ),
                             None => proto::GetResponse {
                                 status: proto::Status::KeyNotFound as i32,
                                 ..proto::GetResponse::default()
@@ -478,11 +497,15 @@ impl OxiaService for Service {
     ) -> Rpc<Self::RangeScanStream> {
         let request = request.into_inner();
         let (responses, end_inclusive) = self.scan(request.shard, request.end_inclusive);
+        let through_index = request.secondary_index_name.is_some();
         let responses: Vec<_> = responses
             .into_iter()
             .map(|keys| {
                 Ok(proto::RangeScanResponse {
-                    records: keys.into_iter().map(record).collect(),
+                    records: keys
+                        .into_iter()
+                        .map(|key| record(key, self.secondary_key(key, through_index)))
+                        .collect(),
                     end_inclusive,
                 })
             })
@@ -1055,6 +1078,127 @@ mod tests {
                 .map(|record| record.key)
                 .collect();
             assert_eq!(scanned, expected, "range scan, {key_sorting:?}");
+        }
+    }
+
+    /// A get through an index without a partition key goes to every shard,
+    /// and the client keeps the largest or smallest answer by the secondary
+    /// keys, in the key sorting of the namespace (the vectors of the Go
+    /// reference, `TestMultiShardIndexGetKeySorting`). In the natural cases,
+    /// comparing the keys instead picks the other answer.
+    #[tokio::test]
+    async fn multi_shard_index_gets_pick_by_the_secondary_keys() {
+        use crate::ComparisonType::{Ceiling, Floor};
+        use proto::KeySorting::{Hierarchical, Natural, Unknown};
+
+        for (key_sorting, comparison, expected) in [
+            // "a/y/z" < "a0"
+            (Natural, Floor, "p1"),
+            (Natural, Ceiling, "p2"),
+            // "a0" < "a/y/z"
+            (Hierarchical, Floor, "p2"),
+            (Hierarchical, Ceiling, "p1"),
+            // "a0" < "a/y/z" in the legacy order
+            (Unknown, Floor, "p2"),
+            (Unknown, Ceiling, "p1"),
+        ] {
+            let mock = MockOxia::start(Behavior {
+                read: ReadMode::ShardKeys,
+                shards: 2,
+                key_sorting,
+                shard_keys: HashMap::from([(0, vec!["p1"]), (1, vec!["p2"])]),
+                secondary_keys: HashMap::from([("p1", "a0"), ("p2", "a/y/z")]),
+                ..Behavior::default()
+            })
+            .await;
+            let client = connect(&mock, Duration::from_secs(5)).await;
+
+            let found = client
+                .get("b")
+                .comparison(comparison)
+                .use_index("idx")
+                .await
+                .expect("a shard has an answer");
+            assert_eq!(found.key, expected, "{key_sorting:?} {comparison:?}");
+        }
+    }
+
+    /// A range scan through an index without a partition key merges the
+    /// records of the shards, which each shard returns in the order of their
+    /// secondary keys, by the secondary keys that come with them, in the key
+    /// sorting of the namespace (the vectors of the Go reference,
+    /// `TestAggregateAndSortRangeScanAcrossShardsSecondaryKeys`). Comparing
+    /// the keys instead puts the records out of order in every case.
+    #[tokio::test]
+    async fn index_range_scans_merge_by_the_secondary_keys() {
+        use proto::KeySorting::{Hierarchical, Natural, Unknown};
+
+        for (case, key_sorting, [shard_0, shard_1], expected) in [
+            (
+                "natural",
+                Natural,
+                [
+                    vec![("p4", "a/x"), ("p2", "a0")],
+                    vec![("p3", "a/y/z"), ("p1", "ab/y")],
+                ],
+                vec!["p4", "p3", "p2", "p1"],
+            ),
+            (
+                "hierarchical",
+                Hierarchical,
+                [
+                    vec![("p4", "a0"), ("p2", "a/x")],
+                    vec![("p3", "ab/y"), ("p1", "a/y/z")],
+                ],
+                vec!["p4", "p3", "p2", "p1"],
+            ),
+            (
+                "unknown",
+                Unknown,
+                [
+                    vec![("p4", "a0"), ("p2", "a/x")],
+                    vec![("p3", "a/y/z"), ("p1", "ab/y")],
+                ],
+                vec!["p4", "p2", "p3", "p1"],
+            ),
+            (
+                "same secondary key",
+                Natural,
+                [
+                    vec![("p2", "a"), ("p3", "b")],
+                    vec![("p1", "b"), ("p4", "c")],
+                ],
+                vec!["p2", "p1", "p3", "p4"],
+            ),
+            (
+                "empty secondary key",
+                Natural,
+                [vec![("p2", "")], vec![("p1", "a")]],
+                vec!["p2", "p1"],
+            ),
+        ] {
+            let keys = |records: &[(&'static str, &'static str)]| -> Vec<&'static str> {
+                records.iter().map(|(key, _)| *key).collect()
+            };
+            let mock = MockOxia::start(Behavior {
+                shards: 2,
+                key_sorting,
+                shard_keys: HashMap::from([(0, keys(&shard_0)), (1, keys(&shard_1))]),
+                secondary_keys: shard_0.iter().chain(&shard_1).copied().collect(),
+                ..Behavior::default()
+            })
+            .await;
+            let client = connect(&mock, Duration::from_secs(5)).await;
+
+            let scanned: Vec<_> = client
+                .range_scan("a", "z")
+                .use_index("idx")
+                .await
+                .expect("range scan")
+                .into_iter()
+                .map(|record| record.key)
+                .collect();
+            assert_eq!(scanned, expected, "{case}");
         }
     }
 

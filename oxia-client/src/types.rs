@@ -102,7 +102,8 @@ pub struct GetResult {
     /// The version of the record.
     pub version: Version,
     /// The matching secondary-index key, when the query used
-    /// [`use_index`](crate::GetBuilder::use_index).
+    /// [`use_index`](crate::GetBuilder::use_index). The records of a range
+    /// scan through an index carry it on the servers with oxia-db/oxia#1508.
     pub secondary_index_key: Option<String>,
 }
 
@@ -129,8 +130,17 @@ impl GetResult {
         })
     }
 
+    /// Compares two records in the key order of the namespace: by their
+    /// secondary keys when both have one, as the records of a read through an
+    /// index do, then by their keys. The records without a secondary key, as
+    /// the servers older than oxia-db/oxia#1508 return them from a range scan
+    /// through an index, are ordered by their keys only.
     pub(crate) fn compare_keys(&self, other: &Self, order: KeyOrder) -> Ordering {
-        order.compare(&self.key, &other.key)
+        let secondary = match (&self.secondary_index_key, &other.secondary_index_key) {
+            (Some(a), Some(b)) => order.compare(a, b),
+            _ => Ordering::Equal,
+        };
+        secondary.then_with(|| order.compare(&self.key, &other.key))
     }
 }
 
