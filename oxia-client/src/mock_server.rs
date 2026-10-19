@@ -926,8 +926,9 @@ mod tests {
     /// A floor or ceiling get without a partition key goes to every shard,
     /// and the client keeps the largest or smallest answer in the key sorting
     /// that the assignments report. A server that reports none keeps the
-    /// legacy slash-aware order. The cases are the examples of
-    /// oxia-db/oxia#1388: each one picks another answer in the legacy order.
+    /// legacy slash-aware order. The natural and hierarchical cases are the
+    /// examples of oxia-db/oxia#1388, where the legacy order picks the other
+    /// answer.
     #[tokio::test]
     async fn multi_shard_gets_pick_in_the_key_sorting() {
         use crate::ComparisonType::{Ceiling, Floor};
