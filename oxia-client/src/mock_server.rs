@@ -992,6 +992,52 @@ mod tests {
         assert_eq!(requests[1].deletes[0].partition_key.as_deref(), Some(""));
     }
 
+    /// A delete range without a partition key joins the batch of every shard
+    /// when it is issued, as a put or a delete does: the writes issued after
+    /// it follow it in the batch, with a higher `op_index`, so that a server
+    /// with ordered writes applies it before them.
+    #[tokio::test]
+    async fn delete_range_precedes_the_writes_issued_after_it() {
+        let mock = MockOxia::start(Behavior {
+            shards: 2,
+            ..Behavior::default()
+        })
+        .await;
+        let client = connect(&mock, Duration::from_secs(5)).await;
+
+        // `biased` polls the operations in order, and each one joins the open
+        // batches on its first poll. On this single-threaded runtime no batch
+        // is flushed before all of them are in it.
+        let (delete_range, put_a, put_b, put_c, put_d) = tokio::join!(
+            biased;
+            client.delete_range("range/", "range/~"),
+            client.put("range/a", "x"),
+            client.put("range/b", "x"),
+            client.put("range/c", "x"),
+            client.put("range/d", "x"),
+        );
+        delete_range.expect("delete range");
+        for put in [put_a, put_b, put_c, put_d] {
+            put.expect("put");
+        }
+
+        // One batch per shard: the delete range, then the puts routed there.
+        let requests = mock.write_requests();
+        assert_eq!(requests.len(), 2, "requests: {requests:?}");
+        for request in &requests {
+            let delete_ranges: Vec<_> = request.delete_ranges.iter().map(|r| r.op_index).collect();
+            let puts: Vec<_> = request.puts.iter().map(|p| p.op_index).collect();
+            assert!(!puts.is_empty(), "every shard gets a put: {requests:?}");
+            assert_eq!(delete_ranges, [0], "shard {:?}", request.shard);
+            assert_eq!(
+                puts,
+                (1..=puts.len() as u32).collect::<Vec<_>>(),
+                "shard {:?}",
+                request.shard
+            );
+        }
+    }
+
     /// A floor or ceiling get without a partition key goes to every shard,
     /// and the client keeps the largest or smallest answer in the key sorting
     /// that the assignments report. A server that reports none keeps the
