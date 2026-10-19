@@ -15,7 +15,7 @@ use futures::channel::mpsc;
 use futures::stream::BoxStream;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status, Streaming};
 
 /// Scripted behavior of the write stream.
@@ -57,6 +57,10 @@ pub(crate) struct Behavior {
     pub(crate) assignments_error: Option<tonic::Code>,
     /// The number of shards, splitting the hash space into equal ranges.
     pub(crate) shards: u32,
+    /// How long after the start the shards have no leader, as while one is
+    /// elected: the assignments name no leader until the server publishes
+    /// itself as the leader when this elapses.
+    pub(crate) leaderless_for: Duration,
 }
 
 impl Default for Behavior {
@@ -67,12 +71,15 @@ impl Default for Behavior {
             read: ReadMode::Ok,
             assignments_error: None,
             shards: 1,
+            leaderless_for: Duration::ZERO,
         }
     }
 }
 
 struct State {
     behavior: Mutex<Behavior>,
+    /// When the shards get their leader (see [`Behavior::leaderless_for`]).
+    leader_elected_at: Instant,
     /// Every received `WriteRequest`, in order.
     write_requests: Mutex<Vec<proto::WriteRequest>>,
     /// Operations per received `WriteRequest` (puts + deletes + delete-ranges).
@@ -98,6 +105,7 @@ impl Drop for MockOxia {
 impl MockOxia {
     pub(crate) async fn start(behavior: Behavior) -> MockOxia {
         let state = Arc::new(State {
+            leader_elected_at: Instant::now() + behavior.leaderless_for,
             behavior: Mutex::new(behavior),
             write_requests: Mutex::new(Vec::new()),
             write_batch_sizes: Mutex::new(Vec::new()),
@@ -246,9 +254,9 @@ impl OxiaService for Service {
             return Err(Status::new(code, "scripted assignments failure"));
         }
         let namespace = request.into_inner().namespace;
-        let assignments = proto::ShardAssignments {
+        let assignments = |leader: &str| proto::ShardAssignments {
             namespaces: [(
-                namespace,
+                namespace.clone(),
                 proto::NamespaceShardsAssignment {
                     assignments: (0..shards)
                         .map(|shard| {
@@ -256,7 +264,7 @@ impl OxiaService for Service {
                                 hash_range(shard, shards);
                             proto::ShardAssignment {
                                 shard: shard.into(),
-                                leader: self.advertised.clone(),
+                                leader: leader.to_string(),
                                 shard_boundaries: Some(
                                     proto::shard_assignment::ShardBoundaries::Int32HashRange(
                                         proto::Int32HashRange {
@@ -275,8 +283,24 @@ impl OxiaService for Service {
             allowed_authorities: vec![],
         };
         let (tx, rx) = mpsc::unbounded();
-        tx.unbounded_send(Ok(assignments))
-            .expect("first assignment");
+        let leaderless_for = self
+            .state
+            .leader_elected_at
+            .saturating_duration_since(Instant::now());
+        if leaderless_for.is_zero() {
+            tx.unbounded_send(Ok(assignments(&self.advertised)))
+                .expect("first assignment");
+        } else {
+            // No leader yet: the coordinator publishes an empty one.
+            tx.unbounded_send(Ok(assignments("")))
+                .expect("first assignment");
+            let elected = assignments(&self.advertised);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(leaderless_for).await;
+                let _ = tx.unbounded_send(Ok(elected));
+            });
+        }
         // Park the sender so the stream stays open, like a real server.
         self.state
             .assignment_senders
@@ -816,5 +840,43 @@ mod tests {
         }
         assert_eq!(requests[0].puts[0].partition_key.as_deref(), Some(""));
         assert_eq!(requests[1].deletes[0].partition_key.as_deref(), Some(""));
+    }
+
+    /// A shard without a leader fails with `LeaderNotFound`; its empty leader
+    /// address is not dialed.
+    #[tokio::test]
+    async fn leaderless_shard_reports_leader_not_found() {
+        let mock = MockOxia::start(Behavior {
+            leaderless_for: Duration::from_secs(60),
+            ..Behavior::default()
+        })
+        .await;
+        let client = connect(&mock, Duration::from_millis(500)).await;
+
+        let result = client.get("leaderless/key").await;
+        assert!(
+            matches!(result, Err(OxiaError::LeaderNotFound { shard: 0 })),
+            "got {result:?}"
+        );
+    }
+
+    /// A write waiting for a shard leader goes out as soon as one is elected,
+    /// not when its reconnect backoff ends.
+    #[tokio::test]
+    async fn write_goes_out_once_the_shard_gets_a_leader() {
+        // The reconnects back off 100, 200, 400, then 800 ms: the leader is
+        // elected 1 s in, during the last wait, which ends after the request
+        // timeout.
+        let mock = MockOxia::start(Behavior {
+            leaderless_for: Duration::from_secs(1),
+            ..Behavior::default()
+        })
+        .await;
+        let client = connect(&mock, Duration::from_millis(1300)).await;
+
+        client
+            .put("election/key", "x")
+            .await
+            .expect("put once the leader is elected");
     }
 }
