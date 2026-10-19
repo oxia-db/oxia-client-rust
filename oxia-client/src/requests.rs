@@ -172,6 +172,8 @@ impl PutBuilder {
                             secondary_indexes,
                             override_version_id: None,
                             override_modifications_count: None,
+                            // Assigned by the write batcher.
+                            op_index: 0,
                         };
                         client.submit_write(shard, request, WriteOp::Put).await
                     }
@@ -372,6 +374,8 @@ impl DeleteBuilder {
             key: self.key,
             expected_version_id: self.expected_version_id,
             partition_key: self.partition_key,
+            // Assigned by the write batcher.
+            op_index: 0,
         };
         let start = std::time::Instant::now();
         let op_result = async {
@@ -439,6 +443,8 @@ impl DeleteRangeBuilder {
         let request = proto::DeleteRangeRequest {
             start_inclusive: self.min_key_inclusive,
             end_exclusive: self.max_key_exclusive,
+            // Assigned by the write batcher.
+            op_index: 0,
         };
         let start = std::time::Instant::now();
         let op_result = async {
