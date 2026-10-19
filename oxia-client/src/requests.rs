@@ -84,6 +84,9 @@ impl PutBuilder {
 
     /// Additionally indexes the record under `secondary_key` in the named
     /// secondary index. May be called multiple times.
+    ///
+    /// The index name must not contain `/` (the secondary key may). Awaiting a
+    /// put with such a name fails with [`OxiaError::InvalidArgument`].
     pub fn secondary_index(
         mut self,
         index_name: impl Into<String>,
@@ -106,6 +109,20 @@ impl PutBuilder {
     async fn execute(self) -> Result<PutResult, OxiaError> {
         let client = self.client;
         client.ensure_open()?;
+        // Reject secondary index names containing '/' up front (matching the
+        // Go client): the server stores index entries under
+        // `__oxia/idx/{index_name}/{secondary_key}`, where such a name is
+        // ambiguous, and servers that predate the check accept it silently.
+        if let Some(index) = self
+            .secondary_indexes
+            .iter()
+            .find(|index| index.index_name.contains('/'))
+        {
+            return Err(OxiaError::InvalidArgument(format!(
+                "secondary index name {:?} must not contain '/'",
+                index.index_name
+            )));
+        }
         // Validate sequence-key puts up front (matching the Java client's
         // `PutOperation`): sequential keys require a partition key, are
         // incompatible with an expected version, and every delta must be
@@ -256,6 +273,7 @@ impl GetBuilder {
     }
 
     /// Queries the named secondary index instead of the primary key space.
+    /// Index names must not contain `/`.
     pub fn use_index(mut self, index_name: impl Into<String>) -> Self {
         self.secondary_index_name = Some(index_name.into());
         self
@@ -526,7 +544,7 @@ impl ListBuilder {
     }
 
     /// Lists keys from the named secondary index instead of the primary key
-    /// space.
+    /// space. Index names must not contain `/`.
     pub fn use_index(mut self, index_name: impl Into<String>) -> Self {
         self.secondary_index_name = Some(index_name.into());
         self
@@ -631,6 +649,7 @@ impl RangeScanBuilder {
     }
 
     /// Scans the named secondary index instead of the primary key space.
+    /// Index names must not contain `/`.
     ///
     /// The records come in the order of their secondary keys. Without a
     /// partition key, the client merges the records of the shards by the
