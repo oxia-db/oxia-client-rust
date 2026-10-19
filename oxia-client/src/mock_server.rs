@@ -780,8 +780,8 @@ mod tests {
     }
 
     /// The `INVALID_ARGUMENT` status a server returns for an invalid request
-    /// (e.g. a secondary index name containing `/`) maps to `InvalidArgument`,
-    /// not to a decode error.
+    /// maps to `InvalidArgument`, not to a decode error. The put itself is
+    /// valid, so that it is the server, not the client, that rejects it.
     #[tokio::test]
     async fn invalid_argument_status_maps_to_invalid_argument() {
         let mock = MockOxia::start(Behavior {
@@ -791,13 +791,59 @@ mod tests {
         .await;
         let client = connect(&mock, Duration::from_secs(5)).await;
 
-        let result = client
-            .put("invalid/key", "x")
-            .secondary_index("by/name", "x")
-            .await;
+        let result = client.put("invalid/key", "x").await;
         assert!(
             matches!(result, Err(OxiaError::InvalidArgument(_))),
             "got {result:?}"
+        );
+        assert_eq!(mock.write_requests().len(), 1, "the put reaches the server");
+    }
+
+    /// A put with a `/` in a secondary index name fails with `InvalidArgument`
+    /// before it is batched, since a server that predates the check would
+    /// store it; a `/` in the secondary key is valid.
+    #[tokio::test]
+    async fn slash_in_index_name_fails_before_reaching_the_server() {
+        let mock = MockOxia::start(Behavior::default()).await;
+        let client = connect(&mock, Duration::from_secs(5)).await;
+
+        let result = client
+            .put("index/key", "x")
+            .secondary_index("by-name", "alice")
+            .secondary_index("tenant/users", "email")
+            .await;
+        match result {
+            Err(OxiaError::InvalidArgument(message)) => assert!(
+                message.contains("\"tenant/users\""),
+                "the error must name the offending index, got: {message}"
+            ),
+            other => panic!("expected an invalid argument, got {other:?}"),
+        }
+        assert!(
+            mock.write_requests().is_empty(),
+            "nothing reaches the server"
+        );
+
+        client
+            .put("index/key", "x")
+            .secondary_index("tenant", "users/email")
+            .await
+            .expect("a '/' in the secondary key is valid");
+        // Had the rejected put been sent anyway, it would precede the valid one
+        // on the same stream: once that is acknowledged, it must be the only
+        // put the server has seen.
+        let indexes: Vec<_> = mock
+            .write_requests()
+            .into_iter()
+            .flat_map(|request| request.puts)
+            .map(|put| put.secondary_indexes)
+            .collect();
+        assert_eq!(
+            indexes,
+            vec![vec![proto::SecondaryIndex {
+                index_name: "tenant".to_string(),
+                secondary_key: "users/email".to_string(),
+            }]]
         );
     }
 
