@@ -1,12 +1,12 @@
 //! A programmable in-process Oxia server for hermetic client tests.
 //!
 //! Serves the real gRPC service on an ephemeral local port (no Docker, no
-//! containers) and advertises itself as the single shard leader, so an
-//! unmodified [`OxiaClient`](crate::OxiaClient) connects to it exactly as it
-//! would to a real cluster. Tests script server behavior — delayed, missing,
-//! erroneous, or absent responses; torn streams — and assert on what the
-//! server observed (batch sizes, connection counts) and on what the client
-//! surfaced.
+//! containers) and advertises itself as the leader of every shard (a single
+//! one by default), so an unmodified [`OxiaClient`](crate::OxiaClient)
+//! connects to it exactly as it would to a real cluster. Tests script server
+//! behavior — delayed, missing, erroneous, or absent responses; torn streams
+//! — and assert on what the server observed (write requests, batch sizes,
+//! connection counts) and on what the client surfaced.
 
 use crate::proto;
 use crate::proto::oxia_client_server::{OxiaClient as OxiaService, OxiaClientServer};
@@ -55,6 +55,8 @@ pub(crate) struct Behavior {
     pub(crate) read: ReadMode,
     /// When set, the assignments stream fails with this gRPC status.
     pub(crate) assignments_error: Option<tonic::Code>,
+    /// The number of shards, splitting the hash space into equal ranges.
+    pub(crate) shards: u32,
 }
 
 impl Default for Behavior {
@@ -64,12 +66,15 @@ impl Default for Behavior {
             torn_write_connections: 0,
             read: ReadMode::Ok,
             assignments_error: None,
+            shards: 1,
         }
     }
 }
 
 struct State {
     behavior: Mutex<Behavior>,
+    /// Every received `WriteRequest`, in order.
+    write_requests: Mutex<Vec<proto::WriteRequest>>,
     /// Operations per received `WriteRequest` (puts + deletes + delete-ranges).
     write_batch_sizes: Mutex<Vec<usize>>,
     write_connections: AtomicU32,
@@ -94,6 +99,7 @@ impl MockOxia {
     pub(crate) async fn start(behavior: Behavior) -> MockOxia {
         let state = Arc::new(State {
             behavior: Mutex::new(behavior),
+            write_requests: Mutex::new(Vec::new()),
             write_batch_sizes: Mutex::new(Vec::new()),
             write_connections: AtomicU32::new(0),
             assignment_senders: Mutex::new(Vec::new()),
@@ -131,6 +137,15 @@ impl MockOxia {
         self.state.behavior.lock().expect("behavior lock").read = read;
     }
 
+    /// The `WriteRequest`s the server has received, in order.
+    pub(crate) fn write_requests(&self) -> Vec<proto::WriteRequest> {
+        self.state
+            .write_requests
+            .lock()
+            .expect("requests lock")
+            .clone()
+    }
+
     /// Operations per `WriteRequest` the server has received, in order.
     pub(crate) fn write_batch_sizes(&self) -> Vec<usize> {
         self.state
@@ -154,6 +169,19 @@ fn ok_version() -> proto::Version {
         session_id: None,
         client_identity: None,
     }
+}
+
+/// The inclusive hash range of `shard` when the hash space is split into
+/// `shards` equal ranges.
+fn hash_range(shard: u32, shards: u32) -> (u32, u32) {
+    let size = (u64::from(u32::MAX) + 1) / u64::from(shards);
+    let min = u64::from(shard) * size;
+    let max = if shard + 1 == shards {
+        u64::from(u32::MAX)
+    } else {
+        min + size - 1
+    };
+    (min as u32, max as u32)
 }
 
 fn respond_to(request: &proto::WriteRequest, mode: WriteMode) -> proto::WriteResponse {
@@ -210,12 +238,10 @@ impl OxiaService for Service {
         &self,
         request: Request<proto::ShardAssignmentsRequest>,
     ) -> Rpc<Self::GetShardAssignmentsStream> {
-        let scripted_error = self
-            .state
-            .behavior
-            .lock()
-            .expect("behavior lock")
-            .assignments_error;
+        let (scripted_error, shards) = {
+            let behavior = self.state.behavior.lock().expect("behavior lock");
+            (behavior.assignments_error, behavior.shards)
+        };
         if let Some(code) = scripted_error {
             return Err(Status::new(code, "scripted assignments failure"));
         }
@@ -224,18 +250,24 @@ impl OxiaService for Service {
             namespaces: [(
                 namespace,
                 proto::NamespaceShardsAssignment {
-                    assignments: vec![proto::ShardAssignment {
-                        shard: 0,
-                        leader: self.advertised.clone(),
-                        shard_boundaries: Some(
-                            proto::shard_assignment::ShardBoundaries::Int32HashRange(
-                                proto::Int32HashRange {
-                                    min_hash_inclusive: 0,
-                                    max_hash_inclusive: u32::MAX,
-                                },
-                            ),
-                        ),
-                    }],
+                    assignments: (0..shards)
+                        .map(|shard| {
+                            let (min_hash_inclusive, max_hash_inclusive) =
+                                hash_range(shard, shards);
+                            proto::ShardAssignment {
+                                shard: shard.into(),
+                                leader: self.advertised.clone(),
+                                shard_boundaries: Some(
+                                    proto::shard_assignment::ShardBoundaries::Int32HashRange(
+                                        proto::Int32HashRange {
+                                            min_hash_inclusive,
+                                            max_hash_inclusive,
+                                        },
+                                    ),
+                                ),
+                            }
+                        })
+                        .collect(),
                     shard_key_router: proto::ShardKeyRouter::Xxhash3 as i32,
                 },
             )]
@@ -274,6 +306,11 @@ impl OxiaService for Service {
         let (tx, rx) = mpsc::unbounded();
         tokio::spawn(async move {
             while let Some(Ok(request)) = inbound.next().await {
+                state
+                    .write_requests
+                    .lock()
+                    .expect("requests lock")
+                    .push(request.clone());
                 let ops = request.puts.len() + request.deletes.len() + request.delete_ranges.len();
                 state
                     .write_batch_sizes
@@ -637,6 +674,28 @@ mod tests {
         );
     }
 
+    /// The `INVALID_ARGUMENT` status a server returns for an invalid request
+    /// (e.g. a secondary index name containing `/`) maps to `InvalidArgument`,
+    /// not to a decode error.
+    #[tokio::test]
+    async fn invalid_argument_status_maps_to_invalid_argument() {
+        let mock = MockOxia::start(Behavior {
+            write: WriteMode::PutStatus(proto::Status::InvalidArgument as i32),
+            ..Behavior::default()
+        })
+        .await;
+        let client = connect(&mock, Duration::from_secs(5)).await;
+
+        let result = client
+            .put("invalid/key", "x")
+            .secondary_index("by/name", "x")
+            .await;
+        assert!(
+            matches!(result, Err(OxiaError::InvalidArgument(_))),
+            "got {result:?}"
+        );
+    }
+
     /// Per-operation proto statuses in read responses map to the typed
     /// errors, and a healthy read produces the served value.
     #[tokio::test]
@@ -677,5 +736,85 @@ mod tests {
             "a permanent error must fail fast, took {:?}",
             start.elapsed()
         );
+    }
+
+    /// A delete carries its partition key on the wire, so that a shard split
+    /// replays it only on the child that holds the record; without one, the
+    /// field stays absent.
+    #[tokio::test]
+    async fn delete_sends_its_partition_key() {
+        let mock = MockOxia::start(Behavior::default()).await;
+        let client = connect(&mock, Duration::from_secs(5)).await;
+
+        client
+            .delete("pk/with")
+            .partition_key("pk")
+            .await
+            .expect("delete with a partition key");
+        client
+            .delete("pk/without")
+            .await
+            .expect("delete without a partition key");
+
+        let deletes: Vec<_> = mock
+            .write_requests()
+            .into_iter()
+            .flat_map(|request| request.deletes)
+            .map(|delete| (delete.key, delete.partition_key))
+            .collect();
+        assert_eq!(
+            deletes,
+            vec![
+                ("pk/with".to_string(), Some("pk".to_string())),
+                ("pk/without".to_string(), None),
+            ]
+        );
+    }
+
+    /// An explicitly empty partition key is a partition key like any other: a
+    /// put or delete with one is routed by `hash("")` and carries it on the
+    /// wire, rather than being treated as absent and routed by its own key.
+    #[tokio::test]
+    async fn empty_partition_key_is_hashed_normally() {
+        let mock = MockOxia::start(Behavior {
+            shards: 2,
+            ..Behavior::default()
+        })
+        .await;
+        let client = connect(&mock, Duration::from_secs(5)).await;
+        let shard_of = |routing_key: &str| {
+            let hash = crate::hash::xxh3_32(routing_key);
+            (0..2)
+                .find(|&shard| {
+                    let (min, max) = hash_range(shard, 2);
+                    (min..=max).contains(&hash)
+                })
+                .map(i64::from)
+        };
+        // A record key owned by the other shard, so that routing by it instead
+        // of by the empty partition key would show.
+        let key = (0..)
+            .map(|i| format!("empty-pk/{i}"))
+            .find(|key| shard_of(key) != shard_of(""))
+            .expect("a key on the other shard");
+
+        client
+            .put(key.clone(), "x")
+            .partition_key("")
+            .await
+            .expect("put");
+        client
+            .delete(key.clone())
+            .partition_key("")
+            .await
+            .expect("delete");
+
+        let requests = mock.write_requests();
+        assert_eq!(requests.len(), 2, "requests: {requests:?}");
+        for request in &requests {
+            assert_eq!(request.shard, shard_of(""), "request: {request:?}");
+        }
+        assert_eq!(requests[0].puts[0].partition_key.as_deref(), Some(""));
+        assert_eq!(requests[1].deletes[0].partition_key.as_deref(), Some(""));
     }
 }

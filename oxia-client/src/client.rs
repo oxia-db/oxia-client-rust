@@ -215,7 +215,8 @@ impl OxiaClient {
     /// - [`OxiaError::InvalidArgument`] when
     ///   [`sequence_key_deltas`](PutBuilder::sequence_key_deltas) is used
     ///   without a partition key, with a zero delta, or together with an
-    ///   expected version;
+    ///   expected version, or when the server rejects the put as invalid
+    ///   (e.g. a secondary index name containing `/`);
     /// - [`OxiaError::UnexpectedVersionId`] when a
     ///   [`expected_version_id`](PutBuilder::expected_version_id) /
     ///   [`expected_record_not_exists`](PutBuilder::expected_record_not_exists)
@@ -1069,6 +1070,9 @@ pub(crate) fn check_status(status: i32) -> Result<(), OxiaError> {
         Ok(proto::Status::KeyNotFound) => Err(OxiaError::KeyNotFound),
         Ok(proto::Status::UnexpectedVersionId) => Err(OxiaError::UnexpectedVersionId),
         Ok(proto::Status::SessionDoesNotExist) => Err(OxiaError::SessionExpired),
+        Ok(proto::Status::InvalidArgument) => Err(OxiaError::InvalidArgument(
+            "rejected by the server".to_string(),
+        )),
         Err(err) => Err(OxiaError::Decode(format!("invalid status code: {err}"))),
     }
 }

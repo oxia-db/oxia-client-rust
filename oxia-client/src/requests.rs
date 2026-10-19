@@ -371,6 +371,7 @@ impl DeleteBuilder {
         let request = proto::DeleteRequest {
             key: self.key,
             expected_version_id: self.expected_version_id,
+            partition_key: self.partition_key,
         };
         let start = std::time::Instant::now();
         let op_result = async {
