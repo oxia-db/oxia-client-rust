@@ -631,6 +631,12 @@ impl RangeScanBuilder {
     }
 
     /// Scans the named secondary index instead of the primary key space.
+    ///
+    /// The records come in the order of their secondary keys. Without a
+    /// partition key, the client merges the records of the shards by the
+    /// secondary keys that the servers send with them (oxia-db/oxia#1508).
+    /// Older servers send none, and the merged records may then be out of
+    /// order.
     pub fn use_index(mut self, index_name: impl Into<String>) -> Self {
         self.secondary_index_name = Some(index_name.into());
         self

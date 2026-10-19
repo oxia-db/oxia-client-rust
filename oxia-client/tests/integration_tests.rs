@@ -857,6 +857,61 @@ async fn test_secondary_index() {
     client.close().await.unwrap();
 }
 
+/// A range scan through an index without a partition key goes to every shard,
+/// and each shard returns its records in the order of their secondary keys:
+/// the client merges them in that order too, by the secondary keys that the
+/// server sends with them (oxia-db/oxia#1508). The records are those of the Go
+/// reference (`TestSyncClientImpl_RangeScanUseIndexKeySorting`): with 4 shards,
+/// they land on all of them, and their secondary keys sort in the opposite
+/// order of their keys.
+///
+/// Run it against a server with oxia-db/oxia#1508, such as
+/// `oxia/oxia:nightly-beta`:
+/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
+#[tokio::test]
+#[ignore = "needs a server that sends the secondary keys of a range scan (oxia-db/oxia#1508), which oxia/oxia:main predates"]
+async fn test_index_range_scan_merges_by_the_secondary_keys() {
+    let records = [
+        ("p1", "h"),
+        ("p2", "g"),
+        ("p3", "f"),
+        ("p4", "e"),
+        ("p5", "d"),
+        ("p6", "c"),
+        ("p7", "b"),
+        ("p8", "a"),
+    ];
+    for key_sorting in ["natural", "hierarchical"] {
+        let (_container, address) =
+            start_oxia_with(&["--shards", "4", "--key-sorting", key_sorting]).await;
+        let client = new_client(&address).await;
+        for (key, secondary_key) in records {
+            client
+                .put(key, key)
+                .secondary_index("idx", secondary_key)
+                .await
+                .unwrap();
+        }
+
+        let scanned: Vec<_> = client
+            .range_scan("a", "z")
+            .use_index("idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.key, record.secondary_index_key))
+            .collect();
+        let expected: Vec<_> = records
+            .iter()
+            .rev()
+            .map(|(key, secondary_key)| (key.to_string(), Some(secondary_key.to_string())))
+            .collect();
+        assert_eq!(scanned, expected, "{key_sorting}");
+
+        client.close().await.unwrap();
+    }
+}
+
 // ============================================================
 // Inclusive Range End Tests
 // ============================================================

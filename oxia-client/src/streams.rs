@@ -6,6 +6,7 @@ use crate::errors::OxiaError;
 use crate::key::KeyOrder;
 use crate::types::{GetResult, Notification};
 use futures::Stream;
+use std::cmp::Ordering;
 use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -14,29 +15,35 @@ use tokio::sync::mpsc;
 /// A boxed stream of results coming from a single shard.
 pub(crate) type ShardStream<T> = Pin<Box<dyn Stream<Item = Result<T, OxiaError>> + Send>>;
 
-/// Items that can be merged across shards in key order.
+/// Items that can be merged across shards in the order of the shards.
 pub(crate) trait MergeItem {
-    fn merge_key(&self) -> &str;
+    /// Compares two items in the order in which a shard returns them, given
+    /// the key order of the namespace.
+    fn merge_cmp(&self, other: &Self, order: KeyOrder) -> Ordering;
 }
 
 impl MergeItem for String {
-    fn merge_key(&self) -> &str {
-        self
+    // Through an index, a shard lists its keys in the order of their
+    // secondary keys, which a list response leaves out: the merge can only
+    // compare the keys.
+    fn merge_cmp(&self, other: &Self, order: KeyOrder) -> Ordering {
+        order.compare(self, other)
     }
 }
 
 impl MergeItem for GetResult {
-    fn merge_key(&self) -> &str {
-        &self.key
+    fn merge_cmp(&self, other: &Self, order: KeyOrder) -> Ordering {
+        self.compare_keys(other, order)
     }
 }
 
 /// An ordered k-way merge over per-shard streams.
 ///
-/// Each shard returns its results in the key order of the namespace; holding
-/// at most one pending item per shard and always yielding the smallest in that
-/// order keeps the global order identical to the server's while buffering
-/// O(shards) items.
+/// Each shard returns its results in the key order of the namespace, and
+/// through an index, in the order of their secondary keys; holding at most
+/// one pending item per shard and always yielding the smallest in that order
+/// ([`MergeItem::merge_cmp`]) keeps the global order identical to the
+/// server's while buffering O(shards) items.
 pub(crate) struct Merged<T> {
     streams: Vec<ShardStream<T>>,
     peeked: Vec<Option<T>>,
@@ -91,11 +98,7 @@ impl<T: MergeItem + Unpin> Stream for Merged<T> {
         for i in 0..this.peeked.len() {
             if let (Some(candidate), Some(m)) = (&this.peeked[i], min_idx) {
                 let current = this.peeked[m].as_ref().expect("min slot is filled");
-                if this
-                    .order
-                    .compare(candidate.merge_key(), current.merge_key())
-                    .is_lt()
-                {
+                if candidate.merge_cmp(current, this.order).is_lt() {
                     min_idx = Some(i);
                 }
             } else if this.peeked[i].is_some() && min_idx.is_none() {
@@ -323,6 +326,102 @@ mod tests {
             let out: Vec<String> = merged.map(|r| r.unwrap()).collect().await;
             assert_eq!(out, expected, "{order:?}");
         }
+    }
+
+    fn record(key: &str, secondary_key: Option<&str>) -> GetResult {
+        GetResult {
+            key: key.to_string(),
+            value: None,
+            version: crate::proto::Version::default().into(),
+            secondary_index_key: secondary_key.map(String::from),
+        }
+    }
+
+    /// A shard that returns the records `(key, secondary key)` of a range
+    /// scan through an index.
+    fn index_records(records: &[(&str, &str)]) -> ShardStream<GetResult> {
+        let records: Vec<Result<GetResult, OxiaError>> = records
+            .iter()
+            .map(|(key, secondary_key)| Ok(record(key, Some(secondary_key))))
+            .collect();
+        Box::pin(futures::stream::iter(records))
+    }
+
+    /// Through an index, each shard returns its records in the order of
+    /// their secondary keys, and the merge compares the secondary keys, then
+    /// the keys (vectors from the Go reference,
+    /// `TestAggregateAndSortRangeScanAcrossShardsSecondaryKeys`).
+    #[tokio::test]
+    async fn merges_by_the_secondary_keys() {
+        for (case, order, shards, expected) in [
+            (
+                "natural",
+                KeyOrder::Natural,
+                vec![
+                    vec![("p4", "a/x"), ("p2", "a0")],
+                    vec![("p3", "a/y/z"), ("p1", "ab/y")],
+                ],
+                vec!["p4", "p3", "p2", "p1"],
+            ),
+            (
+                "hierarchical",
+                KeyOrder::Hierarchical,
+                vec![
+                    vec![("p4", "a0"), ("p2", "a/x")],
+                    vec![("p3", "ab/y"), ("p1", "a/y/z")],
+                ],
+                vec!["p4", "p3", "p2", "p1"],
+            ),
+            (
+                "unknown",
+                KeyOrder::Legacy,
+                vec![
+                    vec![("p4", "a0"), ("p2", "a/x")],
+                    vec![("p3", "a/y/z"), ("p1", "ab/y")],
+                ],
+                vec!["p4", "p2", "p3", "p1"],
+            ),
+            // The records with the same secondary key are ordered by their
+            // keys.
+            (
+                "same secondary key",
+                KeyOrder::Natural,
+                vec![
+                    vec![("p2", "a"), ("p3", "b")],
+                    vec![("p1", "b"), ("p4", "c")],
+                ],
+                vec!["p2", "p1", "p3", "p4"],
+            ),
+            (
+                "empty secondary key",
+                KeyOrder::Natural,
+                vec![vec![("p2", "")], vec![("p1", "a")]],
+                vec!["p2", "p1"],
+            ),
+        ] {
+            let merged = merged(
+                shards.iter().map(|shard| index_records(shard)).collect(),
+                order,
+            );
+            let out: Vec<String> = merged.map(|r| r.unwrap().key).collect().await;
+            assert_eq!(out, expected, "{case}");
+        }
+    }
+
+    /// The records without a secondary key, which the servers older than
+    /// oxia-db/oxia#1508 return from a range scan through an index, are
+    /// ordered by their keys only, even against a record that has one.
+    #[tokio::test]
+    async fn merges_a_record_without_a_secondary_key_by_its_key() {
+        let shard = |record: GetResult| -> ShardStream<GetResult> {
+            Box::pin(futures::stream::iter([Ok(record)]))
+        };
+        let merged = merged(
+            vec![shard(record("p2", None)), shard(record("p1", Some("z")))],
+            KeyOrder::Natural,
+        );
+        let out: Vec<String> = merged.map(|r| r.unwrap().key).collect().await;
+        assert_eq!(out, ["p1", "p2"]);
     }
 
     #[tokio::test]
