@@ -373,6 +373,7 @@ impl DeleteBuilder {
         let request = proto::DeleteRequest {
             key: self.key,
             expected_version_id: self.expected_version_id,
+            partition_key: self.partition_key,
             // Assigned by the write batcher.
             op_index: 0,
         };
