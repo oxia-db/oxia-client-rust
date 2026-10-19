@@ -320,14 +320,19 @@ impl OxiaClient {
     }
 
     /// Deletes every record with `min_key_inclusive <= key < max_key_exclusive`
-    /// (in the key order of the namespace).
+    /// (in the key order of the namespace). On the servers with
+    /// `FEATURE_DELETE_RANGE_NOTIFICATION_RECORDS`, an empty
+    /// `max_key_exclusive` deletes all the records from `min_key_inclusive`
+    /// on, up to Oxia's internal keys, which it leaves.
     ///
     /// Without a [`partition_key`](DeleteRangeBuilder::partition_key) the
     /// deletion is applied on every shard; it is not atomic across shards.
     ///
     /// # Errors
     ///
-    /// Awaiting the builder returns [`OxiaError::Timeout`],
+    /// Awaiting the builder returns [`OxiaError::InvalidArgument`] when the
+    /// range covers both records and Oxia's internal keys (on the servers with
+    /// `FEATURE_DELETE_RANGE_NOTIFICATION_RECORDS`), [`OxiaError::Timeout`],
     /// [`OxiaError::Closed`], or transient routing/transport errors. Deleting
     /// an empty range is not an error.
     ///

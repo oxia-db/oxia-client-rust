@@ -162,7 +162,8 @@ pub enum Notification {
     KeyRangeDeleted {
         /// The start of the deleted range (inclusive).
         key: String,
-        /// The end of the deleted range (exclusive).
+        /// The end of the deleted range (exclusive). An empty end covers all
+        /// the records from `key` on.
         key_range_last: Option<String>,
     },
 }

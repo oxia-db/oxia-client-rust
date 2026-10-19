@@ -69,7 +69,9 @@ impl PutBuilder {
 
     /// Turns the key into a server-generated sequential key: each delta is
     /// added to the current highest sequence and appended as a zero-padded
-    /// suffix.
+    /// suffix. When the highest key of the sequence has more suffixes than
+    /// there are deltas, the missing deltas are 0 on the servers with
+    /// `FEATURE_SEQUENCE_KEY_VALIDATION`.
     ///
     /// Requires [`partition_key`](PutBuilder::partition_key); every delta must
     /// be greater than zero; and it cannot be combined with
