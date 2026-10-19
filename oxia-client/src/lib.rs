@@ -187,6 +187,10 @@ mod types;
 
 #[allow(
     clippy::derive_partial_eq_without_eq,
+    // `#[async_trait]` marks the generated server trait's methods
+    // `#[must_use]`, and newer clippy also treats their boxed-future return
+    // type as must-use.
+    clippy::double_must_use,
     clippy::enum_variant_names,
     missing_docs,
     // The generated server stubs are used only by the cfg(test) mock server,
