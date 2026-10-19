@@ -269,6 +269,7 @@ impl OxiaService for Service {
                         })
                         .collect(),
                     shard_key_router: proto::ShardKeyRouter::Xxhash3 as i32,
+                    key_sorting: proto::KeySorting::Unknown as i32,
                 },
             )]
             .into(),

@@ -541,6 +541,7 @@ impl ListBuilder {
             end_exclusive: self.max_key_exclusive,
             secondary_index_name: self.secondary_index_name,
             include_internal_keys: self.include_internal_keys,
+            end_inclusive: false,
         };
         (self.client, self.partition_key, request)
     }
@@ -628,6 +629,7 @@ impl RangeScanBuilder {
             end_exclusive: self.max_key_exclusive,
             secondary_index_name: self.secondary_index_name,
             include_internal_keys: self.include_internal_keys,
+            end_inclusive: false,
         };
         (self.client, self.partition_key, request)
     }
