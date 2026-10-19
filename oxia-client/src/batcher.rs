@@ -174,10 +174,24 @@ struct WriteBody {
 
 impl WriteBody {
     fn push(&mut self, op: WriteOp, size: usize) {
+        // The op's position among all the ops of the batch: a server with
+        // FEATURE_ORDERED_WRITES applies them in this order rather than all
+        // the puts, then the deletes, then the delete ranges. `count` is
+        // bounded by `max_requests_per_batch` (a u32), so the cast is lossless.
+        let op_index = self.count as u32;
         match op {
-            WriteOp::Put(p) => self.puts.push(p),
-            WriteOp::Delete(d) => self.deletes.push(d),
-            WriteOp::DeleteRange(r) => self.delete_ranges.push(r),
+            WriteOp::Put(mut p) => {
+                p.request.op_index = op_index;
+                self.puts.push(p);
+            }
+            WriteOp::Delete(mut d) => {
+                d.request.op_index = op_index;
+                self.deletes.push(d);
+            }
+            WriteOp::DeleteRange(mut r) => {
+                r.request.op_index = op_index;
+                self.delete_ranges.push(r);
+            }
         }
         self.count += 1;
         self.bytes += size;
@@ -956,6 +970,7 @@ mod tests {
             proto::DeleteRangeRequest {
                 start_inclusive: "ab".to_string(),
                 end_exclusive: "abc".to_string(),
+                ..Default::default()
             },
             WriteOp::DeleteRange,
         );
@@ -987,6 +1002,57 @@ mod tests {
         assert_eq!(request.shard, Some(7));
         assert_eq!(request.puts.len(), 1);
         assert_eq!(callbacks.puts.len(), 1);
+    }
+
+    #[test]
+    fn write_body_assigns_op_index_in_issue_order() {
+        let delete_op = |key: &str| {
+            pending_write(
+                proto::DeleteRequest {
+                    key: key.to_string(),
+                    ..Default::default()
+                },
+                WriteOp::Delete,
+            )
+        };
+        let (put_0, _rx0) = put_op("put-0", b"v");
+        let (delete_1, _rx1) = delete_op("delete-1");
+        let (put_2, _rx2) = put_op("put-2", b"v");
+        let (range_3, _rx3) = pending_write(
+            proto::DeleteRangeRequest {
+                start_inclusive: "range-3".to_string(),
+                end_exclusive: "range-4".to_string(),
+                ..Default::default()
+            },
+            WriteOp::DeleteRange,
+        );
+        let (delete_4, _rx4) = delete_op("delete-4");
+
+        let mut body = WriteBody::default();
+        for op in [put_0, delete_1, put_2, range_3, delete_4] {
+            let size = op.size();
+            body.push(op, size);
+        }
+
+        let (request, _callbacks) = body.into_request(0);
+        let puts: Vec<_> = request
+            .puts
+            .iter()
+            .map(|p| (p.key.as_str(), p.op_index))
+            .collect();
+        assert_eq!(puts, [("put-0", 0), ("put-2", 2)]);
+        let deletes: Vec<_> = request
+            .deletes
+            .iter()
+            .map(|d| (d.key.as_str(), d.op_index))
+            .collect();
+        assert_eq!(deletes, [("delete-1", 1), ("delete-4", 4)]);
+        let delete_ranges: Vec<_> = request
+            .delete_ranges
+            .iter()
+            .map(|r| (r.start_inclusive.as_str(), r.op_index))
+            .collect();
+        assert_eq!(delete_ranges, [("range-3", 3)]);
     }
 
     fn test_deps(max_batch_size: usize) -> Arc<BatcherDeps> {

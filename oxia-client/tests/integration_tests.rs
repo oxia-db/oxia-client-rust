@@ -506,6 +506,39 @@ async fn test_multiple_puts_batch() {
     client.close().await.unwrap();
 }
 
+/// A put, a delete and a put on one key, issued without waiting for each
+/// other, share a write batch. The server applies them in the order they were
+/// issued (the requests' `op_index`), so the last put wins. A server without
+/// ordered writes applies every put before any delete, leaving the key
+/// deleted.
+///
+/// Run it against `oxia/oxia:nightly-beta`, built daily from oxia main:
+/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
+#[tokio::test]
+#[ignore = "needs an Oxia server with ordered writes (oxia-db/oxia#1312), which oxia/oxia:main predates"]
+async fn test_batched_writes_apply_in_issue_order() {
+    let (_container, address) = start_oxia().await;
+    let client = new_client(&address).await;
+
+    // `biased` polls the operations in order, and each one joins the open
+    // batch on its first poll. On this single-threaded runtime the batch
+    // cannot be flushed before all three are in it.
+    let (put1, delete, put2) = tokio::join!(
+        biased;
+        client.put("ordered/key", "v1"),
+        client.delete("ordered/key"),
+        client.put("ordered/key", "v2"),
+    );
+    put1.unwrap();
+    delete.unwrap();
+    put2.unwrap();
+
+    let get = client.get("ordered/key").await.unwrap();
+    assert_eq!(get.value.as_deref(), Some(b"v2".to_vec()).as_deref());
+
+    client.close().await.unwrap();
+}
+
 // ============================================================
 // Notification Tests
 // ============================================================
