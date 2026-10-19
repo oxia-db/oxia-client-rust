@@ -1,6 +1,7 @@
 use crate::address::ensure_protocol;
 use crate::errors::OxiaError;
 use crate::hash::shard_key_hash;
+use crate::key::KeyOrder;
 use crate::proto::shard_assignment::ShardBoundaries;
 use crate::proto::{NamespaceShardsAssignment, ShardAssignmentsRequest, ShardKeyRouter};
 use crate::provider_manager::ProviderManager;
@@ -42,6 +43,8 @@ struct ShardRange {
 /// than a linear scan.
 struct Assignments {
     shard_key_router: i32,
+    /// The order of the keys in the shards, from the namespace's key sorting.
+    key_order: KeyOrder,
     /// Shard hash ranges, sorted ascending by `min_hash`.
     ranges: Vec<ShardRange>,
     /// Shard id -> leader address.
@@ -52,6 +55,7 @@ impl Assignments {
     fn empty() -> Self {
         Assignments {
             shard_key_router: ShardKeyRouter::Xxhash3 as i32,
+            key_order: KeyOrder::default(),
             ranges: Vec::new(),
             leaders: HashMap::new(),
         }
@@ -73,6 +77,7 @@ impl Assignments {
         ranges.sort_by_key(|r| r.min_hash);
         Assignments {
             shard_key_router: namespace_assignment.shard_key_router,
+            key_order: KeyOrder::from_key_sorting(namespace_assignment.key_sorting),
             ranges,
             leaders,
         }
@@ -298,6 +303,12 @@ impl ShardManager {
             .copied()
             .collect()
     }
+
+    /// The order of the keys in the shards of the namespace, per the current
+    /// assignments.
+    pub(crate) fn key_order(&self) -> KeyOrder {
+        self.inner.assignments.load().key_order
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +327,7 @@ mod tests {
     fn shard_for_hash_binary_search() {
         let a = Assignments {
             shard_key_router: ShardKeyRouter::Xxhash3 as i32,
+            key_order: KeyOrder::default(),
             ranges: vec![range(0, 99, 1), range(100, 199, 2), range(200, u32::MAX, 3)],
             leaders: HashMap::new(),
         };
@@ -332,6 +344,7 @@ mod tests {
         // A gap between 100..=199 that no shard owns.
         let a = Assignments {
             shard_key_router: ShardKeyRouter::Xxhash3 as i32,
+            key_order: KeyOrder::default(),
             ranges: vec![range(0, 99, 1), range(200, 299, 2)],
             leaders: HashMap::new(),
         };
@@ -344,5 +357,25 @@ mod tests {
     fn empty_assignments_route_nowhere() {
         let a = Assignments::empty();
         assert_eq!(a.shard_for_hash(0).map(|r| r.shard), None);
+    }
+
+    /// The assignments keep the key sorting of the namespace, and a server
+    /// that does not report it leaves the legacy order.
+    #[test]
+    fn assignments_keep_the_key_sorting() {
+        use crate::proto::KeySorting;
+
+        for (key_sorting, order) in [
+            (KeySorting::Natural, KeyOrder::Natural),
+            (KeySorting::Hierarchical, KeyOrder::Hierarchical),
+            (KeySorting::Unknown, KeyOrder::Legacy),
+        ] {
+            let namespace = NamespaceShardsAssignment {
+                key_sorting: key_sorting as i32,
+                ..NamespaceShardsAssignment::default()
+            };
+            assert_eq!(Assignments::from_namespace(&namespace).key_order, order);
+        }
+        assert_eq!(Assignments::empty().key_order, KeyOrder::Legacy);
     }
 }

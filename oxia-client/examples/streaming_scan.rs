@@ -5,8 +5,8 @@
 //! into a `Vec` — fine for bounded ranges. Chaining `.stream()` instead
 //! returns an ordered async stream that pulls from the server only as fast as
 //! it is consumed (buffering at most one pending item per shard), so a scan
-//! over millions of records runs in constant memory. Items arrive in Oxia's
-//! global slash-aware key order; the first error terminates the stream.
+//! over millions of records runs in constant memory. Items arrive in the
+//! global key order of the namespace; the first error terminates the stream.
 
 use futures::StreamExt;
 use oxia::OxiaClient;

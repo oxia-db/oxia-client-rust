@@ -4,6 +4,7 @@ use crate::batcher::{BatcherDeps, ReadBatcher, WriteBatcher, WriteOp, pending_wr
 use crate::client_builder::OxiaClientBuilder;
 use crate::client_options::OxiaClientOptions;
 use crate::errors::OxiaError;
+use crate::key::KeyOrder;
 use crate::metrics::Metrics;
 use crate::notification_manager::NotificationManager;
 use crate::operations::Pending;
@@ -319,7 +320,7 @@ impl OxiaClient {
     }
 
     /// Deletes every record with `min_key_inclusive <= key < max_key_exclusive`
-    /// (in Oxia's slash-aware key order).
+    /// (in the key order of the namespace).
     ///
     /// Without a [`partition_key`](DeleteRangeBuilder::partition_key) the
     /// deletion is applied on every shard; it is not atomic across shards.
@@ -351,7 +352,7 @@ impl OxiaClient {
     }
 
     /// Lists the keys with `min_key_inclusive <= key < max_key_exclusive`
-    /// (in Oxia's slash-aware key order).
+    /// (in the key order of the namespace).
     ///
     /// `.await` the builder for all keys at once (bounded by the request
     /// timeout), or call [`stream()`](ListBuilder::stream) for an
@@ -386,7 +387,7 @@ impl OxiaClient {
     }
 
     /// Reads every record with `min_key_inclusive <= key < max_key_exclusive`
-    /// (in Oxia's slash-aware key order).
+    /// (in the key order of the namespace).
     ///
     /// `.await` the builder for all records at once (bounded by the request
     /// timeout), or call [`stream()`](RangeScanBuilder::stream) for an
@@ -734,6 +735,7 @@ impl OxiaClient {
         self.with_reroute_retry(|| {
             let request = request.clone();
             async move {
+                let order = self.inner.shard_manager.key_order();
                 let mut join_set = JoinSet::new();
                 for shard in self.inner.shard_manager.get_shard_ids() {
                     let client = self.clone();
@@ -759,7 +761,9 @@ impl OxiaClient {
                         Ok(candidate) => {
                             best = Some(match best.take() {
                                 None => candidate,
-                                Some(current) => pick_get_winner(current, candidate, comparison),
+                                Some(current) => {
+                                    pick_get_winner(current, candidate, comparison, order)
+                                }
                             })
                         }
                         // Not every shard has a matching record.
@@ -820,7 +824,10 @@ impl OxiaClient {
                 Ok::<_, OxiaError>(stream)
             }
         });
-        Ok(ListStream::new(merged(try_join_all(opens).await?)))
+        Ok(ListStream::new(merged(
+            try_join_all(opens).await?,
+            self.inner.shard_manager.key_order(),
+        )))
     }
 
     pub(crate) async fn open_range_scan_stream(
@@ -861,7 +868,10 @@ impl OxiaClient {
                 Ok::<_, OxiaError>(stream)
             }
         });
-        Ok(RangeScanStream::new(merged(try_join_all(opens).await?)))
+        Ok(RangeScanStream::new(merged(
+            try_join_all(opens).await?,
+            self.inner.shard_manager.key_order(),
+        )))
     }
 
     /// Opens a per-shard server stream, retrying — with backoff and leader
@@ -1050,15 +1060,21 @@ fn track(first_err: &mut Option<OxiaError>, result: Result<(), OxiaError>, what:
     }
 }
 
-/// Reduces two per-shard get results to the winner for the comparison type.
-fn pick_get_winner(a: GetResult, b: GetResult, comparison: ComparisonType) -> GetResult {
+/// Reduces two per-shard get results to the winner for the comparison type,
+/// comparing their keys in the key order of the namespace.
+fn pick_get_winner(
+    a: GetResult,
+    b: GetResult,
+    comparison: ComparisonType,
+    order: KeyOrder,
+) -> GetResult {
     let a_wins = match comparison {
         // The smallest matching key wins.
         ComparisonType::Equal | ComparisonType::Ceiling | ComparisonType::Higher => {
-            a.compare_keys(&b).is_le()
+            a.compare_keys(&b, order).is_le()
         }
         // The largest matching key wins.
-        ComparisonType::Floor | ComparisonType::Lower => a.compare_keys(&b).is_ge(),
+        ComparisonType::Floor | ComparisonType::Lower => a.compare_keys(&b, order).is_ge(),
     };
     if a_wins { a } else { b }
 }

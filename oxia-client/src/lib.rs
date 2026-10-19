@@ -69,8 +69,10 @@
 //!   every change applied to the database.
 //!   ([guide](https://oxia-db.github.io/docs/features/notifications))
 //!
-//! Keys use Oxia's slash-aware order (`/`-separated path segments), not plain
-//! lexicographic order; range boundaries follow it.
+//! Keys are ordered by the key sorting of their namespace: hierarchical by
+//! default (the keys with fewer `/` first, then by their bytes), or natural
+//! (by their bytes). Range boundaries follow it, and the client merges the
+//! results of a read across shards in it.
 //! ([guide](https://oxia-db.github.io/docs/features/oxia-key-sorting))
 //!
 //! # Options

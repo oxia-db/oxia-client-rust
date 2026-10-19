@@ -1,7 +1,7 @@
 //! Public domain types returned by client operations.
 
 use crate::errors::OxiaError;
-use crate::key;
+use crate::key::KeyOrder;
 use crate::proto;
 use bytes::Bytes;
 use std::cmp::Ordering;
@@ -129,8 +129,8 @@ impl GetResult {
         })
     }
 
-    pub(crate) fn compare_keys(&self, other: &Self) -> Ordering {
-        key::compare(&self.key, &other.key)
+    pub(crate) fn compare_keys(&self, other: &Self, order: KeyOrder) -> Ordering {
+        order.compare(&self.key, &other.key)
     }
 }
 

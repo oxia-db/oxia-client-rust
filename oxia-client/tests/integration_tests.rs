@@ -10,13 +10,18 @@ const DEFAULT_OXIA_IMAGE: &str = "oxia/oxia";
 const DEFAULT_OXIA_TAG: &str = "main";
 
 async fn start_oxia() -> (ContainerAsync<GenericImage>, String) {
+    start_oxia_with(&[]).await
+}
+
+/// Starts `oxia standalone` with extra flags (e.g. `--shards 4`).
+async fn start_oxia_with(flags: &[&str]) -> (ContainerAsync<GenericImage>, String) {
     let image = std::env::var("OXIA_IMAGE").unwrap_or_else(|_| DEFAULT_OXIA_IMAGE.to_string());
     let tag = std::env::var("OXIA_TAG").unwrap_or_else(|_| DEFAULT_OXIA_TAG.to_string());
 
     let container = GenericImage::new(image, tag)
         .with_exposed_port(ContainerPort::Tcp(OXIA_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Started Grpc server"))
-        .with_cmd(vec!["oxia", "standalone"])
+        .with_cmd(["oxia", "standalone"].iter().chain(flags).copied())
         .start()
         .await
         .expect("Failed to start Oxia container");
@@ -422,6 +427,54 @@ async fn test_get_higher() {
         .await
         .unwrap();
     client.close().await.unwrap();
+}
+
+/// A floor get, a list and a range scan without a partition key go to every
+/// shard, and the client merges the answers of the shards in the key sorting
+/// of the namespace, which the server reports with the shard assignments. The
+/// keys are the example of oxia-db/oxia#1388: with 4 shards, the legacy
+/// slash-aware merge disagrees with the server's order in both sortings.
+///
+/// Run it against `oxia/oxia:nightly-beta`, built daily from oxia main:
+/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
+#[tokio::test]
+#[ignore = "needs a server that reports the key sorting (oxia-db/oxia#1388), which oxia/oxia:main predates"]
+async fn test_multi_shard_reads_merge_in_the_key_sorting() {
+    for (key_sorting, floor_of, floor, ordered) in [
+        (
+            "hierarchical",
+            "a/z",
+            "a/x",
+            ["a0", "b", "ab/y", "a/x", "a/y/z"],
+        ),
+        ("natural", "a1", "a0", ["a/x", "a/y/z", "a0", "ab/y", "b"]),
+    ] {
+        let (_container, address) =
+            start_oxia_with(&["--shards", "4", "--key-sorting", key_sorting]).await;
+        let client = new_client(&address).await;
+        for key in ["b", "a/y/z", "ab/y", "a0", "a/x"] {
+            client.put(key, key).await.unwrap();
+        }
+
+        let found = client
+            .get(floor_of)
+            .comparison(ComparisonType::Floor)
+            .await
+            .unwrap();
+        assert_eq!(found.key, floor, "{key_sorting}: floor of {floor_of:?}");
+        let listed = client.list("", "").await.unwrap();
+        assert_eq!(listed, ordered, "{key_sorting}: list");
+        let scanned: Vec<_> = client
+            .range_scan("", "")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.key)
+            .collect();
+        assert_eq!(scanned, ordered, "{key_sorting}: range scan");
+
+        client.close().await.unwrap();
+    }
 }
 
 // ============================================================
