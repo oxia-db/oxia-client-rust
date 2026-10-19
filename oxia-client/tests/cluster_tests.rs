@@ -81,6 +81,17 @@ async fn start_cluster(servers: usize, initial_shards: u32) -> Cluster {
     }
     let container = request.start().await.expect("Failed to start Oxia cluster");
 
+    // Wait for every server, not just the bootstrap one. A server rejects
+    // all client requests, writes to the shards it leads included, with
+    // "server not initialized yet" until the coordinator sends it the shard
+    // assignments, and each server gets them at its own time: up to ~10 s
+    // apart before oxia-db/oxia#1326. A server serves the assignments only
+    // once it has them, so a client builds through it only once it is ready.
+    for host_port in &host_ports {
+        let probe = connect_with_retry(&format!("localhost:{host_port}")).await;
+        probe.close().await.expect("close probe client");
+    }
+
     Cluster {
         container,
         address: format!("localhost:{}", host_ports[0]),
@@ -111,7 +122,8 @@ impl Cluster {
     }
 }
 
-/// Builds a client, retrying while the cluster elects its shard leaders.
+/// Builds a client, retrying until the server at `address` serves the shard
+/// assignments.
 async fn connect_with_retry(address: &str) -> OxiaClient {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
