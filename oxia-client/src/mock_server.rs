@@ -69,6 +69,12 @@ pub(crate) struct Behavior {
     /// or a range scan of a shard returns all of them, one per response,
     /// whatever its range.
     pub(crate) shard_keys: HashMap<i64, Vec<&'static str>>,
+    /// The shards whose leader includes the end of the range of a list or a
+    /// range scan that asks for it, like a server with
+    /// FEATURE_RANGE_END_INCLUSIVE: their responses say so, and they send one
+    /// without keys when they have none. The other shards ignore it, like an
+    /// older server.
+    pub(crate) end_inclusive_shards: Vec<i64>,
 }
 
 impl Default for Behavior {
@@ -81,6 +87,7 @@ impl Default for Behavior {
             shards: 1,
             key_sorting: proto::KeySorting::Unknown,
             shard_keys: HashMap::new(),
+            end_inclusive_shards: Vec::new(),
         }
     }
 }
@@ -262,6 +269,21 @@ impl Service {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// The keys of the responses of a shard to a list or a range scan, and
+    /// whether the responses say that they include the end of the range.
+    fn scan(&self, shard: Option<i64>, end_inclusive: bool) -> (Vec<Vec<&'static str>>, bool) {
+        let keys = self.shard_keys(shard);
+        let included = end_inclusive
+            && shard.is_some_and(|shard| {
+                let behavior = self.state.behavior.lock().expect("behavior lock");
+                behavior.end_inclusive_shards.contains(&shard)
+            });
+        if keys.is_empty() && included {
+            return (vec![Vec::new()], true);
+        }
+        (keys.into_iter().map(|key| vec![key]).collect(), included)
+    }
 }
 
 type Rpc<T> = Result<Response<T>, Status>;
@@ -434,13 +456,14 @@ impl OxiaService for Service {
     type ListStream = BoxStream<'static, Result<proto::ListResponse, Status>>;
 
     async fn list(&self, request: Request<proto::ListRequest>) -> Rpc<Self::ListStream> {
-        let responses: Vec<_> = self
-            .shard_keys(request.into_inner().shard)
+        let request = request.into_inner();
+        let (responses, end_inclusive) = self.scan(request.shard, request.end_inclusive);
+        let responses: Vec<_> = responses
             .into_iter()
-            .map(|key| {
+            .map(|keys| {
                 Ok(proto::ListResponse {
-                    keys: vec![key.to_string()],
-                    end_inclusive: false,
+                    keys: keys.into_iter().map(String::from).collect(),
+                    end_inclusive,
                 })
             })
             .collect();
@@ -453,13 +476,14 @@ impl OxiaService for Service {
         &self,
         request: Request<proto::RangeScanRequest>,
     ) -> Rpc<Self::RangeScanStream> {
-        let responses: Vec<_> = self
-            .shard_keys(request.into_inner().shard)
+        let request = request.into_inner();
+        let (responses, end_inclusive) = self.scan(request.shard, request.end_inclusive);
+        let responses: Vec<_> = responses
             .into_iter()
-            .map(|key| {
+            .map(|keys| {
                 Ok(proto::RangeScanResponse {
-                    records: vec![record(key)],
-                    end_inclusive: false,
+                    records: keys.into_iter().map(record).collect(),
+                    end_inclusive,
                 })
             })
             .collect();
@@ -984,6 +1008,86 @@ mod tests {
                 .map(|record| record.key)
                 .collect();
             assert_eq!(scanned, expected, "range scan, {key_sorting:?}");
+        }
+    }
+
+    /// A list or a range scan with `end_inclusive` fails with
+    /// `EndInclusiveUnsupported` unless the leader of every shard includes
+    /// the end of the range, which it says in all its responses, sending one
+    /// at least: an older server ignores the flag and leaves the end out.
+    /// The cases are those of the Go reference (`endInclusiveTests`).
+    #[tokio::test]
+    async fn end_inclusive_needs_every_shard_to_include_the_end() {
+        for (case, end_inclusive, [shard_0, shard_1], end_inclusive_shards, expected) in [
+            (
+                "included",
+                true,
+                [vec!["a", "b"], vec!["c"]],
+                vec![0, 1],
+                Some(vec!["a", "b", "c"]),
+            ),
+            (
+                "included, empty shard",
+                true,
+                [vec!["a"], vec![]],
+                vec![0, 1],
+                Some(vec!["a"]),
+            ),
+            (
+                "older server",
+                true,
+                [vec!["a"], vec!["c", "d"]],
+                vec![0],
+                None,
+            ),
+            (
+                "older server, empty shard",
+                true,
+                [vec!["a"], vec![]],
+                vec![0],
+                None,
+            ),
+            (
+                "not requested",
+                false,
+                [vec!["a"], vec!["c"]],
+                vec![],
+                Some(vec!["a", "c"]),
+            ),
+        ] {
+            let mock = MockOxia::start(Behavior {
+                shards: 2,
+                shard_keys: HashMap::from([(0, shard_0), (1, shard_1)]),
+                end_inclusive_shards,
+                ..Behavior::default()
+            })
+            .await;
+            let client = connect(&mock, Duration::from_secs(5)).await;
+
+            let (mut list, mut scan) = (client.list("a", "z"), client.range_scan("a", "z"));
+            if end_inclusive {
+                (list, scan) = (list.end_inclusive(), scan.end_inclusive());
+            }
+            let listed = list.await;
+            let scanned = scan
+                .await
+                .map(|records| records.into_iter().map(|r| r.key).collect::<Vec<_>>());
+            match expected {
+                Some(expected) => {
+                    assert_eq!(listed.expect(case), expected, "list, {case}");
+                    assert_eq!(scanned.expect(case), expected, "range scan, {case}");
+                }
+                None => {
+                    assert!(
+                        matches!(listed, Err(OxiaError::EndInclusiveUnsupported)),
+                        "list, {case}: {listed:?}"
+                    );
+                    assert!(
+                        matches!(scanned, Err(OxiaError::EndInclusiveUnsupported)),
+                        "range scan, {case}: {scanned:?}"
+                    );
+                }
+            }
         }
     }
 }

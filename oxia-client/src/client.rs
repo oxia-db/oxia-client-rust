@@ -352,7 +352,8 @@ impl OxiaClient {
     }
 
     /// Lists the keys with `min_key_inclusive <= key < max_key_exclusive`
-    /// (in the key order of the namespace).
+    /// (in the key order of the namespace), or `<= max_key_exclusive` with
+    /// [`end_inclusive`](ListBuilder::end_inclusive).
     ///
     /// `.await` the builder for all keys at once (bounded by the request
     /// timeout), or call [`stream()`](ListBuilder::stream) for an
@@ -364,8 +365,10 @@ impl OxiaClient {
     ///
     /// Awaiting the builder returns [`OxiaError::Timeout`] when collecting
     /// all keys exceeds the request timeout, [`OxiaError::Closed`] after
-    /// [`close`](OxiaClient::close), or transient routing/transport errors.
-    /// An empty range yields an empty `Vec`, not an error.
+    /// [`close`](OxiaClient::close), [`OxiaError::EndInclusiveUnsupported`]
+    /// when [`end_inclusive`](ListBuilder::end_inclusive) reaches a shard
+    /// that leaves the end out, or transient routing/transport errors. An
+    /// empty range yields an empty `Vec`, not an error.
     ///
     /// # Example
     ///
@@ -387,7 +390,8 @@ impl OxiaClient {
     }
 
     /// Reads every record with `min_key_inclusive <= key < max_key_exclusive`
-    /// (in the key order of the namespace).
+    /// (in the key order of the namespace), or `<= max_key_exclusive` with
+    /// [`end_inclusive`](RangeScanBuilder::end_inclusive).
     ///
     /// `.await` the builder for all records at once (bounded by the request
     /// timeout), or call [`stream()`](RangeScanBuilder::stream) for an
@@ -400,7 +404,9 @@ impl OxiaClient {
     ///
     /// Awaiting the builder returns [`OxiaError::Timeout`] when collecting
     /// all records exceeds the request timeout, [`OxiaError::Closed`] after
-    /// [`close`](OxiaClient::close), or transient routing/transport errors.
+    /// [`close`](OxiaClient::close), [`OxiaError::EndInclusiveUnsupported`]
+    /// when [`end_inclusive`](RangeScanBuilder::end_inclusive) reaches a
+    /// shard that leaves the end out, or transient routing/transport errors.
     /// An empty range yields an empty `Vec`, not an error.
     ///
     /// # Example
@@ -795,6 +801,7 @@ impl OxiaClient {
         partition_key: Option<&str>,
     ) -> Result<ListStream, OxiaError> {
         self.ensure_open()?;
+        let end_inclusive = request.end_inclusive;
         let opens = self.target_shards(partition_key)?.into_iter().map(|shard| {
             let client = self.clone();
             let request = request.clone();
@@ -806,16 +813,20 @@ impl OxiaClient {
                         async move { provider.list(request).await }
                     })
                     .await?;
-                let head = first
-                    .map(|response: proto::ListResponse| {
-                        response.keys.into_iter().map(Ok).collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                check_end_inclusive(end_inclusive, first.as_ref().map(|r| r.end_inclusive))?;
+                let to_keys = move |response: proto::ListResponse| match check_end_inclusive(
+                    end_inclusive,
+                    Some(response.end_inclusive),
+                ) {
+                    Ok(()) => response.keys.into_iter().map(Ok).collect(),
+                    Err(err) => vec![Err(err)],
+                };
+                let head = first.map(to_keys).unwrap_or_default();
                 let stream: ShardStream<String> = Box::pin(
                     futures::stream::iter(head).chain(
                         streaming
-                            .map(|chunk| match chunk {
-                                Ok(response) => response.keys.into_iter().map(Ok).collect(),
+                            .map(move |chunk| match chunk {
+                                Ok(response) => to_keys(response),
                                 Err(status) => vec![Err(OxiaError::from(status))],
                             })
                             .flat_map(futures::stream::iter),
@@ -836,6 +847,7 @@ impl OxiaClient {
         partition_key: Option<&str>,
     ) -> Result<RangeScanStream, OxiaError> {
         self.ensure_open()?;
+        let end_inclusive = request.end_inclusive;
         let opens = self.target_shards(partition_key)?.into_iter().map(|shard| {
             let client = self.clone();
             let request = request.clone();
@@ -847,12 +859,17 @@ impl OxiaClient {
                         async move { provider.range_scan(request).await }
                     })
                     .await?;
-                let to_items = |response: proto::RangeScanResponse| {
-                    response
+                check_end_inclusive(end_inclusive, first.as_ref().map(|r| r.end_inclusive))?;
+                let to_items = move |response: proto::RangeScanResponse| match check_end_inclusive(
+                    end_inclusive,
+                    Some(response.end_inclusive),
+                ) {
+                    Ok(()) => response
                         .records
                         .into_iter()
                         .map(|record| GetResult::from_proto(record, None))
-                        .collect::<Vec<_>>()
+                        .collect(),
+                    Err(err) => vec![Err(err)],
                 };
                 let head = first.map(to_items).unwrap_or_default();
                 let stream: ShardStream<GetResult> = Box::pin(
@@ -1058,6 +1075,19 @@ fn track(first_err: &mut Option<OxiaError>, result: Result<(), OxiaError>, what:
         warn!("error while closing {what}: {err}");
         first_err.get_or_insert(err);
     }
+}
+
+/// Checks that a shard included the end of the range of a list or a range
+/// scan that asked for it ([`end_inclusive`](crate::ListBuilder::end_inclusive)),
+/// given the flag of one of its responses, or `None` when it sent none.
+/// Older servers ignore the request's flag and leave the end out, while a
+/// leader that includes it says so in all its responses, and sends at least
+/// one.
+fn check_end_inclusive(requested: bool, included: Option<bool>) -> Result<(), OxiaError> {
+    if requested && included != Some(true) {
+        return Err(OxiaError::EndInclusiveUnsupported);
+    }
+    Ok(())
 }
 
 /// Reduces two per-shard get results to the winner for the comparison type,

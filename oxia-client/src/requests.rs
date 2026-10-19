@@ -497,6 +497,7 @@ pub struct ListBuilder {
     partition_key: Option<String>,
     secondary_index_name: Option<String>,
     include_internal_keys: bool,
+    end_inclusive: bool,
 }
 
 impl ListBuilder {
@@ -512,6 +513,7 @@ impl ListBuilder {
             partition_key: None,
             secondary_index_name: None,
             include_internal_keys: false,
+            end_inclusive: false,
         }
     }
 
@@ -534,6 +536,20 @@ impl ListBuilder {
         self
     }
 
+    /// Includes the end of the range: the key `max_key_exclusive`, or with
+    /// [`use_index`](ListBuilder::use_index), the records whose secondary key
+    /// is `max_key_exclusive`. An empty end is then the empty key rather than
+    /// no bound, and with an index, a range from a key to the same key lists
+    /// the records whose secondary key is that key.
+    ///
+    /// The leader of a shard includes the end once all the servers of the
+    /// shard support it. Until then, the list fails with
+    /// [`OxiaError::EndInclusiveUnsupported`] rather than leave the end out.
+    pub fn end_inclusive(mut self) -> Self {
+        self.end_inclusive = true;
+        self
+    }
+
     fn into_request(self) -> (OxiaClient, Option<String>, proto::ListRequest) {
         let request = proto::ListRequest {
             shard: None,
@@ -541,7 +557,7 @@ impl ListBuilder {
             end_exclusive: self.max_key_exclusive,
             secondary_index_name: self.secondary_index_name,
             include_internal_keys: self.include_internal_keys,
-            end_inclusive: false,
+            end_inclusive: self.end_inclusive,
         };
         (self.client, self.partition_key, request)
     }
@@ -586,6 +602,7 @@ pub struct RangeScanBuilder {
     partition_key: Option<String>,
     secondary_index_name: Option<String>,
     include_internal_keys: bool,
+    end_inclusive: bool,
 }
 
 impl RangeScanBuilder {
@@ -601,6 +618,7 @@ impl RangeScanBuilder {
             partition_key: None,
             secondary_index_name: None,
             include_internal_keys: false,
+            end_inclusive: false,
         }
     }
 
@@ -622,6 +640,21 @@ impl RangeScanBuilder {
         self
     }
 
+    /// Includes the end of the range: the record whose key is
+    /// `max_key_exclusive`, or with [`use_index`](RangeScanBuilder::use_index),
+    /// the records whose secondary key is `max_key_exclusive`. An empty end is
+    /// then the empty key rather than no bound, and with an index, a range
+    /// from a key to the same key scans the records whose secondary key is
+    /// that key.
+    ///
+    /// The leader of a shard includes the end once all the servers of the
+    /// shard support it. Until then, the scan fails with
+    /// [`OxiaError::EndInclusiveUnsupported`] rather than leave the end out.
+    pub fn end_inclusive(mut self) -> Self {
+        self.end_inclusive = true;
+        self
+    }
+
     fn into_request(self) -> (OxiaClient, Option<String>, proto::RangeScanRequest) {
         let request = proto::RangeScanRequest {
             shard: None,
@@ -629,7 +662,7 @@ impl RangeScanBuilder {
             end_exclusive: self.max_key_exclusive,
             secondary_index_name: self.secondary_index_name,
             include_internal_keys: self.include_internal_keys,
-            end_inclusive: false,
+            end_inclusive: self.end_inclusive,
         };
         (self.client, self.partition_key, request)
     }

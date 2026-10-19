@@ -100,8 +100,8 @@
 //! | [`get`](OxiaClient::get) | [`comparison`](GetBuilder::comparison), [`partition_key`](GetBuilder::partition_key), [`include_value`](GetBuilder::include_value), [`use_index`](GetBuilder::use_index) |
 //! | [`delete`](OxiaClient::delete) | [`expected_version_id`](DeleteBuilder::expected_version_id), [`partition_key`](DeleteBuilder::partition_key) |
 //! | [`delete_range`](OxiaClient::delete_range) | [`partition_key`](DeleteRangeBuilder::partition_key) |
-//! | [`list`](OxiaClient::list) | [`partition_key`](ListBuilder::partition_key), [`use_index`](ListBuilder::use_index), [`stream`](ListBuilder::stream) |
-//! | [`range_scan`](OxiaClient::range_scan) | [`partition_key`](RangeScanBuilder::partition_key), [`use_index`](RangeScanBuilder::use_index), [`stream`](RangeScanBuilder::stream) |
+//! | [`list`](OxiaClient::list) | [`partition_key`](ListBuilder::partition_key), [`use_index`](ListBuilder::use_index), [`end_inclusive`](ListBuilder::end_inclusive), [`stream`](ListBuilder::stream) |
+//! | [`range_scan`](OxiaClient::range_scan) | [`partition_key`](RangeScanBuilder::partition_key), [`use_index`](RangeScanBuilder::use_index), [`end_inclusive`](RangeScanBuilder::end_inclusive), [`stream`](RangeScanBuilder::stream) |
 //! | [`notifications`](OxiaClient::notifications) | [`buffer_size`](NotificationsBuilder::buffer_size) |
 //! | [`sequence_updates`](OxiaClient::sequence_updates) | [`buffer_size`](SequenceUpdatesBuilder::buffer_size) |
 //!

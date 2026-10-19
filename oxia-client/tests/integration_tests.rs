@@ -858,6 +858,108 @@ async fn test_secondary_index() {
 }
 
 // ============================================================
+// Inclusive Range End Tests
+// ============================================================
+
+/// A list or a range scan with `end_inclusive` includes the end of its range,
+/// or fails with `EndInclusiveUnsupported` on a server that leaves the end out
+/// (such as `oxia/oxia:main`, which predates oxia-db/oxia#1608): it never
+/// returns the half-open range silently.
+#[tokio::test]
+async fn test_end_inclusive_includes_the_end_or_fails() {
+    let (_container, address) = start_oxia().await;
+    let client = new_client(&address).await;
+    for key in ["incl/a", "incl/b", "incl/c"] {
+        client.put(key, key).await.unwrap();
+    }
+
+    let listed = client.list("incl/a", "incl/b").end_inclusive().await;
+    let scanned = client
+        .range_scan("incl/a", "incl/b")
+        .end_inclusive()
+        .await
+        .map(|records| records.into_iter().map(|r| r.key).collect::<Vec<_>>());
+    match (listed, scanned) {
+        (Ok(listed), Ok(scanned)) => {
+            assert_eq!(listed, ["incl/a", "incl/b"]);
+            assert_eq!(scanned, ["incl/a", "incl/b"]);
+        }
+        (Err(OxiaError::EndInclusiveUnsupported), Err(OxiaError::EndInclusiveUnsupported)) => {}
+        other => panic!("expected the end, or EndInclusiveUnsupported from both: {other:?}"),
+    }
+
+    client.close().await.unwrap();
+}
+
+/// With `end_inclusive`, a list or a range scan ends at its end key, and
+/// through an index, a range from a key to the same key returns the records
+/// whose secondary key is that key. The records are the example of
+/// oxia-db/oxia#1608, where `["k-1", "k-1~")` also matches `k-12`, `k-1:a`
+/// and `k-1_b`.
+///
+/// Run it against a server with oxia-db/oxia#1608, such as an
+/// `oxia/oxia:nightly-beta` built after it:
+/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
+#[tokio::test]
+#[ignore = "needs FEATURE_RANGE_END_INCLUSIVE (oxia-db/oxia#1608), which oxia/oxia:main predates"]
+async fn test_list_and_range_scan_end_inclusive() {
+    let (_container, address) = start_oxia_with(&["--shards", "4"]).await;
+    let client = new_client(&address).await;
+    for (key, secondary_key) in [
+        ("/ledgers/1", "k-1"),
+        ("/ledgers/2", "k-1"),
+        ("/ledgers/3", "k-12"),
+        ("/ledgers/4", "k-1:a"),
+        ("/ledgers/5", "k-1_b"),
+        ("/ledgers/6", "k-0"),
+    ] {
+        client
+            .put(key, key)
+            .secondary_index("ledgers", secondary_key)
+            .await
+            .unwrap();
+    }
+
+    let mut listed = client
+        .list("k-1", "k-1")
+        .use_index("ledgers")
+        .end_inclusive()
+        .await
+        .unwrap();
+    listed.sort();
+    assert_eq!(listed, ["/ledgers/1", "/ledgers/2"]);
+    let mut scanned: Vec<_> = client
+        .range_scan("k-1", "k-1")
+        .use_index("ledgers")
+        .end_inclusive()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.key)
+        .collect();
+    scanned.sort();
+    assert_eq!(scanned, ["/ledgers/1", "/ledgers/2"]);
+
+    let listed = client
+        .list("/ledgers/2", "/ledgers/4")
+        .end_inclusive()
+        .await
+        .unwrap();
+    assert_eq!(listed, ["/ledgers/2", "/ledgers/3", "/ledgers/4"]);
+    let scanned: Vec<_> = client
+        .range_scan("/ledgers/2", "/ledgers/4")
+        .end_inclusive()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.key)
+        .collect();
+    assert_eq!(scanned, ["/ledgers/2", "/ledgers/3", "/ledgers/4"]);
+
+    client.close().await.unwrap();
+}
+
+// ============================================================
 // Client Builder Tests
 // ============================================================
 

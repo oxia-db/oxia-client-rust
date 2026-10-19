@@ -5,7 +5,8 @@ use thiserror::Error;
 /// The variants fall into three groups:
 /// - **Semantic results** callers commonly match on ([`KeyNotFound`],
 ///   [`UnexpectedVersionId`], [`SessionExpired`], [`RequestTooLarge`],
-///   [`InvalidArgument`]). These are never retryable.
+///   [`InvalidArgument`], [`EndInclusiveUnsupported`]). These are never
+///   retryable.
 /// - **Transient failures** that the client's background loops (and, in a later
 ///   phase, its operation-level retries) may retry: [`LeaderNotFound`],
 ///   [`NoShardForKey`], [`Disconnected`], and some [`Grpc`] codes. See
@@ -18,6 +19,7 @@ use thiserror::Error;
 /// [`SessionExpired`]: OxiaError::SessionExpired
 /// [`RequestTooLarge`]: OxiaError::RequestTooLarge
 /// [`InvalidArgument`]: OxiaError::InvalidArgument
+/// [`EndInclusiveUnsupported`]: OxiaError::EndInclusiveUnsupported
 /// [`LeaderNotFound`]: OxiaError::LeaderNotFound
 /// [`NoShardForKey`]: OxiaError::NoShardForKey
 /// [`Disconnected`]: OxiaError::Disconnected
@@ -49,6 +51,14 @@ pub enum OxiaError {
     /// An option or argument passed to an operation was invalid.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// A [`list`](crate::OxiaClient::list) or
+    /// [`range_scan`](crate::OxiaClient::range_scan) with
+    /// [`end_inclusive`](crate::ListBuilder::end_inclusive) reached a shard
+    /// whose leader left the end of the range out: its server is older, or
+    /// not all the servers of the shard support it yet.
+    #[error("the shard does not support an inclusive end of range")]
+    EndInclusiveUnsupported,
 
     /// No leader is currently available for the shard (e.g. a leader election is
     /// in progress). Retryable.
@@ -191,6 +201,7 @@ mod tests {
         assert!(!OxiaError::UnexpectedVersionId.is_retryable());
         assert!(!OxiaError::SessionExpired.is_retryable());
         assert!(!OxiaError::RequestTooLarge.is_retryable());
+        assert!(!OxiaError::EndInclusiveUnsupported.is_retryable());
         assert!(OxiaError::ShardMoved.is_retryable());
         assert!(!OxiaError::Timeout.is_retryable());
         assert!(!OxiaError::Closed.is_retryable());
