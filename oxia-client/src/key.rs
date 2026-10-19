@@ -1,13 +1,100 @@
+use crate::proto;
 use std::cmp::Ordering;
 
-/// Compares two keys using Oxia's slash-aware ordering.
+/// The prefix of Oxia's own internal keys.
+const INTERNAL_KEY_PREFIX: &str = "__oxia/";
+
+/// The order of the keys in the shards of a namespace, which the shard
+/// assignments report as its key sorting. Each shard returns the results of a
+/// read in this order, and the client picks or merges the results of a read
+/// sent to several shards in the same order, so it has to agree with the
+/// server exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum KeyOrder {
+    /// The order of the storage format before Oxia v0.15 ([`compare`]),
+    /// kept when the server does not report the key sorting.
+    #[default]
+    Legacy,
+    /// `KEY_SORTING_NATURAL`: the keys are sorted by their bytes.
+    Natural,
+    /// `KEY_SORTING_HIERARCHICAL`: the keys with fewer `/` sort first, and
+    /// the keys with as many `/` by their bytes, with `/` after any other
+    /// byte.
+    Hierarchical,
+}
+
+impl KeyOrder {
+    /// The order of a namespace with this key sorting.
+    pub(crate) fn from_key_sorting(key_sorting: i32) -> Self {
+        match proto::KeySorting::try_from(key_sorting) {
+            Ok(proto::KeySorting::Natural) => KeyOrder::Natural,
+            Ok(proto::KeySorting::Hierarchical) => KeyOrder::Hierarchical,
+            // Older servers do not report the key sorting: keep the order
+            // that the client has always used, which is also the order of the
+            // servers older than v0.15.
+            Ok(proto::KeySorting::Unknown) | Err(_) => KeyOrder::Legacy,
+        }
+    }
+
+    /// Compares two keys in this order.
+    pub(crate) fn compare(self, a: &str, b: &str) -> Ordering {
+        match self {
+            KeyOrder::Legacy => compare(a, b),
+            KeyOrder::Natural => compare_natural(a, b),
+            KeyOrder::Hierarchical => compare_hierarchical(a, b),
+        }
+    }
+}
+
+/// Compares two keys as the server sorts them in a natural namespace: by
+/// their bytes, except that the internal keys sort after all the others. The
+/// server stores an internal key with its `__` prefix replaced by
+/// `0xff 0xff`, which no UTF-8 key starts with.
+fn compare_natural(a: &str, b: &str) -> Ordering {
+    let internal = |key: &str| key.starts_with(INTERNAL_KEY_PREFIX);
+    internal(a).cmp(&internal(b)).then_with(|| a.cmp(b))
+}
+
+/// Compares two keys as the server sorts them in a hierarchical namespace,
+/// where it stores a key as its [`hierarchical_level`] on 2 bytes, followed by
+/// the key with every `/` replaced by `0xff`, which sorts it after any other
+/// byte of a UTF-8 key.
+fn compare_hierarchical(a: &str, b: &str) -> Ordering {
+    let encode = |byte: u8| if byte == b'/' { 0xff } else { byte };
+    hierarchical_level(a)
+        .cmp(&hierarchical_level(b))
+        .then_with(|| a.bytes().map(encode).cmp(b.bytes().map(encode)))
+}
+
+/// The level of a key in a hierarchical namespace: its number of `/`, except
+/// the last one of a key that ends with `//`, at most `0x7fff`, with the top
+/// bit set for the internal keys, which sort after all the others.
+fn hierarchical_level(key: &str) -> u16 {
+    const MAX_LEVEL: usize = 0x7fff;
+    const INTERNAL_KEYS: u16 = 0x8000;
+    let mut separators = key.bytes().filter(|&byte| byte == b'/').count();
+    if separators == 0 {
+        return 0;
+    }
+    if key.ends_with("//") {
+        // The trailing separator does not open a new level.
+        separators -= 1;
+    }
+    let mut level = separators.min(MAX_LEVEL) as u16;
+    if key.starts_with(INTERNAL_KEY_PREFIX) {
+        level |= INTERNAL_KEYS;
+    }
+    level
+}
+
+/// Compares two keys using Oxia's slash-aware ordering: the order of the
+/// storage format before Oxia v0.15, which the client keeps when the server
+/// does not report the key sorting of the namespace ([`KeyOrder::Legacy`]).
 ///
-/// This must match the server and every other Oxia client — it is a direct port
-/// of the Go reference `common/compare.CompareWithSlash`. Comparison proceeds
-/// segment by segment, splitting on `/`; at any level a key with no further `/`
-/// sorts *before* one that has a deeper segment, regardless of the remaining
-/// bytes. `list` and `range_scan` merge per-shard results with this order, so it
-/// has to agree with the server exactly.
+/// It is a direct port of the Go reference `common/compare.CompareWithSlash`.
+/// Comparison proceeds segment by segment, splitting on `/`; at any level a
+/// key with no further `/` sorts *before* one that has a deeper segment,
+/// regardless of the remaining bytes.
 pub fn compare(mut a: &str, mut b: &str) -> Ordering {
     while !a.is_empty() && !b.is_empty() {
         match (a.find('/'), b.find('/')) {
@@ -136,5 +223,150 @@ mod tests {
     fn test_root_vs_subdirectory() {
         assert_eq!(compare("/", "a/b"), Ordering::Less);
         assert_eq!(compare("a/b", "/"), Ordering::Greater);
+    }
+
+    /// Vectors copied from the Go reference (`oxia/key_order_test.go`): the
+    /// order of each key sorting, and the legacy order when the server does
+    /// not report one.
+    #[test]
+    fn key_order_matches_go_vectors() {
+        use super::KeyOrder;
+        use Ordering::{Equal, Greater, Less};
+
+        for (a, b, natural, hierarchical, legacy) in [
+            ("a", "a", Equal, Equal, Equal),
+            ("a0", "a/y/z", Greater, Less, Less),
+            ("a/x", "ab/y", Less, Greater, Less),
+            ("b/x", "a/y/z", Greater, Less, Greater),
+            ("a/z", "a/y/z", Greater, Less, Less),
+            // The internal keys sort after the other keys.
+            ("__oxia/x", "z/z", Greater, Greater, Less),
+        ] {
+            for (order, expected) in [
+                (KeyOrder::Natural, natural),
+                (KeyOrder::Hierarchical, hierarchical),
+                (KeyOrder::Legacy, legacy),
+            ] {
+                assert_eq!(order.compare(a, b), expected, "{order:?}: {a:?} vs {b:?}");
+                assert_eq!(
+                    order.compare(b, a),
+                    expected.reverse(),
+                    "{order:?}: {b:?} vs {a:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_order_from_key_sorting() {
+        use super::KeyOrder;
+        use crate::proto::KeySorting;
+
+        let order = |key_sorting: i32| KeyOrder::from_key_sorting(key_sorting);
+        assert_eq!(order(KeySorting::Natural as i32), KeyOrder::Natural);
+        assert_eq!(
+            order(KeySorting::Hierarchical as i32),
+            KeyOrder::Hierarchical
+        );
+        assert_eq!(order(KeySorting::Unknown as i32), KeyOrder::Legacy);
+        // A key sorting this client does not know keeps the legacy order.
+        assert_eq!(order(99), KeyOrder::Legacy);
+    }
+
+    /// Vectors copied from the Go reference
+    /// (`common/compare/encode_test.go`, `TestEncodeCompare`), which compares
+    /// the keys as the server stores them in a hierarchical namespace.
+    #[test]
+    fn hierarchical_matches_go_encoder_vectors() {
+        let cmp = super::compare_hierarchical;
+
+        assert_eq!(cmp("aaaaa", "aaaaa"), Ordering::Equal);
+        assert_eq!(cmp("aaaaa", "zzzzz"), Ordering::Less);
+        assert_eq!(cmp("bbbbb", "aaaaa"), Ordering::Greater);
+
+        assert_eq!(cmp("aaaaa", ""), Ordering::Greater);
+        assert_eq!(cmp("", "aaaaaa"), Ordering::Less);
+        assert_eq!(cmp("", ""), Ordering::Equal);
+
+        assert_eq!(cmp("aaaaa", "aaaaaaaaaaa"), Ordering::Less);
+        assert_eq!(cmp("aaaaaaaaaaa", "aaa"), Ordering::Greater);
+
+        assert_eq!(cmp("a", "/"), Ordering::Less);
+        assert_eq!(cmp("/", "a"), Ordering::Greater);
+
+        assert_eq!(cmp("/aaaa", "/bbbbb"), Ordering::Less);
+        assert_eq!(cmp("/aaaa", "/aa/a"), Ordering::Less);
+        assert_eq!(cmp("/aaaa/a", "/aaaa/b"), Ordering::Less);
+        assert_eq!(cmp("/aaaa/a/a", "/bbbbbbbbbb"), Ordering::Greater);
+        assert_eq!(cmp("/aaaa/a/a", "/aaaa/bbbbbbbbbb"), Ordering::Greater);
+
+        assert_eq!(cmp("/a/b/a/a/a", "/a/b/a/b"), Ordering::Greater);
+
+        assert_eq!(cmp("/a", "/b"), Ordering::Less);
+        assert_eq!(cmp("/a", "/a/"), Ordering::Less);
+        assert_eq!(cmp("/a/", "/a//"), Ordering::Less);
+        assert_eq!(cmp("/a/a-2", "/b/c"), Ordering::Less);
+        assert_eq!(cmp("/", "/a"), Ordering::Less);
+        assert_eq!(cmp("/a", "//"), Ordering::Less);
+        assert_eq!(cmp("/b", "//"), Ordering::Less);
+        assert_eq!(cmp("//", "/a/a-1"), Ordering::Less);
+
+        assert_eq!(cmp("/a/a-1", "/a//"), Ordering::Less);
+        assert_eq!(cmp("/a//", "/b/c"), Ordering::Less);
+    }
+
+    /// The internal keys sort after the other keys in both key sortings
+    /// (`TestEncodeInternalKeys` in the Go reference), even after a key that
+    /// sorts after their `__` prefix by its bytes.
+    #[test]
+    fn internal_keys_sort_last() {
+        use super::KeyOrder;
+
+        for order in [KeyOrder::Natural, KeyOrder::Hierarchical] {
+            for key in ["my-key", "/my-key", "~", "~/~/~"] {
+                assert_eq!(
+                    order.compare(key, "__oxia/xyz"),
+                    Ordering::Less,
+                    "{order:?}: {key:?}"
+                );
+            }
+            assert_eq!(
+                order.compare("__oxia/a", "__oxia/b"),
+                Ordering::Less,
+                "{order:?}"
+            );
+        }
+    }
+
+    /// A key deeper than the level can count shares the deepest level, rather
+    /// than reaching into the internal keys' bit or wrapping around
+    /// (`TestEncodeDeeplyNestedKeys` in the Go reference).
+    #[test]
+    fn deeply_nested_keys_share_the_deepest_level() {
+        let cmp = super::compare_hierarchical;
+
+        for (separators, level) in [
+            (0x7ffe, 0x7ffe),
+            (0x8000, 0x7fff),
+            (0x8001, 0x7fff),
+            (1 << 16, 0x7fff),
+        ] {
+            // The trailing "a" keeps the key from ending with `//`, which
+            // would drop the count by one.
+            let key = "/".repeat(separators) + "a";
+            assert_eq!(super::hierarchical_level(&key), level, "{separators}");
+            assert_eq!(cmp(&key, "__oxia/xyz"), Ordering::Less, "{separators}");
+            assert_eq!(cmp(&key, "a/b"), Ordering::Greater, "{separators}");
+        }
+        // Past the deepest level, the keys compare by their bytes alone.
+        let deep = |separators: usize, last: &str| "/".repeat(separators) + last;
+        assert_eq!(
+            cmp(&deep(0x9000, "a"), &deep(0x8000, "b")),
+            Ordering::Greater
+        );
+        assert_eq!(cmp(&deep(0x8000, "a"), &deep(0x8000, "b")), Ordering::Less);
+        // An internal key keeps its bit however deep it is.
+        let internal = format!("__oxia/{}a", "/".repeat(1 << 16));
+        assert_eq!(super::hierarchical_level(&internal), 0xffff);
     }
 }

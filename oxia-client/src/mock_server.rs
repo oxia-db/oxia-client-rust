@@ -4,15 +4,17 @@
 //! containers) and advertises itself as the leader of every shard (a single
 //! one by default), so an unmodified [`OxiaClient`](crate::OxiaClient)
 //! connects to it exactly as it would to a real cluster. Tests script server
-//! behavior — delayed, missing, erroneous, or absent responses; torn streams
-//! — and assert on what the server observed (write requests, batch sizes,
-//! connection counts) and on what the client surfaced.
+//! behavior — delayed, missing, erroneous, or absent responses; torn streams;
+//! the keys each shard returns — and assert on what the server observed
+//! (write requests, batch sizes, connection counts) and on what the client
+//! surfaced.
 
 use crate::proto;
 use crate::proto::oxia_client_server::{OxiaClient as OxiaService, OxiaClientServer};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::stream::BoxStream;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,6 +47,10 @@ pub(crate) enum ReadMode {
     Hang,
     /// Respond to every get with this proto `Status` code.
     GetStatus(i32),
+    /// Every get on a shard finds the first of the shard's keys
+    /// ([`Behavior::shard_keys`]), as a floor or ceiling get would, or gets
+    /// `KEY_NOT_FOUND` on a shard without keys.
+    ShardKeys,
 }
 
 pub(crate) struct Behavior {
@@ -57,6 +63,18 @@ pub(crate) struct Behavior {
     pub(crate) assignments_error: Option<tonic::Code>,
     /// The number of shards, splitting the hash space into equal ranges.
     pub(crate) shards: u32,
+    /// The key sorting that the assignments report for the namespace.
+    pub(crate) key_sorting: proto::KeySorting,
+    /// The keys of each shard, by shard id, in the order of the shard: a list
+    /// or a range scan of a shard returns all of them, one per response,
+    /// whatever its range.
+    pub(crate) shard_keys: HashMap<i64, Vec<&'static str>>,
+    /// The shards whose leader includes the end of the range of a list or a
+    /// range scan that asks for it, like a server with
+    /// FEATURE_RANGE_END_INCLUSIVE: their responses say so, and they send one
+    /// without keys when they have none. The other shards ignore it, like an
+    /// older server.
+    pub(crate) end_inclusive_shards: Vec<i64>,
 }
 
 impl Default for Behavior {
@@ -67,6 +85,9 @@ impl Default for Behavior {
             read: ReadMode::Ok,
             assignments_error: None,
             shards: 1,
+            key_sorting: proto::KeySorting::Unknown,
+            shard_keys: HashMap::new(),
+            end_inclusive_shards: Vec::new(),
         }
     }
 }
@@ -171,6 +192,17 @@ fn ok_version() -> proto::Version {
     }
 }
 
+/// The record of `key`, as a get or a range scan finds it.
+fn record(key: &str) -> proto::GetResponse {
+    proto::GetResponse {
+        status: proto::Status::Ok as i32,
+        version: Some(ok_version()),
+        value: Some(bytes::Bytes::from(key.to_string())),
+        key: Some(key.to_string()),
+        secondary_index_key: None,
+    }
+}
+
 /// The inclusive hash range of `shard` when the hash space is split into
 /// `shards` equal ranges.
 fn hash_range(shard: u32, shards: u32) -> (u32, u32) {
@@ -228,6 +260,32 @@ struct Service {
     advertised: String,
 }
 
+impl Service {
+    /// The scripted keys of a shard.
+    fn shard_keys(&self, shard: Option<i64>) -> Vec<&'static str> {
+        let behavior = self.state.behavior.lock().expect("behavior lock");
+        shard
+            .and_then(|shard| behavior.shard_keys.get(&shard))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The keys of the responses of a shard to a list or a range scan, and
+    /// whether the responses say that they include the end of the range.
+    fn scan(&self, shard: Option<i64>, end_inclusive: bool) -> (Vec<Vec<&'static str>>, bool) {
+        let keys = self.shard_keys(shard);
+        let included = end_inclusive
+            && shard.is_some_and(|shard| {
+                let behavior = self.state.behavior.lock().expect("behavior lock");
+                behavior.end_inclusive_shards.contains(&shard)
+            });
+        if keys.is_empty() && included {
+            return (vec![Vec::new()], true);
+        }
+        (keys.into_iter().map(|key| vec![key]).collect(), included)
+    }
+}
+
 type Rpc<T> = Result<Response<T>, Status>;
 
 #[tonic::async_trait]
@@ -238,9 +296,13 @@ impl OxiaService for Service {
         &self,
         request: Request<proto::ShardAssignmentsRequest>,
     ) -> Rpc<Self::GetShardAssignmentsStream> {
-        let (scripted_error, shards) = {
+        let (scripted_error, shards, key_sorting) = {
             let behavior = self.state.behavior.lock().expect("behavior lock");
-            (behavior.assignments_error, behavior.shards)
+            (
+                behavior.assignments_error,
+                behavior.shards,
+                behavior.key_sorting,
+            )
         };
         if let Some(code) = scripted_error {
             return Err(Status::new(code, "scripted assignments failure"));
@@ -269,6 +331,7 @@ impl OxiaService for Service {
                         })
                         .collect(),
                     shard_key_router: proto::ShardKeyRouter::Xxhash3 as i32,
+                    key_sorting: key_sorting as i32,
                 },
             )]
             .into(),
@@ -342,13 +405,30 @@ impl OxiaService for Service {
 
     async fn read(&self, request: Request<proto::ReadRequest>) -> Rpc<Self::ReadStream> {
         let mode = self.state.behavior.lock().expect("behavior lock").read;
-        let gets = request.into_inner().gets;
+        let request = request.into_inner();
+        let gets = request.gets;
         match mode {
             ReadMode::Hang => {
                 let (tx, rx) = mpsc::unbounded();
                 // Keep the RPC open without ever responding.
                 std::mem::forget(tx);
                 Ok(Response::new(rx.boxed()))
+            }
+            ReadMode::ShardKeys => {
+                let found = self.shard_keys(request.shard).first().copied();
+                let response = proto::ReadResponse {
+                    gets: gets
+                        .iter()
+                        .map(|_| match found {
+                            Some(key) => record(key),
+                            None => proto::GetResponse {
+                                status: proto::Status::KeyNotFound as i32,
+                                ..proto::GetResponse::default()
+                            },
+                        })
+                        .collect(),
+                };
+                Ok(Response::new(futures::stream::iter([Ok(response)]).boxed()))
             }
             ReadMode::Ok | ReadMode::GetStatus(_) => {
                 let status = match mode {
@@ -375,14 +455,39 @@ impl OxiaService for Service {
 
     type ListStream = BoxStream<'static, Result<proto::ListResponse, Status>>;
 
-    async fn list(&self, _: Request<proto::ListRequest>) -> Rpc<Self::ListStream> {
-        Err(Status::unimplemented("not scripted"))
+    async fn list(&self, request: Request<proto::ListRequest>) -> Rpc<Self::ListStream> {
+        let request = request.into_inner();
+        let (responses, end_inclusive) = self.scan(request.shard, request.end_inclusive);
+        let responses: Vec<_> = responses
+            .into_iter()
+            .map(|keys| {
+                Ok(proto::ListResponse {
+                    keys: keys.into_iter().map(String::from).collect(),
+                    end_inclusive,
+                })
+            })
+            .collect();
+        Ok(Response::new(futures::stream::iter(responses).boxed()))
     }
 
     type RangeScanStream = BoxStream<'static, Result<proto::RangeScanResponse, Status>>;
 
-    async fn range_scan(&self, _: Request<proto::RangeScanRequest>) -> Rpc<Self::RangeScanStream> {
-        Err(Status::unimplemented("not scripted"))
+    async fn range_scan(
+        &self,
+        request: Request<proto::RangeScanRequest>,
+    ) -> Rpc<Self::RangeScanStream> {
+        let request = request.into_inner();
+        let (responses, end_inclusive) = self.scan(request.shard, request.end_inclusive);
+        let responses: Vec<_> = responses
+            .into_iter()
+            .map(|keys| {
+                Ok(proto::RangeScanResponse {
+                    records: keys.into_iter().map(record).collect(),
+                    end_inclusive,
+                })
+            })
+            .collect();
+        Ok(Response::new(futures::stream::iter(responses).boxed()))
     }
 
     type GetSequenceUpdatesStream =
@@ -862,5 +967,174 @@ mod tests {
         }
         assert_eq!(requests[0].puts[0].partition_key.as_deref(), Some(""));
         assert_eq!(requests[1].deletes[0].partition_key.as_deref(), Some(""));
+    }
+
+    /// A floor or ceiling get without a partition key goes to every shard,
+    /// and the client keeps the largest or smallest answer in the key sorting
+    /// that the assignments report. A server that reports none keeps the
+    /// legacy slash-aware order. The natural and hierarchical cases are the
+    /// examples of oxia-db/oxia#1388, where the legacy order picks the other
+    /// answer.
+    #[tokio::test]
+    async fn multi_shard_gets_pick_in_the_key_sorting() {
+        use crate::ComparisonType::{Ceiling, Floor};
+        use proto::KeySorting::{Hierarchical, Natural, Unknown};
+
+        for (key_sorting, comparison, key, answers, expected) in [
+            (Natural, Floor, "b", ["a/y/z", "a0"], "a0"),
+            (Natural, Ceiling, "a", ["a0", "a/y/z"], "a/y/z"),
+            (Hierarchical, Floor, "a/z", ["ab/y", "a/x"], "a/x"),
+            (Hierarchical, Ceiling, "a", ["a/x", "ab/y"], "ab/y"),
+            (Unknown, Floor, "a/z", ["ab/y", "a/x"], "ab/y"),
+            (Unknown, Ceiling, "a", ["a/x", "ab/y"], "a/x"),
+        ] {
+            // The third shard has no answer.
+            let mock = MockOxia::start(Behavior {
+                read: ReadMode::ShardKeys,
+                shards: 3,
+                key_sorting,
+                shard_keys: HashMap::from([(0, vec![answers[0]]), (1, vec![answers[1]])]),
+                ..Behavior::default()
+            })
+            .await;
+            let client = connect(&mock, Duration::from_secs(5)).await;
+
+            let found = client
+                .get(key)
+                .comparison(comparison)
+                .await
+                .expect("a shard has an answer");
+            assert_eq!(
+                found.key, expected,
+                "{key_sorting:?} {comparison:?} {key:?} among {answers:?}"
+            );
+        }
+    }
+
+    /// A list or a range scan without a partition key merges the keys of the
+    /// shards, which each shard returns in the key sorting of the namespace,
+    /// in the same order (the vectors of the Go reference's merge tests).
+    #[tokio::test]
+    async fn list_and_range_scan_merge_in_the_key_sorting() {
+        use proto::KeySorting::{Hierarchical, Natural, Unknown};
+
+        for (key_sorting, shards, expected) in [
+            (
+                Natural,
+                [vec!["a/x", "a0"], vec!["a/y/z", "ab/y"]],
+                ["a/x", "a/y/z", "a0", "ab/y"],
+            ),
+            (
+                Hierarchical,
+                [vec!["a0", "a/x"], vec!["ab/y", "a/y/z"]],
+                ["a0", "ab/y", "a/x", "a/y/z"],
+            ),
+            (
+                Unknown,
+                [vec!["a0", "a/x"], vec!["a/y/z", "ab/y"]],
+                ["a0", "a/x", "a/y/z", "ab/y"],
+            ),
+        ] {
+            let [shard_0, shard_1] = shards;
+            let mock = MockOxia::start(Behavior {
+                shards: 2,
+                key_sorting,
+                shard_keys: HashMap::from([(0, shard_0), (1, shard_1)]),
+                ..Behavior::default()
+            })
+            .await;
+            let client = connect(&mock, Duration::from_secs(5)).await;
+
+            let listed = client.list("", "").await.expect("list");
+            assert_eq!(listed, expected, "list, {key_sorting:?}");
+            let scanned: Vec<_> = client
+                .range_scan("", "")
+                .await
+                .expect("range scan")
+                .into_iter()
+                .map(|record| record.key)
+                .collect();
+            assert_eq!(scanned, expected, "range scan, {key_sorting:?}");
+        }
+    }
+
+    /// A list or a range scan with `end_inclusive` fails with
+    /// `EndInclusiveUnsupported` unless the leader of every shard includes
+    /// the end of the range, which it says in all its responses, sending one
+    /// at least: an older server ignores the flag and leaves the end out.
+    /// The cases are those of the Go reference (`endInclusiveTests`).
+    #[tokio::test]
+    async fn end_inclusive_needs_every_shard_to_include_the_end() {
+        for (case, end_inclusive, [shard_0, shard_1], end_inclusive_shards, expected) in [
+            (
+                "included",
+                true,
+                [vec!["a", "b"], vec!["c"]],
+                vec![0, 1],
+                Some(vec!["a", "b", "c"]),
+            ),
+            (
+                "included, empty shard",
+                true,
+                [vec!["a"], vec![]],
+                vec![0, 1],
+                Some(vec!["a"]),
+            ),
+            (
+                "older server",
+                true,
+                [vec!["a"], vec!["c", "d"]],
+                vec![0],
+                None,
+            ),
+            (
+                "older server, empty shard",
+                true,
+                [vec!["a"], vec![]],
+                vec![0],
+                None,
+            ),
+            (
+                "not requested",
+                false,
+                [vec!["a"], vec!["c"]],
+                vec![],
+                Some(vec!["a", "c"]),
+            ),
+        ] {
+            let mock = MockOxia::start(Behavior {
+                shards: 2,
+                shard_keys: HashMap::from([(0, shard_0), (1, shard_1)]),
+                end_inclusive_shards,
+                ..Behavior::default()
+            })
+            .await;
+            let client = connect(&mock, Duration::from_secs(5)).await;
+
+            let (mut list, mut scan) = (client.list("a", "z"), client.range_scan("a", "z"));
+            if end_inclusive {
+                (list, scan) = (list.end_inclusive(), scan.end_inclusive());
+            }
+            let listed = list.await;
+            let scanned = scan
+                .await
+                .map(|records| records.into_iter().map(|r| r.key).collect::<Vec<_>>());
+            match expected {
+                Some(expected) => {
+                    assert_eq!(listed.expect(case), expected, "list, {case}");
+                    assert_eq!(scanned.expect(case), expected, "range scan, {case}");
+                }
+                None => {
+                    assert!(
+                        matches!(listed, Err(OxiaError::EndInclusiveUnsupported)),
+                        "list, {case}: {listed:?}"
+                    );
+                    assert!(
+                        matches!(scanned, Err(OxiaError::EndInclusiveUnsupported)),
+                        "range scan, {case}: {scanned:?}"
+                    );
+                }
+            }
+        }
     }
 }

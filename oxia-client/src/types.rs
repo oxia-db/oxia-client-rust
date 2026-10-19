@@ -1,7 +1,7 @@
 //! Public domain types returned by client operations.
 
 use crate::errors::OxiaError;
-use crate::key;
+use crate::key::KeyOrder;
 use crate::proto;
 use bytes::Bytes;
 use std::cmp::Ordering;
@@ -129,8 +129,8 @@ impl GetResult {
         })
     }
 
-    pub(crate) fn compare_keys(&self, other: &Self) -> Ordering {
-        key::compare(&self.key, &other.key)
+    pub(crate) fn compare_keys(&self, other: &Self, order: KeyOrder) -> Ordering {
+        order.compare(&self.key, &other.key)
     }
 }
 
@@ -162,7 +162,8 @@ pub enum Notification {
     KeyRangeDeleted {
         /// The start of the deleted range (inclusive).
         key: String,
-        /// The end of the deleted range (exclusive).
+        /// The end of the deleted range (exclusive). An empty end covers all
+        /// the records from `key` on.
         key_range_last: Option<String>,
     },
 }

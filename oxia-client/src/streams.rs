@@ -3,7 +3,7 @@
 
 use crate::client::SubscriptionGuard;
 use crate::errors::OxiaError;
-use crate::key;
+use crate::key::KeyOrder;
 use crate::types::{GetResult, Notification};
 use futures::Stream;
 use std::fmt;
@@ -33,23 +33,26 @@ impl MergeItem for GetResult {
 
 /// An ordered k-way merge over per-shard streams.
 ///
-/// Each shard returns its results in Oxia's key order; holding at most one
-/// pending item per shard and always yielding the smallest keeps the global
-/// order identical to the server's while buffering O(shards) items.
+/// Each shard returns its results in the key order of the namespace; holding
+/// at most one pending item per shard and always yielding the smallest in that
+/// order keeps the global order identical to the server's while buffering
+/// O(shards) items.
 pub(crate) struct Merged<T> {
     streams: Vec<ShardStream<T>>,
     peeked: Vec<Option<T>>,
     done: Vec<bool>,
     finished: bool,
+    order: KeyOrder,
 }
 
-pub(crate) fn merged<T>(streams: Vec<ShardStream<T>>) -> Merged<T> {
+pub(crate) fn merged<T>(streams: Vec<ShardStream<T>>, order: KeyOrder) -> Merged<T> {
     let count = streams.len();
     Merged {
         streams,
         peeked: (0..count).map(|_| None).collect(),
         done: vec![false; count],
         finished: false,
+        order,
     }
 }
 
@@ -88,7 +91,11 @@ impl<T: MergeItem + Unpin> Stream for Merged<T> {
         for i in 0..this.peeked.len() {
             if let (Some(candidate), Some(m)) = (&this.peeked[i], min_idx) {
                 let current = this.peeked[m].as_ref().expect("min slot is filled");
-                if key::compare(candidate.merge_key(), current.merge_key()).is_lt() {
+                if this
+                    .order
+                    .compare(candidate.merge_key(), current.merge_key())
+                    .is_lt()
+                {
                     min_idx = Some(i);
                 }
             } else if this.peeked[i].is_some() && min_idx.is_none() {
@@ -108,8 +115,9 @@ impl<T: MergeItem + Unpin> Stream for Merged<T> {
 /// An ordered stream of keys produced by
 /// [`ListBuilder::stream`](crate::ListBuilder::stream).
 ///
-/// Yields keys in the server's global (slash-aware) key order, merged across
-/// shards while buffering at most one pending key per shard. The stream has
+/// Yields keys in the server's global key order (the key sorting of the
+/// namespace), merged across shards while buffering at most one pending key
+/// per shard. The stream has
 /// no overall deadline; it is naturally backpressured — keys are pulled from
 /// the server only as fast as they are consumed. The first error is yielded
 /// as an `Err` item and terminates the stream. Dropping the stream cancels
@@ -141,8 +149,9 @@ impl fmt::Debug for ListStream {
 /// An ordered stream of records produced by
 /// [`RangeScanBuilder::stream`](crate::RangeScanBuilder::stream).
 ///
-/// Yields records in the server's global (slash-aware) key order, merged
-/// across shards while buffering at most one pending record per shard — a
+/// Yields records in the server's global key order (the key sorting of the
+/// namespace), merged across shards while buffering at most one pending
+/// record per shard — a
 /// scan of any size runs in O(shards) memory. The stream has no overall
 /// deadline; it is naturally backpressured — records are pulled from the
 /// server only as fast as they are consumed. The first error is yielded as an
@@ -272,11 +281,10 @@ mod tests {
 
     #[tokio::test]
     async fn merges_in_key_order() {
-        let merged = merged(vec![
-            keys(&["a", "d", "e"]),
-            keys(&["b", "c", "f"]),
-            keys(&[]),
-        ]);
+        let merged = merged(
+            vec![keys(&["a", "d", "e"]), keys(&["b", "c", "f"]), keys(&[])],
+            KeyOrder::default(),
+        );
         let out: Vec<String> = merged.map(|r| r.unwrap()).collect().await;
         assert_eq!(out, vec!["a", "b", "c", "d", "e", "f"]);
     }
@@ -284,17 +292,48 @@ mod tests {
     #[tokio::test]
     async fn merges_with_slash_order() {
         // "a" sorts before "/" in Oxia's slash-aware order.
-        let merged = merged(vec![keys(&["/x"]), keys(&["a"])]);
+        let merged = merged(vec![keys(&["/x"]), keys(&["a"])], KeyOrder::Legacy);
         let out: Vec<String> = merged.map(|r| r.unwrap()).collect().await;
         assert_eq!(out, vec!["a", "/x"]);
     }
 
+    /// Each shard returns its keys in the key sorting of the namespace, and
+    /// the merge keeps it (vectors from the Go reference,
+    /// `TestAggregateAndSortRangeScanAcrossShardsKeySorting`).
+    #[tokio::test]
+    async fn merges_in_the_key_sorting_of_the_namespace() {
+        for (order, shards, expected) in [
+            (
+                KeyOrder::Natural,
+                [["a/x", "a0"], ["a/y/z", "ab/y"]],
+                ["a/x", "a/y/z", "a0", "ab/y"],
+            ),
+            (
+                KeyOrder::Hierarchical,
+                [["a0", "a/x"], ["ab/y", "a/y/z"]],
+                ["a0", "ab/y", "a/x", "a/y/z"],
+            ),
+            (
+                KeyOrder::Legacy,
+                [["a0", "a/x"], ["a/y/z", "ab/y"]],
+                ["a0", "a/x", "a/y/z", "ab/y"],
+            ),
+        ] {
+            let merged = merged(shards.iter().map(|shard| keys(shard)).collect(), order);
+            let out: Vec<String> = merged.map(|r| r.unwrap()).collect().await;
+            assert_eq!(out, expected, "{order:?}");
+        }
+    }
+
     #[tokio::test]
     async fn error_terminates_stream() {
-        let merged = merged(vec![
-            shard(vec![Ok("a".to_string()), Err(OxiaError::Timeout)]),
-            keys(&["b", "c"]),
-        ]);
+        let merged = merged(
+            vec![
+                shard(vec![Ok("a".to_string()), Err(OxiaError::Timeout)]),
+                keys(&["b", "c"]),
+            ],
+            KeyOrder::default(),
+        );
         let out: Vec<Result<String, OxiaError>> = merged.collect().await;
         assert!(matches!(out[0], Ok(ref k) if k == "a"));
         assert!(out.iter().any(|r| r.is_err()));
@@ -305,7 +344,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_merge_ends() {
-        let merged = merged::<String>(vec![]);
+        let merged = merged::<String>(vec![], KeyOrder::default());
         let out: Vec<_> = merged.collect().await;
         assert!(out.is_empty());
     }
