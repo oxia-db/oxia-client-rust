@@ -406,10 +406,10 @@ async fn test_delete_range_across_live_split() {
                 // Polled once, the delete range has a copy queued for every
                 // shard.
                 assert!(futures::poll!(&mut delete).is_pending());
-                // Once shard 1 has applied its copy (not merely queued it: the
-                // server applies a batch's puts before its delete ranges),
-                // write a key there in the range, while the copy for shard 0
-                // may still be held back.
+                // Once shard 1 has applied its copy (not merely queued it: a
+                // server without FEATURE_ORDERED_WRITES applies a batch's puts
+                // before its delete ranges), write a key there in the range,
+                // while the copy for shard 0 may still be held back.
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !is_deleted(&client, &round.before[1]).await {
                     assert!(
