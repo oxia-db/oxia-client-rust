@@ -5,16 +5,16 @@
 //! one by default), so an unmodified [`OxiaClient`](crate::OxiaClient)
 //! connects to it exactly as it would to a real cluster. Tests script server
 //! behavior — delayed, missing, erroneous, or absent responses; torn streams;
-//! the keys each shard returns — and assert on what the server observed
-//! (write requests, batch sizes, connection counts) and on what the client
-//! surfaced.
+//! the keys each shard returns; shard splits — and assert on what the server
+//! observed (write requests, batch sizes, connection counts) and on what the
+//! client surfaced.
 
 use crate::proto;
 use crate::proto::oxia_client_server::{OxiaClient as OxiaService, OxiaClientServer};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::stream::BoxStream;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -106,13 +106,58 @@ struct State {
     behavior: Mutex<Behavior>,
     /// When the shards get their leader (see [`Behavior::leaderless_for`]).
     leader_elected_at: Instant,
+    /// The shards of the namespace, as `(shard, min_hash, max_hash)`: those
+    /// of [`Behavior::shards`], then as [`MockOxia::split_shard`] left them.
+    shards: Mutex<Vec<(i64, u32, u32)>>,
+    /// The shards that reject the writes (see [`MockOxia::freeze_shard`]).
+    frozen: Mutex<HashSet<i64>>,
     /// Every received `WriteRequest`, in order.
     write_requests: Mutex<Vec<proto::WriteRequest>>,
     /// Operations per received `WriteRequest` (puts + deletes + delete-ranges).
     write_batch_sizes: Mutex<Vec<usize>>,
     write_connections: AtomicU32,
-    /// Keeps assignment streams open for the lifetime of the mock.
-    assignment_senders: Mutex<Vec<mpsc::UnboundedSender<Result<proto::ShardAssignments, Status>>>>,
+    /// Keeps assignment streams open for the lifetime of the mock, with the
+    /// namespace that each one asked for.
+    assignment_senders: Mutex<Vec<(String, AssignmentSender)>>,
+}
+
+/// The sending end of a client's assignment stream.
+type AssignmentSender = mpsc::UnboundedSender<Result<proto::ShardAssignments, Status>>;
+
+impl State {
+    /// The current assignments of `namespace`, every shard led by `leader`.
+    fn assignments(&self, namespace: &str, leader: &str) -> proto::ShardAssignments {
+        let key_sorting = self.behavior.lock().expect("behavior lock").key_sorting;
+        let shards = self.shards.lock().expect("shards lock");
+        proto::ShardAssignments {
+            namespaces: [(
+                namespace.to_string(),
+                proto::NamespaceShardsAssignment {
+                    assignments: shards
+                        .iter()
+                        .map(|&(shard, min_hash_inclusive, max_hash_inclusive)| {
+                            proto::ShardAssignment {
+                                shard,
+                                leader: leader.to_string(),
+                                shard_boundaries: Some(
+                                    proto::shard_assignment::ShardBoundaries::Int32HashRange(
+                                        proto::Int32HashRange {
+                                            min_hash_inclusive,
+                                            max_hash_inclusive,
+                                        },
+                                    ),
+                                ),
+                            }
+                        })
+                        .collect(),
+                    shard_key_router: proto::ShardKeyRouter::Xxhash3 as i32,
+                    key_sorting: key_sorting as i32,
+                },
+            )]
+            .into(),
+            allowed_authorities: vec![],
+        }
+    }
 }
 
 /// A running mock server. Dropping it stops the server.
@@ -130,9 +175,17 @@ impl Drop for MockOxia {
 
 impl MockOxia {
     pub(crate) async fn start(behavior: Behavior) -> MockOxia {
+        let shards = (0..behavior.shards)
+            .map(|shard| {
+                let (min, max) = hash_range(shard, behavior.shards);
+                (shard.into(), min, max)
+            })
+            .collect();
         let state = Arc::new(State {
             leader_elected_at: Instant::now() + behavior.leaderless_for,
             behavior: Mutex::new(behavior),
+            shards: Mutex::new(shards),
+            frozen: Mutex::new(HashSet::new()),
             write_requests: Mutex::new(Vec::new()),
             write_batch_sizes: Mutex::new(Vec::new()),
             write_connections: AtomicU32::new(0),
@@ -169,6 +222,40 @@ impl MockOxia {
 
     pub(crate) fn set_read_mode(&self, read: ReadMode) {
         self.state.behavior.lock().expect("behavior lock").read = read;
+    }
+
+    /// Makes `shard` reject the writes, failing their stream with a
+    /// retryable error, as the leader of a shard does once it is frozen for
+    /// the cutover of its split, and its node once the split has removed it.
+    pub(crate) fn freeze_shard(&self, shard: i64) {
+        self.state.frozen.lock().expect("frozen lock").insert(shard);
+    }
+
+    /// Splits `shard` into two new shards, with a half of its hash range
+    /// each, and returns their ids. The split shard rejects the writes from
+    /// now on ([`freeze_shard`](Self::freeze_shard)). Only the server sees
+    /// the split until [`publish_assignments`](Self::publish_assignments).
+    pub(crate) fn split_shard(&self, shard: i64) -> (i64, i64) {
+        self.freeze_shard(shard);
+        let mut shards = self.state.shards.lock().expect("shards lock");
+        let next = shards.iter().map(|&(id, _, _)| id).max().expect("shards") + 1;
+        let index = shards
+            .iter()
+            .position(|&(id, _, _)| id == shard)
+            .expect("the shard to split exists");
+        let (_, min, max) = shards.remove(index);
+        let middle = min + (max - min) / 2;
+        shards.push((next, min, middle));
+        shards.push((next + 1, middle + 1, max));
+        (next, next + 1)
+    }
+
+    /// Sends the current shard assignments to the connected clients.
+    pub(crate) fn publish_assignments(&self) {
+        let senders = self.state.assignment_senders.lock().expect("senders lock");
+        for (namespace, sender) in senders.iter() {
+            let _ = sender.unbounded_send(Ok(self.state.assignments(namespace, &self.address)));
+        }
     }
 
     /// The `WriteRequest`s the server has received, in order.
@@ -320,60 +407,32 @@ impl OxiaService for Service {
         &self,
         request: Request<proto::ShardAssignmentsRequest>,
     ) -> Rpc<Self::GetShardAssignmentsStream> {
-        let (scripted_error, shards, key_sorting) = {
-            let behavior = self.state.behavior.lock().expect("behavior lock");
-            (
-                behavior.assignments_error,
-                behavior.shards,
-                behavior.key_sorting,
-            )
-        };
+        let scripted_error = self
+            .state
+            .behavior
+            .lock()
+            .expect("behavior lock")
+            .assignments_error;
         if let Some(code) = scripted_error {
             return Err(Status::new(code, "scripted assignments failure"));
         }
         let namespace = request.into_inner().namespace;
-        let assignments = |leader: &str| proto::ShardAssignments {
-            namespaces: [(
-                namespace.clone(),
-                proto::NamespaceShardsAssignment {
-                    assignments: (0..shards)
-                        .map(|shard| {
-                            let (min_hash_inclusive, max_hash_inclusive) =
-                                hash_range(shard, shards);
-                            proto::ShardAssignment {
-                                shard: shard.into(),
-                                leader: leader.to_string(),
-                                shard_boundaries: Some(
-                                    proto::shard_assignment::ShardBoundaries::Int32HashRange(
-                                        proto::Int32HashRange {
-                                            min_hash_inclusive,
-                                            max_hash_inclusive,
-                                        },
-                                    ),
-                                ),
-                            }
-                        })
-                        .collect(),
-                    shard_key_router: proto::ShardKeyRouter::Xxhash3 as i32,
-                    key_sorting: key_sorting as i32,
-                },
-            )]
-            .into(),
-            allowed_authorities: vec![],
-        };
         let (tx, rx) = mpsc::unbounded();
         let leaderless_for = self
             .state
             .leader_elected_at
             .saturating_duration_since(Instant::now());
+        // Hold the senders lock while sending the first assignments, so that
+        // `publish_assignments` can't send newer ones before them.
+        let mut senders = self.state.assignment_senders.lock().expect("senders lock");
         if leaderless_for.is_zero() {
-            tx.unbounded_send(Ok(assignments(&self.advertised)))
+            tx.unbounded_send(Ok(self.state.assignments(&namespace, &self.advertised)))
                 .expect("first assignment");
         } else {
             // No leader yet: the coordinator publishes an empty one.
-            tx.unbounded_send(Ok(assignments("")))
+            tx.unbounded_send(Ok(self.state.assignments(&namespace, "")))
                 .expect("first assignment");
-            let elected = assignments(&self.advertised);
+            let elected = self.state.assignments(&namespace, &self.advertised);
             let tx = tx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(leaderless_for).await;
@@ -381,11 +440,7 @@ impl OxiaService for Service {
             });
         }
         // Park the sender so the stream stays open, like a real server.
-        self.state
-            .assignment_senders
-            .lock()
-            .expect("senders lock")
-            .push(tx);
+        senders.push((namespace, tx));
         Ok(Response::new(rx.boxed()))
     }
 
@@ -432,6 +487,16 @@ impl OxiaService for Service {
                         tokio::time::sleep(delay).await;
                     }
                     _ => {}
+                }
+                let frozen = request.shard.is_some_and(|shard| {
+                    state.frozen.lock().expect("frozen lock").contains(&shard)
+                });
+                if frozen {
+                    // As the leader of a frozen shard does, even with the
+                    // request in flight when it was frozen: the client
+                    // retries the batch.
+                    let _ = tx.unbounded_send(Err(Status::aborted("node is not leader")));
+                    return;
                 }
                 if tx.unbounded_send(Ok(respond_to(&request, mode))).is_err() {
                     return;
@@ -1342,5 +1407,254 @@ mod tests {
             .put("election/key", "x")
             .await
             .expect("put once the leader is elected");
+    }
+
+    /// A key starting with `prefix` whose hash lies in `[min_hash, max_hash]`.
+    fn key_in(prefix: &str, min_hash: u32, max_hash: u32) -> String {
+        (0u32..)
+            .map(|n| format!("{prefix}{n}"))
+            .find(|key| (min_hash..=max_hash).contains(&crate::hash::xxh3_32(key)))
+            .expect("a key lands in the hash range")
+    }
+
+    /// Runs a write in a task of its own.
+    fn spawn_write<T: Send + 'static>(
+        write: impl Future<Output = Result<T, OxiaError>> + Send + 'static,
+    ) -> tokio::task::JoinHandle<Result<(), OxiaError>> {
+        tokio::spawn(async move { write.await.map(drop) })
+    }
+
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The writes that the mock received for `shard`, in the order the shard
+    /// applies them: request by request, each in `op_index` order.
+    fn applied_on(mock: &MockOxia, shard: i64) -> Vec<String> {
+        mock.write_requests()
+            .into_iter()
+            .filter(|request| request.shard == Some(shard))
+            .flat_map(|request| {
+                let puts = request.puts.iter().map(|put| {
+                    let value = String::from_utf8_lossy(&put.value);
+                    (put.op_index, format!("put {}={value}", put.key))
+                });
+                let deletes = request
+                    .deletes
+                    .iter()
+                    .map(|delete| (delete.op_index, format!("delete {}", delete.key)));
+                let delete_ranges = request.delete_ranges.iter().map(|range| {
+                    let op = format!(
+                        "delete_range {}..{}",
+                        range.start_inclusive, range.end_exclusive
+                    );
+                    (range.op_index, op)
+                });
+                let mut ops: Vec<_> = puts.chain(deletes).chain(delete_ranges).collect();
+                ops.sort();
+                ops.into_iter().map(|(_, op)| op)
+            })
+            .collect()
+    }
+
+    /// The writes pending on a shard when it is split go to the shards that
+    /// replaced it, in the order they were issued: a delete range to every
+    /// one of them, unless it has a partition key. They go ahead of the
+    /// writes issued once the client has the new assignments, and of those
+    /// still routed to the split shard.
+    #[tokio::test]
+    async fn split_hands_off_the_pending_writes_in_issue_order() {
+        let mock = MockOxia::start(Behavior::default()).await;
+        let client = connect(&mock, Duration::from_secs(10)).await;
+        let middle = u32::MAX / 2;
+        let lower = key_in("lower-", 0, middle);
+        let upper = key_in("upper-", middle + 1, u32::MAX);
+
+        // The shard rejects the writes for the cutover of its split: the
+        // client retries the batch until it gets the new assignments.
+        mock.freeze_shard(0);
+        // Each from a task of its own, as independent callers would issue
+        // them: the runtime runs the tasks in turn, so the writes join the
+        // batch in this order.
+        let pending = [
+            spawn_write(client.put(lower.clone(), "1").into_future()),
+            spawn_write(client.put(upper.clone(), "2").into_future()),
+            spawn_write(
+                client
+                    .delete_range("p", "q")
+                    .partition_key(lower.clone())
+                    .into_future(),
+            ),
+            spawn_write(client.delete(lower.clone()).into_future()),
+            spawn_write(client.put(lower.clone(), "3").into_future()),
+            spawn_write(client.delete_range("a", "z").into_future()),
+        ];
+        wait_until("the shard rejects the batch", || {
+            !mock.write_requests().is_empty()
+        })
+        .await;
+        let (left, right) = mock.split_shard(0);
+        mock.publish_assignments();
+        wait_until("the client has the new assignments", || {
+            client.shard_manager().shard_exists(left)
+        })
+        .await;
+
+        // Routed with the new assignments.
+        client
+            .put(upper.clone(), "4")
+            .await
+            .expect("put issued after the split");
+        // Routed with the old assignments, to the split shard.
+        let request = proto::PutRequest {
+            key: lower.clone(),
+            value: bytes::Bytes::from_static(b"5"),
+            ..Default::default()
+        };
+        client
+            .submit_write(0, request, crate::batcher::WriteOp::Put)
+            .await
+            .expect("put routed to the split shard");
+        for write in pending {
+            write.await.expect("write task").expect("pending write");
+        }
+
+        assert_eq!(
+            applied_on(&mock, left),
+            [
+                format!("put {lower}=1"),
+                "delete_range p..q".to_string(),
+                format!("delete {lower}"),
+                format!("put {lower}=3"),
+                "delete_range a..z".to_string(),
+                format!("put {lower}=5"),
+            ]
+        );
+        assert_eq!(
+            applied_on(&mock, right),
+            [
+                format!("put {upper}=2"),
+                "delete_range a..z".to_string(),
+                format!("put {upper}=4"),
+            ]
+        );
+    }
+
+    /// A batch still in flight on a shard when the client gets the
+    /// assignments without it is handed off once the shard rejects it. Until
+    /// then, the shards that replaced it hold the writes issued meanwhile.
+    #[tokio::test]
+    async fn split_hands_off_a_batch_in_flight_once_the_shard_rejects_it() {
+        let mock = MockOxia::start(Behavior {
+            write: WriteMode::DelayResponses(Duration::from_millis(300)),
+            ..Behavior::default()
+        })
+        .await;
+        let client = connect(&mock, Duration::from_secs(10)).await;
+        let key = key_in("key-", 0, u32::MAX / 2);
+
+        let pending = spawn_write(client.put(key.clone(), "1").into_future());
+        wait_until("shard 0 receives the put", || {
+            !mock.write_requests().is_empty()
+        })
+        .await;
+        // The shard rejects the put when it gets to it.
+        let (left, _) = mock.split_shard(0);
+        mock.publish_assignments();
+        wait_until("the client has the new assignments", || {
+            client.shard_manager().shard_exists(left)
+        })
+        .await;
+
+        client
+            .put(key.clone(), "2")
+            .await
+            .expect("put issued after the split");
+        pending
+            .await
+            .expect("write task")
+            .expect("put in flight during the split");
+        assert_eq!(
+            applied_on(&mock, left),
+            [format!("put {key}=1"), format!("put {key}=2")]
+        );
+    }
+
+    /// A shard split again before it has applied the writes handed off to it
+    /// hands them off in turn, in order, ahead of the writes issued once the
+    /// client has the newest assignments.
+    #[tokio::test]
+    async fn nested_split_keeps_the_write_order() {
+        let mock = MockOxia::start(Behavior::default()).await;
+        let client = connect(&mock, Duration::from_secs(10)).await;
+        // The halves of the split of shard 0, and the quarters of the split of
+        // its lower half.
+        let middle = u32::MAX / 2;
+        let first = key_in("first-", 0, middle / 2);
+        let second = key_in("second-", middle / 2 + 1, middle);
+        let upper = key_in("upper-", middle + 1, u32::MAX);
+
+        mock.freeze_shard(0);
+        let pending = tokio::spawn({
+            let client = client.clone();
+            let (first, second, upper) = (first.clone(), second.clone(), upper.clone());
+            async move {
+                tokio::join!(
+                    biased;
+                    client.put(first.clone(), "1"),
+                    client.delete(first.clone()),
+                    client.put(second, "2"),
+                    client.put(upper, "3"),
+                    client.put(first, "4"),
+                )
+            }
+        });
+        wait_until("shard 0 rejects the batch", || {
+            !mock.write_requests().is_empty()
+        })
+        .await;
+        let (left, right) = mock.split_shard(0);
+        // The shard that gets the lower half is split in turn.
+        mock.freeze_shard(left);
+        mock.publish_assignments();
+        wait_until("the lower half rejects the writes handed off to it", || {
+            mock.write_requests()
+                .iter()
+                .any(|request| request.shard == Some(left))
+        })
+        .await;
+        let (lower_left, lower_right) = mock.split_shard(left);
+        mock.publish_assignments();
+        wait_until("the client has the newest assignments", || {
+            client.shard_manager().shard_exists(lower_left)
+        })
+        .await;
+
+        client
+            .put(first.clone(), "5")
+            .await
+            .expect("put issued after the splits");
+        let (put_1, delete, put_2, put_3, put_4) = pending.await.expect("pending writes");
+        put_1.expect("put 1");
+        delete.expect("delete");
+        put_2.expect("put 2");
+        put_3.expect("put 3");
+        put_4.expect("put 4");
+
+        assert_eq!(
+            applied_on(&mock, lower_left),
+            [
+                format!("put {first}=1"),
+                format!("delete {first}"),
+                format!("put {first}=4"),
+                format!("put {first}=5"),
+            ]
+        );
+        assert_eq!(applied_on(&mock, lower_right), [format!("put {second}=2")]);
+        assert_eq!(applied_on(&mock, right), [format!("put {upper}=3")]);
     }
 }
