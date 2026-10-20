@@ -592,6 +592,39 @@ async fn test_batched_writes_apply_in_issue_order() {
     client.close().await.unwrap();
 }
 
+/// A delete range and a put of a key in the range, issued one after the other
+/// without waiting, share a write batch. The server applies them in the order
+/// they were issued, so the put survives the delete range. A server without
+/// ordered writes applies the put first, and the delete range deletes it.
+///
+/// Run it against `oxia/oxia:nightly-beta`, built daily from oxia main:
+/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
+#[tokio::test]
+#[ignore = "needs an Oxia server with ordered writes (oxia-db/oxia#1312), which oxia/oxia:main predates"]
+async fn test_put_issued_after_a_delete_range_survives_it() {
+    let (_container, address) = start_oxia().await;
+    let client = new_client(&address).await;
+    client.put("ordered-range/old", "v0").await.unwrap();
+
+    // `biased` polls the delete range first, and each operation joins the
+    // open batch on its first poll, before the batch can be flushed.
+    let (delete_range, put) = tokio::join!(
+        biased;
+        client.delete_range("ordered-range/", "ordered-range/~"),
+        client.put("ordered-range/new", "v1"),
+    );
+    delete_range.unwrap();
+    put.unwrap();
+
+    let keys = client
+        .list("ordered-range/", "ordered-range/~")
+        .await
+        .unwrap();
+    assert_eq!(keys, ["ordered-range/new"]);
+
+    client.close().await.unwrap();
+}
+
 // ============================================================
 // Notification Tests
 // ============================================================
