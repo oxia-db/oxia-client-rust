@@ -9,7 +9,7 @@
 //! running.
 
 use futures::{StreamExt, TryStreamExt};
-use oxia::{ComparisonType, OxiaClient, OxiaClientBuilder, OxiaError};
+use oxia::{ComparisonType, Notification, Notifications, OxiaClient, OxiaClientBuilder, OxiaError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -619,6 +619,81 @@ async fn test_reads_across_live_split() {
         retry_while_moved(partition_list).await.unwrap(),
         *partitioned
     );
+
+    client.close().await.unwrap();
+}
+
+/// The keys of the next `count` notifications, all creations, sorted, once
+/// no other arrives for a while: a duplicate would come after.
+async fn created_keys(notifications: &mut Notifications, count: usize) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut keys = Vec::with_capacity(count);
+    while keys.len() < count {
+        let notification = tokio::time::timeout_at(deadline, notifications.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{} of the {count} notifications arrived", keys.len()))
+            .expect("the subscription is open");
+        match notification {
+            Notification::KeyCreated { key, .. } => keys.push(key),
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+    let extra = tokio::time::timeout(Duration::from_millis(500), notifications.recv()).await;
+    assert!(extra.is_err(), "unexpected notification: {extra:?}");
+    keys.sort();
+    keys
+}
+
+/// Notifications across a live split of the only shard, by two
+/// subscriptions opened before it: one with a buffer that never fills, which
+/// reads the stream as the notifications come, and one that lags behind, as
+/// nothing reads it until the split has completed and its buffer holds a
+/// single notification. Each follows the split to the children, after the
+/// last batch it received from the parent: both get the creation of every
+/// key written before, during and after the split, once.
+#[tokio::test]
+async fn test_notifications_across_live_split() {
+    let cluster = start_cluster(2, 1).await;
+    let client = connect_with_retry(&cluster.address).await;
+    let mut prompt = client.notifications().buffer_size(100_000).await.unwrap();
+    let mut lagging = client.notifications().buffer_size(1).await.unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = tokio::spawn({
+        let (client, stop) = (client.clone(), stop.clone());
+        async move {
+            let mut written = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let key = format!("notified/during-{:05}", written.len());
+                client
+                    .put(key.clone(), "x")
+                    .await
+                    .expect("write during the split");
+                written.push(key);
+            }
+            written
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let split_output = cluster.split_shard(0).await;
+    assert!(
+        split_output.contains("\"Error\":null"),
+        "split must succeed, got: {split_output}"
+    );
+    cluster.wait_until_removed(0).await;
+    stop.store(true, Ordering::SeqCst);
+    let mut written = writer.await.expect("writer");
+    // Once the split has completed, the children take every write.
+    for i in 0..20 {
+        let key = format!("notified/after-{i:02}");
+        client.put(key.clone(), "x").await.unwrap();
+        written.push(key);
+    }
+    written.sort();
+
+    assert_eq!(created_keys(&mut prompt, written.len()).await, written);
+    assert_eq!(created_keys(&mut lagging, written.len()).await, written);
 
     client.close().await.unwrap();
 }
