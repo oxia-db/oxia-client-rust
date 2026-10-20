@@ -530,7 +530,8 @@ impl WriteBatcher {
 
     /// Opens the shard's write-stream RPC, feeding it the already-queued
     /// requests in `rx`. A leader hint from the previous failure, when present
-    /// for this shard, overrides the (possibly stale) shard-manager leader.
+    /// for this shard, overrides the (possibly stale) shard-manager leader —
+    /// as long as the shard still exists.
     async fn connect_stream(
         &self,
         rx: UnboundedReceiver<proto::WriteRequest>,
@@ -542,8 +543,12 @@ impl WriteBatcher {
                 .and_then(|hint| hint.address_for(self.shard).map(str::to_string))
         };
         let target = match hinted {
-            Some(address) => ensure_protocol(address),
-            None => {
+            // Once the shard is split or merged away, its hint is stale too:
+            // fall through, so the write fails with `ShardMoved` and reroutes.
+            Some(address) if self.deps.shard_manager.shard_exists(self.shard) => {
+                ensure_protocol(address)
+            }
+            _ => {
                 self.deps
                     .shard_manager
                     .get_leader(self.shard)
@@ -946,6 +951,7 @@ pub(crate) fn pending_write<Req, Resp>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mock_server::{Behavior, MockOxia};
     use bytes::Bytes;
 
     fn put_op(
@@ -1102,6 +1108,47 @@ mod tests {
         batcher.add(op);
         let err = rx.await.expect("callback must fire").unwrap_err();
         assert!(matches!(err, OxiaError::Closed));
+    }
+
+    /// A leader hint left over for a shard that has since been split away
+    /// must not keep steering the write stream to the hinted leader: the
+    /// write fails with `ShardMoved`, so the caller reroutes it, instead of
+    /// retrying against the hint until the request timeout.
+    #[tokio::test]
+    async fn stale_hint_for_a_removed_shard_fails_with_shard_moved() {
+        // The detached shard manager has no assignments: shard 0 is gone.
+        let batcher = Arc::new(WriteBatcher::new(0, test_deps(1024)));
+        batcher.state.lock().unwrap().hint = Some(LeaderHint {
+            shard: 0,
+            leader: "127.0.0.1:1".to_string(),
+        });
+        let (op, rx) = put_op("key", b"value");
+        batcher.add(op);
+        let err = rx.await.expect("callback must fire").unwrap_err();
+        assert!(matches!(err, OxiaError::ShardMoved), "got {err:?}");
+    }
+
+    /// While the shard exists, its hint still overrides the leader in the
+    /// assignments.
+    #[tokio::test]
+    async fn hint_for_an_existing_shard_overrides_the_assigned_leader() {
+        let mock = MockOxia::start(Behavior::default()).await;
+        let deps = test_deps(1024);
+        // The assigned leader, `server-0:6648`, does not exist.
+        deps.shard_manager
+            .set_assignments_for_tests(&[(0, 0, u32::MAX)]);
+        let batcher = Arc::new(WriteBatcher::new(0, deps));
+        batcher.state.lock().unwrap().hint = Some(LeaderHint {
+            shard: 0,
+            leader: mock.address.clone(),
+        });
+        let (op, rx) = put_op("key", b"value");
+        batcher.add(op);
+        let response = rx
+            .await
+            .expect("callback must fire")
+            .expect("the write goes to the hinted leader");
+        assert_eq!(response.status, proto::Status::Ok as i32);
     }
 
     #[tokio::test]

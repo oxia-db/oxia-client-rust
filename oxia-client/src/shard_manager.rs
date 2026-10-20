@@ -331,6 +331,34 @@ impl ShardManager {
     pub(crate) fn key_order(&self) -> KeyOrder {
         self.inner.assignments.load().key_order
     }
+
+    /// Replaces the assignments with `shards`, as `(shard, min_hash,
+    /// max_hash)`, as if the coordinator had published them.
+    #[cfg(test)]
+    pub(crate) fn set_assignments_for_tests(&self, shards: &[(i64, u32, u32)]) {
+        use crate::proto::{Int32HashRange, ShardAssignment};
+        let assignments = shards
+            .iter()
+            .map(|&(shard, min_hash, max_hash)| ShardAssignment {
+                shard,
+                leader: format!("server-{shard}:6648"),
+                shard_boundaries: Some(ShardBoundaries::Int32HashRange(Int32HashRange {
+                    min_hash_inclusive: min_hash,
+                    max_hash_inclusive: max_hash,
+                })),
+            })
+            .collect();
+        self.inner
+            .assignments
+            .store(Arc::new(Assignments::from_namespace(
+                &NamespaceShardsAssignment {
+                    assignments,
+                    shard_key_router: ShardKeyRouter::Xxhash3 as i32,
+                    ..Default::default()
+                },
+            )));
+        self.inner.version.send_modify(|version| *version += 1);
+    }
 }
 
 #[cfg(test)]
