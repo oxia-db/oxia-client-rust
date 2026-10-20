@@ -1055,20 +1055,28 @@ impl OxiaClient {
         self.with_reroute_retry(|| {
             let request = request.clone();
             async move {
-                let mut join_set = JoinSet::new();
-                for shard in self.inner.shard_manager.get_shard_ids() {
-                    let client = self.clone();
-                    let request = request.clone();
-                    join_set.spawn(async move {
-                        let response = client
-                            .submit_write(shard, request, WriteOp::DeleteRange)
-                            .await?;
-                        check_status(response.status)
-                    });
-                }
-                while let Some(joined) = join_set.join_next().await {
-                    joined.map_err(|err| OxiaError::Disconnected(err.to_string()))??;
-                }
+                // Queue every copy before the first await, as `submit_write`
+                // does for a single write, so that each copy precedes in its
+                // shard's batch the writes issued after this delete range.
+                // Queued from tasks of their own, the copies could follow
+                // those writes, and be applied after them.
+                let responses: Vec<_> = self
+                    .inner
+                    .shard_manager
+                    .get_shard_ids()
+                    .into_iter()
+                    .map(|shard| {
+                        let (op, rx) = pending_write(request.clone(), WriteOp::DeleteRange);
+                        self.write_batcher(shard).add(op);
+                        rx
+                    })
+                    .collect();
+                try_join_all(
+                    responses.into_iter().map(|rx| async move {
+                        check_status(self.await_response(rx).await?.status)
+                    }),
+                )
+                .await?;
                 Ok(())
             }
         })
