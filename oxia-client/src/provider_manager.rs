@@ -22,7 +22,7 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct ProviderManager {
-    providers: Arc<DashMap<String, OnceCell<OxiaClientClient<AuthChannel>>>>,
+    providers: Arc<DashMap<String, Arc<OnceCell<OxiaClientClient<AuthChannel>>>>>,
     connect_timeout: Duration,
     auth: Option<TokenAuth>,
     #[cfg(feature = "tls")]
@@ -34,7 +34,11 @@ impl ProviderManager {
         &self,
         address: String,
     ) -> Result<OxiaClientClient<AuthChannel>, OxiaError> {
-        let once_cell = self.providers.entry(address.clone()).or_default();
+        // Clone the cell out of the map: the map entry holds a lock on its
+        // shard, which must not be held while connecting — it would block
+        // every other lookup in the shard, the whole thread on a
+        // single-threaded runtime.
+        let once_cell = self.providers.entry(address.clone()).or_default().clone();
         let connect_timeout = self.connect_timeout;
         let auth = self.auth.clone();
         #[cfg(feature = "tls")]
@@ -98,5 +102,40 @@ impl ProviderManager {
     /// Drops all cached connections.
     pub fn clear(&self) {
         self.providers.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two lookups of an address with no connection yet, on a single-threaded
+    /// runtime: the second must wait for the connection the first is making
+    /// without blocking the thread, which the first needs to finish.
+    #[test]
+    fn concurrent_lookups_while_connecting_do_not_block_the_thread() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let address = format!("http://{}", listener.local_addr().expect("address"));
+                let manager = ProviderManager::new(Duration::from_millis(500));
+                let _ = futures::future::join(
+                    manager.get_provider(address.clone()),
+                    manager.get_provider(address),
+                )
+                .await;
+            });
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the lookups must complete");
     }
 }
