@@ -1,7 +1,7 @@
 //! The Oxia client: construction, per-operation execution, and shutdown.
 
 use crate::batcher::{
-    BatcherDeps, ReadBatcher, WriteBatcher, WriteOp, absent_shard_error, pending_write,
+    BatcherDeps, ReadBatcher, WriteManager, WriteOp, absent_shard_error, pending_write,
 };
 use crate::client_builder::OxiaClientBuilder;
 use crate::client_options::OxiaClientOptions;
@@ -49,7 +49,7 @@ pub(crate) struct Inner {
     notification_managers: DashMap<u64, NotificationManager>,
     sequence_managers: DashMap<u64, SequenceUpdatesManager>,
     next_subscription_id: AtomicU64,
-    write_batchers: DashMap<i64, Arc<WriteBatcher>>,
+    write_manager: Arc<WriteManager>,
     read_batchers: DashMap<i64, Arc<ReadBatcher>>,
     closed: AtomicBool,
 }
@@ -192,12 +192,12 @@ impl OxiaClient {
                 provider_manager,
                 shard_manager,
                 session_manager,
+                write_manager: WriteManager::new(batcher_deps.clone()),
                 batcher_deps,
                 metrics,
                 notification_managers: DashMap::new(),
                 sequence_managers: DashMap::new(),
                 next_subscription_id: AtomicU64::new(0),
-                write_batchers: DashMap::new(),
                 read_batchers: DashMap::new(),
                 closed: AtomicBool::new(false),
             }),
@@ -548,12 +548,11 @@ impl OxiaClient {
         let mut first_err: Option<OxiaError> = None;
 
         // Flush and stop the batchers (writes first, so queued mutations land).
-        let write_shards: Vec<i64> = self.inner.write_batchers.iter().map(|e| *e.key()).collect();
-        for shard in write_shards {
-            if let Some((_, batcher)) = self.inner.write_batchers.remove(&shard) {
-                track(&mut first_err, batcher.close().await, "write batcher");
-            }
-        }
+        track(
+            &mut first_err,
+            self.inner.write_manager.close().await,
+            "write batcher",
+        );
         let read_shards: Vec<i64> = self.inner.read_batchers.iter().map(|e| *e.key()).collect();
         for shard in read_shards {
             if let Some((_, batcher)) = self.inner.read_batchers.remove(&shard) {
@@ -630,6 +629,13 @@ impl OxiaClient {
             })
     }
 
+    /// The shard manager, for the tests that wait for the client to get new
+    /// assignments.
+    #[cfg(test)]
+    pub(crate) fn shard_manager(&self) -> &ShardManager {
+        &self.inner.shard_manager
+    }
+
     pub(crate) async fn session_id_for(&self, shard: i64) -> Result<i64, OxiaError> {
         self.inner.session_manager.get_session_id(shard).await
     }
@@ -637,8 +643,11 @@ impl OxiaClient {
     /// Runs `attempt` against the shard that owns `routing_key`, re-resolving
     /// the shard and retrying (backoff, bounded by the request timeout) while
     /// routing is unavailable — `NoShardForKey` (assignments not loaded yet) or
-    /// `ShardMoved` (the shard just split or merged). This is how an operation
-    /// re-routes to the new shard after a split/merge.
+    /// `ShardMoved` (the shard just split or merged). This is how a get
+    /// re-routes to the new shard after a split/merge. The batcher of a split
+    /// shard hands its pending writes off to the new shards instead, in order
+    /// ([`WriteManager`]): a write fails with `ShardMoved` only when no shard
+    /// took over its key.
     pub(crate) async fn with_shard_retry<T, F, Fut>(
         &self,
         routing_key: &str,
@@ -677,17 +686,6 @@ impl OxiaClient {
         .await
     }
 
-    /// Returns (creating on first use) the write batcher for a shard.
-    fn write_batcher(&self, shard_id: i64) -> Arc<WriteBatcher> {
-        self.inner
-            .write_batchers
-            .entry(shard_id)
-            .or_insert_with(|| {
-                Arc::new(WriteBatcher::new(shard_id, self.inner.batcher_deps.clone()))
-            })
-            .clone()
-    }
-
     /// Returns (creating on first use) the read batcher for a shard.
     fn read_batcher(&self, shard_id: i64) -> Arc<ReadBatcher> {
         self.inner
@@ -705,10 +703,10 @@ impl OxiaClient {
         &self,
         shard_id: i64,
         request: Req,
-        wrap: fn(Pending<Req, Resp>) -> WriteOp,
+        wrap: impl FnOnce(Pending<Req, Resp>) -> WriteOp,
     ) -> Result<Resp, OxiaError> {
         let (op, rx) = pending_write(request, wrap);
-        self.write_batcher(shard_id).add(op);
+        self.inner.write_manager.add(shard_id, op);
         self.await_response(rx).await
     }
 
@@ -1083,8 +1081,10 @@ impl OxiaClient {
             // delete range. Queued only once polled, a copy could follow those
             // writes, and be applied after them. (A copy rerouted after a
             // split can only follow what the successors already have.)
-            let (op, rx) = pending_write(request.clone(), WriteOp::DeleteRange);
-            self.write_batcher(shard).add(op);
+            let (op, rx) = pending_write(request.clone(), |pending| {
+                WriteOp::DeleteRange(pending, None)
+            });
+            self.inner.write_manager.add(shard, op);
             async move { check_status(self.await_response(rx).await?.status) }
         })
         .await
@@ -1097,10 +1097,12 @@ impl OxiaClient {
 /// has elapsed.
 ///
 /// A copy fails with `ShardMoved` when its shard was split or merged away
-/// before the copy ran. The copy is then sent to that shard's successors, the
-/// shards now owning its hash range, except those that already have a copy in
-/// flight or applied. A successor that is split away in turn gets the same
-/// treatment, by its own range. No other shard is sent a second copy.
+/// before the copy ran, and the write batcher did not hand it off to the
+/// shards that replaced it ([`WriteManager`]). The copy is then sent to that
+/// shard's successors, the shards now owning its hash range, except those
+/// that already have a copy in flight or applied. A successor that is split
+/// away in turn gets the same treatment, by its own range. No other shard is
+/// sent a second copy.
 async fn send_to_every_shard<F, Fut>(
     shard_manager: &ShardManager,
     timeout: Duration,

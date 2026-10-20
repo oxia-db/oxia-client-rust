@@ -36,8 +36,32 @@ pub(crate) struct ShardRange {
 }
 
 impl ShardRange {
+    fn contains(&self, code: u32) -> bool {
+        self.min_hash <= code && code <= self.max_hash
+    }
+
     fn overlaps(&self, other: &ShardRange) -> bool {
         self.min_hash <= other.max_hash && other.min_hash <= self.max_hash
+    }
+}
+
+/// A shard removed from the assignments, after a split, and the shards that
+/// replaced it: those of the assignments it was removed from whose hash
+/// ranges overlap its own.
+#[derive(Debug)]
+pub(crate) struct ShardReplacement {
+    pub(crate) removed: i64,
+    pub(crate) successors: Vec<ShardRange>,
+    shard_key_router: i32,
+}
+
+impl ShardReplacement {
+    /// The position in `successors` of the shard that took over `key`.
+    pub(crate) fn successor_for(&self, key: &str) -> Option<usize> {
+        let code = shard_key_hash(self.shard_key_router, key);
+        self.successors
+            .iter()
+            .position(|range| range.contains(code))
     }
 }
 
@@ -56,6 +80,9 @@ struct Assignments {
     ranges: Vec<ShardRange>,
     /// Shard id -> leader address.
     leaders: HashMap<i64, String>,
+    /// The shards removed from the assignments since the first ones, in the
+    /// order they were removed.
+    replacements: Vec<Arc<ShardReplacement>>,
 }
 
 impl Assignments {
@@ -65,6 +92,7 @@ impl Assignments {
             key_order: KeyOrder::default(),
             ranges: Vec::new(),
             leaders: HashMap::new(),
+            replacements: Vec::new(),
         }
     }
 
@@ -87,7 +115,37 @@ impl Assignments {
             key_order: KeyOrder::from_key_sorting(namespace_assignment.key_sorting),
             ranges,
             leaders,
+            replacements: Vec::new(),
         }
+    }
+
+    /// The assignments that `namespace_assignment` replaces these with,
+    /// recording the shards it no longer has that other shards replaced: the
+    /// shards of `namespace_assignment` overlapping their hash ranges.
+    fn next(&self, namespace_assignment: &NamespaceShardsAssignment) -> Self {
+        let mut next = Assignments::from_namespace(namespace_assignment);
+        next.replacements = self.replacements.clone();
+        for removed in self
+            .ranges
+            .iter()
+            .filter(|range| !next.leaders.contains_key(&range.shard))
+        {
+            let successors: Vec<ShardRange> = next
+                .ranges
+                .iter()
+                .filter(|range| range.overlaps(removed))
+                .copied()
+                .collect();
+            if successors.is_empty() {
+                continue;
+            }
+            next.replacements.push(Arc::new(ShardReplacement {
+                removed: removed.shard,
+                successors,
+                shard_key_router: next.shard_key_router,
+            }));
+        }
+        next
     }
 
     /// Finds the shard whose hash range contains `code`, in O(log n).
@@ -171,7 +229,9 @@ async fn start_assignments_listener(
                         Some(Err(status)) => return classify_status(status, &init_sender).await,
                         Some(Ok(assignments)) => {
                             if let Some(na) = assignments.namespaces.get(&ns) {
-                                local_inner.set_assignments(Assignments::from_namespace(na));
+                                // This task is the only one to store them.
+                                let next = local_inner.assignments.load().next(na);
+                                local_inner.set_assignments(next);
                                 if !init_sender.is_closed() {
                                     let _ = init_sender.send(Ok(())).await;
                                 }
@@ -343,6 +403,18 @@ impl ShardManager {
         self.inner.assignments.load().key_order
     }
 
+    /// The shards removed from the assignments after the first `from` of
+    /// them, in the order they were removed, each with the shards that
+    /// replaced it.
+    pub(crate) fn replacements(&self, from: usize) -> Vec<Arc<ShardReplacement>> {
+        let assignments = self.inner.assignments.load();
+        assignments
+            .replacements
+            .get(from..)
+            .unwrap_or_default()
+            .to_vec()
+    }
+
     /// The hash ranges of all shards in the namespace, per the current
     /// assignments.
     pub(crate) fn get_shard_ranges(&self) -> Vec<ShardRange> {
@@ -384,12 +456,16 @@ impl ShardManager {
                 })),
             })
             .collect();
-        self.inner
-            .set_assignments(Assignments::from_namespace(&NamespaceShardsAssignment {
+        let next = self
+            .inner
+            .assignments
+            .load()
+            .next(&NamespaceShardsAssignment {
                 assignments,
                 shard_key_router: ShardKeyRouter::Xxhash3 as i32,
                 ..Default::default()
-            }));
+            });
+        self.inner.set_assignments(next);
     }
 }
 
@@ -412,6 +488,7 @@ mod tests {
             key_order: KeyOrder::default(),
             ranges: vec![range(0, 99, 1), range(100, 199, 2), range(200, u32::MAX, 3)],
             leaders: HashMap::new(),
+            replacements: Vec::new(),
         };
         assert_eq!(a.shard_for_hash(0).map(|r| r.shard), Some(1));
         assert_eq!(a.shard_for_hash(99).map(|r| r.shard), Some(1));
@@ -429,6 +506,7 @@ mod tests {
             key_order: KeyOrder::default(),
             ranges: vec![range(0, 99, 1), range(200, 299, 2)],
             leaders: HashMap::new(),
+            replacements: Vec::new(),
         };
         assert_eq!(a.shard_for_hash(50).map(|r| r.shard), Some(1));
         assert_eq!(a.shard_for_hash(150).map(|r| r.shard), None);
@@ -459,6 +537,106 @@ mod tests {
             assert_eq!(Assignments::from_namespace(&namespace).key_order, order);
         }
         assert_eq!(Assignments::empty().key_order, KeyOrder::Legacy);
+    }
+
+    /// The assignments of `shards`, as `(shard, min_hash, max_hash)`.
+    fn namespace(shards: &[(i64, u32, u32)]) -> NamespaceShardsAssignment {
+        use crate::proto::{Int32HashRange, ShardAssignment};
+        NamespaceShardsAssignment {
+            assignments: shards
+                .iter()
+                .map(
+                    |&(shard, min_hash_inclusive, max_hash_inclusive)| ShardAssignment {
+                        shard,
+                        leader: format!("server-{shard}:6648"),
+                        shard_boundaries: Some(ShardBoundaries::Int32HashRange(Int32HashRange {
+                            min_hash_inclusive,
+                            max_hash_inclusive,
+                        })),
+                    },
+                )
+                .collect(),
+            shard_key_router: ShardKeyRouter::Xxhash3 as i32,
+            ..NamespaceShardsAssignment::default()
+        }
+    }
+
+    fn replaced(assignments: &Assignments) -> Vec<(i64, Vec<i64>)> {
+        assignments
+            .replacements
+            .iter()
+            .map(|r| (r.removed, r.successors.iter().map(|s| s.shard).collect()))
+            .collect()
+    }
+
+    /// An update records the shards it removes, each with the shards of the
+    /// update that overlap its hash range: a split shard keeps its children
+    /// as its successors even once one of them is split in turn.
+    #[test]
+    fn updates_record_the_replaced_shards() {
+        let first = Assignments::empty().next(&namespace(&[(0, 0, 99), (1, 100, 199)]));
+        assert_eq!(replaced(&first), []);
+        // Shard 0 is split into shards 2 and 3.
+        let second = first.next(&namespace(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]));
+        assert_eq!(replaced(&second), [(0, vec![2, 3])]);
+        // An update that removes no shard records nothing.
+        let third = second.next(&namespace(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]));
+        assert_eq!(replaced(&third), [(0, vec![2, 3])]);
+        // Shard 3 is split into shards 4 and 5.
+        let fourth = third.next(&namespace(&[
+            (1, 100, 199),
+            (2, 0, 49),
+            (4, 50, 74),
+            (5, 75, 99),
+        ]));
+        assert_eq!(replaced(&fourth), [(0, vec![2, 3]), (3, vec![4, 5])]);
+        // A shard that no other shard replaced is not recorded.
+        let fifth = fourth.next(&namespace(&[(2, 0, 49), (4, 50, 74), (5, 75, 99)]));
+        assert_eq!(replaced(&fifth), [(0, vec![2, 3]), (3, vec![4, 5])]);
+    }
+
+    /// A replacement sends a key to the successor that the new assignments
+    /// route it to.
+    #[test]
+    fn replacement_routes_a_key_to_its_successor() {
+        let middle = u32::MAX / 2;
+        let assignments = Assignments::empty()
+            .next(&namespace(&[(0, 0, u32::MAX)]))
+            .next(&namespace(&[(1, 0, middle), (2, middle + 1, u32::MAX)]));
+        let replacement = &assignments.replacements[0];
+        let mut successors = std::collections::HashSet::new();
+        for key in (0..20).map(|i| format!("key-{i}")) {
+            let routed = assignments
+                .shard_for_hash(crate::hash::xxh3_32(&key))
+                .map(|r| r.shard);
+            let successor = replacement
+                .successor_for(&key)
+                .map(|i| replacement.successors[i].shard);
+            assert_eq!(successor, routed, "key {key}");
+            successors.extend(successor);
+        }
+        assert_eq!(successors.len(), 2, "the keys land on both successors");
+    }
+
+    #[test]
+    fn replacements_are_listed_after_the_first_ones() {
+        let manager = ShardManager::detached_for_tests();
+        let assignments = Assignments::empty()
+            .next(&namespace(&[(0, 0, 99), (1, 100, 199)]))
+            .next(&namespace(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]))
+            .next(&namespace(&[(2, 0, 49), (3, 50, 99), (4, 100, 199)]));
+        manager.inner.assignments.store(Arc::new(assignments));
+        let removed = |from| -> Vec<i64> {
+            manager
+                .replacements(from)
+                .iter()
+                .map(|r| r.removed)
+                .collect()
+        };
+        assert_eq!(removed(0), [0, 1]);
+        assert_eq!(removed(1), [1]);
+        assert_eq!(removed(2), []);
+        assert_eq!(removed(3), []);
     }
 
     fn range_of(manager: &ShardManager, shard: i64) -> ShardRange {

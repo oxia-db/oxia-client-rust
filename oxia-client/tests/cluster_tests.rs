@@ -10,6 +10,7 @@
 
 use futures::{StreamExt, TryStreamExt};
 use oxia::{ComparisonType, Notification, Notifications, OxiaClient, OxiaClientBuilder, OxiaError};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -706,6 +707,102 @@ async fn test_notifications_across_live_split() {
 
     assert_eq!(created_keys(&mut prompt, written.len()).await, written);
     assert_eq!(created_keys(&mut lagging, written.len()).await, written);
+
+    client.close().await.unwrap();
+}
+
+/// Puts pipelined to the same keys across a live split of the only shard are
+/// applied in the order they were issued: the modification count of each put
+/// is higher than those of the puts to its key issued before it. When the
+/// split completes, some of the puts are pending on the parent, and are
+/// handed off to the children, while the puts issued once the client has the
+/// new assignments go to the children directly.
+///
+/// Runs on a multi-thread runtime, as a pipelined writer would: the parent's
+/// batcher hands its writes off while the writes issued meanwhile are queued
+/// on other threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_shard_split_keeps_the_write_order() {
+    const KEYS: usize = 16;
+    // Enough puts in flight for the writer to keep issuing them while the
+    // ones pending on the parent are handed off.
+    const IN_FLIGHT: usize = 1024;
+    let cluster = start_cluster(2, 1).await;
+    let client = connect_with_retry(&cluster.address).await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = tokio::spawn({
+        let client = client.clone();
+        let stop = stop.clone();
+        async move {
+            // `buffered` polls the puts first in the order they are issued:
+            // the order they join their shard's batch in.
+            let mut puts = futures::stream::iter(0..)
+                .take_while(|_| futures::future::ready(!stop.load(Ordering::SeqCst)))
+                .map(|seq: usize| {
+                    let key = format!("order/key-{:02}", seq % KEYS);
+                    let put = client.put(key.clone(), seq.to_string());
+                    async move { (seq, key, put.await) }
+                })
+                .buffered(IN_FLIGHT);
+            // The puts that succeeded, those that failed, and those applied
+            // before a put issued earlier to their key.
+            let mut succeeded = 0;
+            let mut failed = Vec::new();
+            let mut out_of_order = Vec::new();
+            let mut last_applied: HashMap<String, (usize, i64)> = HashMap::new();
+            while let Some((seq, key, result)) = puts.next().await {
+                let put = match result {
+                    Ok(put) => put,
+                    Err(e) => {
+                        failed.push(format!("put #{seq} to {key}: {e}"));
+                        continue;
+                    }
+                };
+                succeeded += 1;
+                let count = put.version.modifications_count;
+                if let Some(&(last_seq, last_count)) = last_applied.get(&key) {
+                    if count <= last_count {
+                        out_of_order.push(format!(
+                            "{key}: put #{seq} applied as modification {count}, \
+                             before put #{last_seq} (modification {last_count})"
+                        ));
+                    }
+                }
+                last_applied.insert(key, (seq, count));
+            }
+            (succeeded, failed, out_of_order)
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let split_output = cluster.split_shard(0).await;
+    assert!(
+        split_output.contains("\"Error\":null"),
+        "split must succeed, got: {split_output}"
+    );
+    cluster.wait_until_removed(0).await;
+    // Keep writing to the children for a while.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    stop.store(true, Ordering::SeqCst);
+
+    let (succeeded, failed, out_of_order) = writer.await.expect("writer task");
+    println!(
+        "{succeeded} puts succeeded, {} failed, {} out of order",
+        failed.len(),
+        out_of_order.len()
+    );
+    assert!(
+        out_of_order.is_empty(),
+        "puts applied out of the order they were issued: {:#?}",
+        &out_of_order[..out_of_order.len().min(20)]
+    );
+    assert!(
+        failed.is_empty(),
+        "puts failed across the split: {:#?}",
+        &failed[..failed.len().min(20)]
+    );
+    assert!(succeeded > 0, "no put succeeded");
 
     client.close().await.unwrap();
 }

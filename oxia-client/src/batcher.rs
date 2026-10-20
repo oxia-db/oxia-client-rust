@@ -23,6 +23,11 @@
 //! decision *and* the hand-off to the write stream happen under one mutex, so
 //! stream order always equals dispatch order. Reads have no ordering
 //! constraint and run as independent RPCs.
+//!
+//! The order also holds across a shard split ([`WriteManager`]): the batcher
+//! of the split shard hands its pending writes off to the batchers of the
+//! shards that replaced it, in the order they were issued, and those hold the
+//! writes issued after the split until it has.
 
 use crate::address::ensure_protocol;
 use crate::errors::OxiaError;
@@ -31,9 +36,12 @@ use crate::proto;
 use crate::provider_manager::ProviderManager;
 use crate::retry::retry_delay;
 use crate::server_error::{DecodedStatus, LeaderHint, decode_status};
-use crate::shard_manager::ShardManager;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use crate::shard_manager::{ShardManager, ShardReplacement};
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
+use futures::stream::FuturesUnordered;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::{Notify, oneshot};
@@ -61,7 +69,9 @@ pub(crate) struct BatcherDeps {
 pub(crate) enum WriteOp {
     Put(PendingPut),
     Delete(PendingDelete),
-    DeleteRange(PendingDeleteRange),
+    /// With the partition key the delete range was routed with: `None` for
+    /// the copy of a delete range sent to every shard.
+    DeleteRange(PendingDeleteRange, Option<String>),
 }
 
 impl WriteOp {
@@ -71,9 +81,21 @@ impl WriteOp {
         match self {
             WriteOp::Put(p) => p.request.key.len() + p.request.value.len(),
             WriteOp::Delete(d) => d.request.key.len(),
-            WriteOp::DeleteRange(r) => {
+            WriteOp::DeleteRange(r, _) => {
                 r.request.start_inclusive.len() + r.request.end_exclusive.len()
             }
+        }
+    }
+
+    /// The key that routes the op to its shard: its partition key, or its
+    /// key. `None` for the copy of a delete range sent to every shard.
+    fn routing_key(&self) -> Option<&str> {
+        match self {
+            WriteOp::Put(p) => Some(p.request.partition_key.as_deref().unwrap_or(&p.request.key)),
+            WriteOp::Delete(d) => {
+                Some(d.request.partition_key.as_deref().unwrap_or(&d.request.key))
+            }
+            WriteOp::DeleteRange(_, partition_key) => partition_key.as_deref(),
         }
     }
 
@@ -85,7 +107,7 @@ impl WriteOp {
             WriteOp::Delete(d) => {
                 let _ = d.callback.send(Err(err));
             }
-            WriteOp::DeleteRange(r) => {
+            WriteOp::DeleteRange(r, _) => {
                 let _ = r.callback.send(Err(err));
             }
         }
@@ -167,7 +189,8 @@ fn complete_all<Resp>(
 struct WriteBody {
     puts: Vec<PendingPut>,
     deletes: Vec<PendingDelete>,
-    delete_ranges: Vec<PendingDeleteRange>,
+    /// With the partition key each delete range was routed with.
+    delete_ranges: Vec<(PendingDeleteRange, Option<String>)>,
     count: usize,
     bytes: usize,
 }
@@ -188,9 +211,9 @@ impl WriteBody {
                 d.request.op_index = op_index;
                 self.deletes.push(d);
             }
-            WriteOp::DeleteRange(mut r) => {
+            WriteOp::DeleteRange(mut r, partition_key) => {
                 r.request.op_index = op_index;
-                self.delete_ranges.push(r);
+                self.delete_ranges.push((r, partition_key));
             }
         }
         self.count += 1;
@@ -199,6 +222,17 @@ impl WriteBody {
 
     fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Whether an op of `size` fits next to the ops already in the batch.
+    fn fits(&self, size: usize, max_requests: usize, max_bytes: usize) -> bool {
+        self.is_empty() || (self.count < max_requests && self.bytes + size <= max_bytes)
+    }
+
+    /// The ops of the batch, in the order they were added.
+    fn into_ops(self) -> Vec<WriteOp> {
+        let (request, callbacks) = self.into_request(0);
+        ops_in_issue_order(request, callbacks)
     }
 
     /// Splits into the wire request (requests moved, not cloned) and the
@@ -217,7 +251,7 @@ impl WriteBody {
         let (dr_reqs, dr_cbs): (Vec<_>, Vec<_>) = self
             .delete_ranges
             .into_iter()
-            .map(|p| (p.request, p.callback))
+            .map(|(p, partition_key)| (p.request, (p.callback, partition_key)))
             .unzip();
         (
             proto::WriteRequest {
@@ -235,26 +269,72 @@ impl WriteBody {
     }
 }
 
+type DeleteRangeCallback = oneshot::Sender<Result<proto::DeleteRangeResponse, OxiaError>>;
+
 /// The callbacks of one in-flight write batch, completed FIFO from the shard's
 /// response stream.
 struct WriteCallbacks {
     puts: Vec<oneshot::Sender<Result<proto::PutResponse, OxiaError>>>,
     deletes: Vec<oneshot::Sender<Result<proto::DeleteResponse, OxiaError>>>,
-    delete_ranges: Vec<oneshot::Sender<Result<proto::DeleteRangeResponse, OxiaError>>>,
+    /// With the partition key each delete range was routed with.
+    delete_ranges: Vec<(DeleteRangeCallback, Option<String>)>,
 }
 
 impl WriteCallbacks {
     fn complete(self, response: proto::WriteResponse) {
         complete_all(self.puts, response.puts, "put");
         complete_all(self.deletes, response.deletes, "delete");
-        complete_all(self.delete_ranges, response.delete_ranges, "delete_range");
+        let delete_ranges = self.delete_ranges.into_iter().map(|(callback, _)| callback);
+        complete_all(delete_ranges, response.delete_ranges, "delete_range");
     }
 
     fn fail(self, err: &OxiaError) {
         fail_all(self.puts, err);
         fail_all(self.deletes, err);
-        fail_all(self.delete_ranges, err);
+        fail_all(
+            self.delete_ranges.into_iter().map(|(callback, _)| callback),
+            err,
+        );
     }
+}
+
+/// The ops of a batch, with their callbacks, in `op_index` order: the order
+/// they were issued in.
+fn ops_in_issue_order(request: proto::WriteRequest, callbacks: WriteCallbacks) -> Vec<WriteOp> {
+    let puts = request
+        .puts
+        .into_iter()
+        .zip(callbacks.puts)
+        .map(|(request, callback)| {
+            (
+                request.op_index,
+                WriteOp::Put(Pending { request, callback }),
+            )
+        });
+    let deletes = request
+        .deletes
+        .into_iter()
+        .zip(callbacks.deletes)
+        .map(|(request, callback)| {
+            (
+                request.op_index,
+                WriteOp::Delete(Pending { request, callback }),
+            )
+        });
+    let delete_ranges = request
+        .delete_ranges
+        .into_iter()
+        .zip(callbacks.delete_ranges)
+        .map(|(request, (callback, partition_key))| {
+            let op_index = request.op_index;
+            (
+                op_index,
+                WriteOp::DeleteRange(Pending { request, callback }, partition_key),
+            )
+        });
+    let mut ops: Vec<(u32, WriteOp)> = puts.chain(deletes).chain(delete_ranges).collect();
+    ops.sort_by_key(|(op_index, _)| *op_index);
+    ops.into_iter().map(|(_, op)| op).collect()
 }
 
 /// An in-flight (or retryable) write batch: the wire request is retained so a
@@ -289,6 +369,98 @@ struct WriteState {
     /// The response stream, parked here while the shard is idle (no pump).
     parked: Option<Streaming<proto::WriteResponse>>,
     pump_running: bool,
+    /// Writes handed off by the shards that this one replaced, after a split.
+    /// Issued before the writes in `queues`, they go out first.
+    handed_off: VecDeque<WriteBody>,
+    /// The number of shards that this one replaced and that have not handed
+    /// off all their writes yet: until then, the writes in `queues` wait.
+    held: usize,
+    /// Set once the shard has been removed from the assignments.
+    retired: Option<Retired>,
+}
+
+/// A shard removed from the assignments, after a split: the writes queued for
+/// it go to the shards that replaced it.
+struct Retired {
+    replacement: Arc<ShardReplacement>,
+    /// The batchers of the shards in `replacement.successors`, in order.
+    successors: Vec<Arc<WriteBatcher>>,
+    /// Whether the successors no longer hold their writes for this shard.
+    released: bool,
+}
+
+impl Retired {
+    /// Where `op` goes, by position in `successors`: to the successor that
+    /// took over its key, or to each one, for the copy of a delete range sent
+    /// to every shard. Without a successor for it, the op fails with
+    /// `ShardMoved`, and its builder re-routes it.
+    fn route(&self, op: WriteOp) -> Vec<(usize, WriteOp)> {
+        let successor = op
+            .routing_key()
+            .map(|key| self.replacement.successor_for(key));
+        match (successor, op) {
+            (Some(Some(index)), op) => vec![(index, op)],
+            (None, WriteOp::DeleteRange(pending, None)) if !self.successors.is_empty() => {
+                copy_delete_range(pending, self.successors.len())
+                    .into_iter()
+                    .map(|copy| WriteOp::DeleteRange(copy, None))
+                    .enumerate()
+                    .collect()
+            }
+            (_, op) => {
+                op.fail(OxiaError::ShardMoved);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Hands `ops` off to the successors, in order.
+    fn hand_off(&self, ops: Vec<WriteOp>) {
+        let mut handed_off: Vec<Vec<WriteOp>> =
+            self.successors.iter().map(|_| Vec::new()).collect();
+        for op in ops {
+            for (index, op) in self.route(op) {
+                handed_off[index].push(op);
+            }
+        }
+        for (successor, ops) in self.successors.iter().zip(handed_off) {
+            if !ops.is_empty() {
+                successor.hand_off(ops);
+            }
+        }
+    }
+}
+
+/// Copies a delete range for `shards` shards. Its callback gets the first
+/// failure of a copy, or, once they have all succeeded, the response of the
+/// last one.
+fn copy_delete_range(pending: PendingDeleteRange, shards: usize) -> Vec<PendingDeleteRange> {
+    if shards == 1 {
+        return vec![pending];
+    }
+    let Pending { request, callback } = pending;
+    let (copies, responses): (Vec<PendingDeleteRange>, Vec<_>) =
+        (0..shards).map(|_| Pending::new(request.clone())).unzip();
+    tokio::spawn(async move {
+        let mut responses: FuturesUnordered<_> = responses.into_iter().collect();
+        let mut result = None;
+        while let Some(response) = responses.next().await {
+            let response = response.unwrap_or_else(|_| {
+                Err(OxiaError::Disconnected(
+                    "operation was dropped without a response".to_string(),
+                ))
+            });
+            let failed = !matches!(&response, Ok(r) if r.status == proto::Status::Ok as i32);
+            result = Some(response);
+            if failed {
+                break;
+            }
+        }
+        if let Some(result) = result {
+            let _ = callback.send(result);
+        }
+    });
+    copies
 }
 
 /// Batches write operations for one shard.
@@ -305,15 +477,18 @@ pub(crate) fn absent_shard_error(deps: &BatcherDeps, shard: i64) -> OxiaError {
 pub(crate) struct WriteBatcher {
     shard: i64,
     deps: Arc<BatcherDeps>,
+    /// Retires the shard once it leaves the assignments.
+    manager: Weak<WriteManager>,
     state: Mutex<WriteState>,
     drained: Notify,
 }
 
 impl WriteBatcher {
-    pub(crate) fn new(shard: i64, deps: Arc<BatcherDeps>) -> Self {
+    pub(crate) fn new(shard: i64, deps: Arc<BatcherDeps>, manager: Weak<WriteManager>) -> Self {
         WriteBatcher {
             shard,
             deps,
+            manager,
             state: Mutex::new(WriteState {
                 queues: Queues::default(),
                 pending: VecDeque::new(),
@@ -324,6 +499,9 @@ impl WriteBatcher {
                 stream_tx: None,
                 parked: None,
                 pump_running: false,
+                handed_off: VecDeque::new(),
+                held: 0,
+                retired: None,
             }),
             drained: Notify::new(),
         }
@@ -342,11 +520,25 @@ impl WriteBatcher {
             let mut st = self.state.lock().expect("write batcher poisoned");
             if st.queues.closed {
                 Some(op)
+            } else if let Some(retired) = &st.retired {
+                // Routed with assignments that still had the shard: on to the
+                // shard that took over its key, behind the writes this one
+                // hands off to it.
+                let forwarded: Vec<_> = retired
+                    .route(op)
+                    .into_iter()
+                    .map(|(index, op)| (retired.successors[index].clone(), op))
+                    .collect();
+                drop(st);
+                for (successor, op) in forwarded {
+                    successor.add(op);
+                }
+                return;
             } else {
                 let mut open = st.queues.open.take().unwrap_or_default();
                 // Seal the open batch when this operation would overflow it.
                 if !open.is_empty() && open.bytes + size > self.deps.max_batch_size {
-                    if self.can_dispatch(&st) {
+                    if self.can_dispatch_own(&st) {
                         self.dispatch_locked(&mut st, open);
                     } else {
                         st.queues.ready.push_back(open);
@@ -355,7 +547,7 @@ impl WriteBatcher {
                 }
                 open.push(op, size);
                 if open.count >= self.deps.max_requests_per_batch {
-                    if self.can_dispatch(&st) {
+                    if self.can_dispatch_own(&st) {
                         self.dispatch_locked(&mut st, open);
                     } else {
                         st.queues.ready.push_back(open);
@@ -367,7 +559,7 @@ impl WriteBatcher {
                     // whatever arrives in the meantime). With the window
                     // exhausted (or a reconnect backoff pending), do nothing —
                     // a completion or the reconnect will pick it up.
-                    if self.can_dispatch(&st) && !st.queues.flush_scheduled {
+                    if self.can_dispatch_own(&st) && !st.queues.flush_scheduled {
                         st.queues.flush_scheduled = true;
                         spawn_flusher = true;
                     }
@@ -395,14 +587,24 @@ impl WriteBatcher {
         self.fill_capacity(&mut st);
     }
 
+    /// Whether a batch can go out: none can once the shard is retired.
     fn can_dispatch(&self, st: &WriteState) -> bool {
-        !st.reconnecting && st.pending.len() < self.deps.max_write_batches_in_flight
+        st.retired.is_none()
+            && !st.reconnecting
+            && st.pending.len() < self.deps.max_write_batches_in_flight
+    }
+
+    /// Whether a batch of the writes in `queues` can go out: not before the
+    /// writes handed off to the shard, which are older.
+    fn can_dispatch_own(&self, st: &WriteState) -> bool {
+        st.held == 0 && st.handed_off.is_empty() && self.can_dispatch(st)
     }
 
     /// Dispatches queued batches — retries first (they are the oldest), then
-    /// sealed batches, then the open one — while the window has capacity.
-    /// Retries whose deadline has passed fail here instead of being re-sent.
-    /// Must be called with the state lock held.
+    /// those handed off by the shards this one replaced, then sealed batches,
+    /// then the open one — while the window has capacity. Retries whose
+    /// deadline has passed fail here instead of being re-sent. Must be called
+    /// with the state lock held.
     fn fill_capacity(self: &Arc<Self>, st: &mut WriteState) {
         while self.can_dispatch(st) {
             if let Some(inflight) = st.retry.pop_front() {
@@ -412,6 +614,13 @@ impl WriteBatcher {
                 }
                 self.send_locked(st, inflight);
                 continue;
+            }
+            if let Some(body) = st.handed_off.pop_front() {
+                self.dispatch_locked(st, body);
+                continue;
+            }
+            if st.held > 0 {
+                break;
             }
             match st.queues.take_next() {
                 Some(body) => self.dispatch_locked(st, body),
@@ -470,6 +679,122 @@ impl WriteBatcher {
         }
     }
 
+    /// Holds the writes queued here from now on until [`release`]: a shard
+    /// that this one replaced has writes to hand off first.
+    ///
+    /// [`release`]: WriteBatcher::release
+    fn hold(&self) {
+        self.state.lock().expect("write batcher poisoned").held += 1;
+    }
+
+    /// A shard that this one replaced has handed off all its writes.
+    fn release(self: &Arc<Self>) {
+        let mut st = self.state.lock().expect("write batcher poisoned");
+        st.held -= 1;
+        self.make_progress(&mut st);
+    }
+
+    /// Takes over writes that were pending on a shard that this one replaced:
+    /// they go out before the writes queued here.
+    fn hand_off(self: &Arc<Self>, ops: Vec<WriteOp>) {
+        let mut st = self.state.lock().expect("write batcher poisoned");
+        for op in ops {
+            let size = op.size();
+            let fits = st.handed_off.back().is_some_and(|body| {
+                body.fits(
+                    size,
+                    self.deps.max_requests_per_batch,
+                    self.deps.max_batch_size,
+                )
+            });
+            if !fits {
+                st.handed_off.push_back(WriteBody::default());
+            }
+            let body = st.handed_off.back_mut().expect("a batch to add to");
+            body.push(op, size);
+        }
+        self.make_progress(&mut st);
+    }
+
+    /// Retires the shard, removed from the assignments: from now on, its
+    /// writes go to the shards that replaced it.
+    fn retire(self: &Arc<Self>, retired: Retired) {
+        let mut st = self.state.lock().expect("write batcher poisoned");
+        st.retired = Some(retired);
+        self.make_progress(&mut st);
+    }
+
+    /// Sends what the window allows, or, once the shard is retired, hands it
+    /// off. Must be called with the state lock held.
+    fn make_progress(self: &Arc<Self>, st: &mut WriteState) {
+        if st.retired.is_some() {
+            self.drain_retired(st);
+        } else {
+            self.fill_capacity(st);
+        }
+        if st.queues.closed && self.is_drained(st) {
+            self.drained.notify_waiters();
+        }
+    }
+
+    /// Hands off the writes of a retired shard once none is in flight on its
+    /// stream, in the order they were issued: first the writes older than
+    /// those queued here (the batches to retry, then the writes handed off to
+    /// this shard), then, once the shards it replaced have handed off theirs,
+    /// the writes queued here. Then releases the successors. Must be called
+    /// with the state lock held.
+    fn drain_retired(self: &Arc<Self>, st: &mut WriteState) {
+        if st.retired.is_none() || st.pump_running {
+            return;
+        }
+        let mut ops = Vec::new();
+        for inflight in st.retry.drain(..) {
+            if inflight.first_dispatch.elapsed() >= self.deps.request_timeout {
+                inflight.callbacks.fail(&OxiaError::Timeout);
+            } else {
+                ops.extend(ops_in_issue_order(inflight.request, inflight.callbacks));
+            }
+        }
+        for body in st.handed_off.drain(..) {
+            ops.extend(body.into_ops());
+        }
+        let held = st.held > 0;
+        if !held {
+            while let Some(body) = st.queues.take_next() {
+                ops.extend(body.into_ops());
+            }
+        }
+        // Nothing goes out on the stream anymore.
+        st.stream_tx = None;
+        st.parked = None;
+        let retired = st.retired.as_mut().expect("the shard is retired");
+        retired.hand_off(ops);
+        if !held && !retired.released {
+            retired.released = true;
+            for successor in &retired.successors {
+                successor.release();
+            }
+        }
+    }
+
+    /// Retires the shard once it has left the assignments.
+    fn retire_if_removed(&self) {
+        if self.deps.shard_manager.shard_exists(self.shard) {
+            return;
+        }
+        if let Some(manager) = self.manager.upgrade() {
+            manager.process_replacements();
+        }
+    }
+
+    /// The stream failed, or could not be created. A shard that has left the
+    /// assignments is retired first, so that its writes go to the shards
+    /// that replaced it rather than to a new stream.
+    fn stream_failed(self: &Arc<Self>, decoded: DecodedStatus, version: u64) {
+        self.retire_if_removed();
+        self.pump_died(decoded, version);
+    }
+
     async fn run_pump(self: Arc<Self>, init: PumpInit) {
         let version = self.deps.shard_manager.assignments_version();
         let mut streaming = match init {
@@ -477,7 +802,7 @@ impl WriteBatcher {
             PumpInit::Connect(rx) => match self.connect_stream(rx).await {
                 Ok(streaming) => streaming,
                 Err(err) => {
-                    self.pump_died(err, version);
+                    self.stream_failed(err, version);
                     return;
                 }
             },
@@ -488,14 +813,14 @@ impl WriteBatcher {
                 // No response within the request timeout while batches are in
                 // flight: the stream is wedged. Not retried — the batch may
                 // have been applied.
-                Err(_) => return self.pump_died(OxiaError::Timeout.into(), version),
+                Err(_) => return self.stream_failed(OxiaError::Timeout.into(), version),
                 Ok(None) => {
-                    return self.pump_died(
+                    return self.stream_failed(
                         OxiaError::Disconnected("write stream closed by server".to_string()).into(),
                         version,
                     );
                 }
-                Ok(Some(Err(status))) => return self.pump_died(decode_status(status), version),
+                Ok(Some(Err(status))) => return self.stream_failed(decode_status(status), version),
                 Ok(Some(Ok(response))) => response,
             };
 
@@ -515,6 +840,9 @@ impl WriteBatcher {
                 // Shard idle: park the response stream and exit.
                 st.parked = Some(streaming);
                 st.pump_running = false;
+                // Nothing is in flight anymore: a retired shard hands off the
+                // writes queued here.
+                self.drain_retired(&mut st);
                 let drained = st.queues.closed && self.is_drained(&st);
                 drop(st);
                 callbacks.complete(response);
@@ -594,6 +922,9 @@ impl WriteBatcher {
     /// `version`, the one the pump started with: a leader elected or moved
     /// meanwhile is tried right away, not when the backoff ends — possibly
     /// past the request timeout.
+    ///
+    /// Once the shard is retired, the batches that would be retried are
+    /// handed off to the shards that replaced it instead.
     fn pump_died(self: &Arc<Self>, decoded: DecodedStatus, version: u64) {
         let DecodedStatus { error, leader_hint } = decoded;
         warn!(shard = self.shard, error = %error, "write stream failed");
@@ -607,10 +938,24 @@ impl WriteBatcher {
             }
             let mut expired: Vec<WriteCallbacks> = Vec::new();
             let mut failed: Vec<WriteCallbacks> = Vec::new();
-            // A split/merged shard is retryable-by-rerouting, not by re-sending
+            // A retired shard hands off the batches it would retry. Otherwise,
+            // a split/merged shard is retryable-by-rerouting, not by re-sending
             // to the same (now dead) shard: let it fall through to fail so the
             // builders re-route.
-            if error.is_retryable() && !matches!(error, OxiaError::ShardMoved) && !st.queues.closed
+            if st.retired.is_some() {
+                if error.is_retryable() {
+                    // Ahead of the batches requeued before them, which are
+                    // newer.
+                    let mut retry = std::mem::take(&mut st.pending);
+                    retry.append(&mut st.retry);
+                    st.retry = retry;
+                } else {
+                    failed = st.pending.drain(..).map(|i| i.callbacks).collect();
+                }
+                self.drain_retired(&mut st);
+            } else if error.is_retryable()
+                && !matches!(error, OxiaError::ShardMoved)
+                && !st.queues.closed
             {
                 st.failure_streak += 1;
                 // Requeue in dispatch order ahead of previously-requeued
@@ -635,6 +980,9 @@ impl WriteBatcher {
                         .shard_manager
                         .wait_for_update(version, delay)
                         .await;
+                    // A shard that has left the assignments hands off its
+                    // writes rather than reconnecting.
+                    this.retire_if_removed();
                     let mut st = this.state.lock().expect("write batcher poisoned");
                     st.reconnecting = false;
                     this.fill_capacity(&mut st);
@@ -660,7 +1008,10 @@ impl WriteBatcher {
     }
 
     fn is_drained(&self, st: &WriteState) -> bool {
-        st.queues.is_drained() && st.pending.is_empty() && st.retry.is_empty()
+        st.queues.is_drained()
+            && st.pending.is_empty()
+            && st.retry.is_empty()
+            && st.handed_off.is_empty()
     }
 
     /// Flushes everything queued and waits (bounded) for in-flight batches to
@@ -670,14 +1021,25 @@ impl WriteBatcher {
         {
             let mut st = self.state.lock().expect("write batcher poisoned");
             st.queues.closed = true;
-            // Drain fast: cancel any reconnect hold and dispatch everything,
-            // ignoring the window bound (stream ordering is unaffected).
-            st.reconnecting = false;
-            while let Some(inflight) = st.retry.pop_front() {
-                self.send_locked(&mut st, inflight);
-            }
-            while let Some(body) = st.queues.take_next() {
-                self.dispatch_locked(&mut st, body);
+            // A retired shard hands its writes off instead, once none is in
+            // flight.
+            if st.retired.is_none() {
+                // Drain fast: cancel any reconnect hold and dispatch everything,
+                // ignoring the window bound (stream ordering is unaffected).
+                st.reconnecting = false;
+                while let Some(inflight) = st.retry.pop_front() {
+                    self.send_locked(&mut st, inflight);
+                }
+                while let Some(body) = st.handed_off.pop_front() {
+                    self.dispatch_locked(&mut st, body);
+                }
+                // The writes queued here wait for the shards that this one
+                // replaced to hand off theirs.
+                if st.held == 0 {
+                    while let Some(body) = st.queues.take_next() {
+                        self.dispatch_locked(&mut st, body);
+                    }
+                }
             }
         }
         let deadline = tokio::time::Instant::now() + self.deps.request_timeout;
@@ -695,6 +1057,15 @@ impl WriteBatcher {
                     let mut leftovers: Vec<WriteCallbacks> =
                         st.pending.drain(..).map(|i| i.callbacks).collect();
                     leftovers.extend(st.retry.drain(..).map(|i| i.callbacks));
+                    let mut queued: Vec<WriteBody> = st.handed_off.drain(..).collect();
+                    while let Some(body) = st.queues.take_next() {
+                        queued.push(body);
+                    }
+                    leftovers.extend(
+                        queued
+                            .into_iter()
+                            .map(|body| body.into_request(self.shard).1),
+                    );
                     leftovers
                 };
                 for callbacks in leftovers {
@@ -709,6 +1080,141 @@ impl WriteBatcher {
         st.stream_tx = None;
         st.parked = None;
         Ok(())
+    }
+}
+
+/// The write batchers of a client, one per shard, created on the shard's
+/// first write.
+///
+/// Writes keep their order across a shard split, as in the Go client
+/// (oxia-db/oxia#1360): the batcher of the split shard hands off its pending
+/// writes to the batchers of the shards that replaced it, in the order they
+/// were issued, and these hold their own writes until it has, so that a
+/// write issued once the client has the new assignments is not applied
+/// before an older write to the same key.
+pub(crate) struct WriteManager {
+    deps: Arc<BatcherDeps>,
+    batchers: DashMap<i64, Arc<WriteBatcher>>,
+    /// The number of shard replacements processed, in the order the shard
+    /// manager recorded them.
+    processed: Mutex<usize>,
+    this: Weak<WriteManager>,
+}
+
+impl WriteManager {
+    pub(crate) fn new(deps: Arc<BatcherDeps>) -> Arc<Self> {
+        Arc::new_cyclic(|this| WriteManager {
+            deps,
+            batchers: DashMap::new(),
+            processed: Mutex::new(0),
+            this: this.clone(),
+        })
+    }
+
+    /// Queues a write for `shard`. Infallible: failures are delivered through
+    /// the operation's callback.
+    pub(crate) fn add(&self, shard: i64, op: WriteOp) {
+        self.batcher(shard).add(op);
+    }
+
+    fn batcher(&self, shard: i64) -> Arc<WriteBatcher> {
+        if let Some(batcher) = self.batchers.get(&shard) {
+            return batcher.clone();
+        }
+        // The shard's first write. A shard that replaced split ones must hold
+        // it until they have handed off their writes: retire them first.
+        self.process_replacements();
+        self.get_or_create(shard, |_| {}).0
+    }
+
+    /// The batcher of `shard`, and whether it was just created: then by
+    /// `init`, before any write can reach it.
+    fn get_or_create(
+        &self,
+        shard: i64,
+        init: impl FnOnce(&Arc<WriteBatcher>),
+    ) -> (Arc<WriteBatcher>, bool) {
+        match self.batchers.entry(shard) {
+            Entry::Occupied(entry) => (entry.get().clone(), false),
+            Entry::Vacant(entry) => {
+                let batcher = Arc::new(WriteBatcher::new(
+                    shard,
+                    self.deps.clone(),
+                    self.this.clone(),
+                ));
+                init(&batcher);
+                entry.insert(batcher.clone());
+                (batcher, true)
+            }
+        }
+    }
+
+    /// Retires the shards removed from the assignments since the last call,
+    /// in the order they were removed: the batcher of each one hands off its
+    /// pending writes to the batchers of the shards that replaced it, which
+    /// hold their own writes until then. A removed shard without a batcher
+    /// gets one, which forwards the writes still routed to it.
+    fn process_replacements(&self) {
+        let mut processed = self.processed.lock().expect("write manager poisoned");
+        for replacement in self.deps.shard_manager.replacements(*processed) {
+            *processed += 1;
+            let successors: Vec<Arc<WriteBatcher>> = replacement
+                .successors
+                .iter()
+                .map(|range| {
+                    let (successor, created) =
+                        self.get_or_create(range.shard, |successor| successor.hold());
+                    if !created {
+                        successor.hold();
+                    }
+                    successor
+                })
+                .collect();
+            let mut retired = Some(Retired {
+                replacement: replacement.clone(),
+                successors,
+                released: false,
+            });
+            // A batcher created for the removed shard is retired before any
+            // write can reach it. Having none to hand off, it releases the
+            // successors at once.
+            let (removed, _) = self.get_or_create(replacement.removed, |removed| {
+                removed.retire(retired.take().expect("retired once"));
+            });
+            if let Some(retired) = retired {
+                removed.retire(retired);
+            }
+        }
+    }
+
+    /// Flushes every batcher, and waits (bounded) for each one: those of the
+    /// removed shards first, in the order they were removed, as they hand
+    /// off their writes to the batchers of the shards that replaced them,
+    /// which may be created meanwhile.
+    pub(crate) async fn close(&self) -> Result<(), OxiaError> {
+        let mut closed = HashSet::new();
+        loop {
+            let mut shards: Vec<i64> = self
+                .deps
+                .shard_manager
+                .replacements(0)
+                .iter()
+                .map(|replacement| replacement.removed)
+                .collect();
+            shards.extend(self.batchers.iter().map(|entry| *entry.key()));
+            shards.retain(|shard| !closed.contains(shard));
+            if shards.is_empty() {
+                return Ok(());
+            }
+            for shard in shards {
+                let batcher = self.batchers.get(&shard).map(|entry| entry.clone());
+                if closed.insert(shard) {
+                    if let Some(batcher) = batcher {
+                        batcher.close().await?;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -947,7 +1453,7 @@ impl ReadBatcher {
 /// Creates a `Pending` write op and its receiver in one step.
 pub(crate) fn pending_write<Req, Resp>(
     request: Req,
-    wrap: fn(Pending<Req, Resp>) -> WriteOp,
+    wrap: impl FnOnce(Pending<Req, Resp>) -> WriteOp,
 ) -> (WriteOp, oneshot::Receiver<Result<Resp, OxiaError>>) {
     let (pending, rx) = Pending::new(request);
     (wrap(pending), rx)
@@ -994,7 +1500,7 @@ mod tests {
                 end_exclusive: "abc".to_string(),
                 ..Default::default()
             },
-            WriteOp::DeleteRange,
+            |pending| WriteOp::DeleteRange(pending, None),
         );
         assert_eq!(dr.size(), 5);
     }
@@ -1046,7 +1552,7 @@ mod tests {
                 end_exclusive: "range-4".to_string(),
                 ..Default::default()
             },
-            WriteOp::DeleteRange,
+            |pending| WriteOp::DeleteRange(pending, None),
         );
         let (delete_4, _rx4) = delete_op("delete-4");
 
@@ -1094,7 +1600,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_write_is_rejected_before_batching() {
-        let batcher = Arc::new(WriteBatcher::new(0, test_deps(16)));
+        let batcher = Arc::new(WriteBatcher::new(0, test_deps(16), Weak::new()));
         let (op, rx) = put_op("key", &[0u8; 64]);
         batcher.add(op);
         let err = rx.await.expect("callback must fire").unwrap_err();
@@ -1107,7 +1613,7 @@ mod tests {
 
     #[tokio::test]
     async fn writes_after_close_fail_with_closed() {
-        let batcher = Arc::new(WriteBatcher::new(0, test_deps(1024)));
+        let batcher = Arc::new(WriteBatcher::new(0, test_deps(1024), Weak::new()));
         batcher.close().await.unwrap();
         let (op, rx) = put_op("key", b"value");
         batcher.add(op);
@@ -1122,7 +1628,7 @@ mod tests {
     #[tokio::test]
     async fn stale_hint_for_a_removed_shard_fails_with_shard_moved() {
         // The detached shard manager has no assignments: shard 0 is gone.
-        let batcher = Arc::new(WriteBatcher::new(0, test_deps(1024)));
+        let batcher = Arc::new(WriteBatcher::new(0, test_deps(1024), Weak::new()));
         batcher.state.lock().unwrap().hint = Some(LeaderHint {
             shard: 0,
             leader: "127.0.0.1:1".to_string(),
@@ -1142,7 +1648,7 @@ mod tests {
         // The assigned leader, `server-0:6648`, does not exist.
         deps.shard_manager
             .set_assignments_for_tests(&[(0, 0, u32::MAX)]);
-        let batcher = Arc::new(WriteBatcher::new(0, deps));
+        let batcher = Arc::new(WriteBatcher::new(0, deps, Weak::new()));
         batcher.state.lock().unwrap().hint = Some(LeaderHint {
             shard: 0,
             leader: mock.address.clone(),
@@ -1207,5 +1713,39 @@ mod tests {
             .expect("the read goes to the hinted leader");
         let statuses: Vec<i32> = responses.iter().map(|r| r.status).collect();
         assert_eq!(statuses, [proto::Status::Ok as i32]);
+    }
+
+    /// A delete range copied for the shards that replaced a split one
+    /// succeeds once every copy has, and fails with the first copy that
+    /// fails, an error or a status other than OK.
+    #[tokio::test]
+    async fn copied_delete_range_reports_every_copy() {
+        let status = |status: proto::Status| proto::DeleteRangeResponse {
+            status: status as i32,
+        };
+        let (pending, rx) = Pending::new(proto::DeleteRangeRequest::default());
+        let copies = copy_delete_range(pending, 3);
+        assert_eq!(copies.len(), 3);
+        for copy in copies {
+            let _ = copy.callback.send(Ok(status(proto::Status::Ok)));
+        }
+        let response = rx.await.expect("callback must fire").expect("delete range");
+        assert_eq!(response.status, proto::Status::Ok as i32);
+
+        // The third copy never completes.
+        for failure in [
+            Err(OxiaError::Timeout),
+            Ok(status(proto::Status::InvalidArgument)),
+        ] {
+            let (pending, rx) = Pending::new(proto::DeleteRangeRequest::default());
+            let [first, second, _third]: [PendingDeleteRange; 3] = copy_delete_range(pending, 3)
+                .try_into()
+                .unwrap_or_else(|_| panic!("three copies"));
+            let _ = first.callback.send(Ok(status(proto::Status::Ok)));
+            let expected = format!("{failure:?}");
+            let _ = second.callback.send(failure);
+            let result = rx.await.expect("callback must fire");
+            assert_eq!(format!("{result:?}"), expected);
+        }
     }
 }

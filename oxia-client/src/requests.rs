@@ -474,9 +474,12 @@ impl DeleteRangeBuilder {
                         .with_shard_retry(&partition_key, |shard| {
                             let client = client.clone();
                             let request = request.clone();
+                            let partition_key = partition_key.clone();
                             async move {
                                 client
-                                    .submit_write(shard, request, WriteOp::DeleteRange)
+                                    .submit_write(shard, request, |pending| {
+                                        WriteOp::DeleteRange(pending, Some(partition_key))
+                                    })
                                     .await
                             }
                         })
