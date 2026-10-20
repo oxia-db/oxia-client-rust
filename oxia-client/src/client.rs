@@ -4,6 +4,7 @@ use crate::batcher::{BatcherDeps, ReadBatcher, WriteBatcher, WriteOp, pending_wr
 use crate::client_builder::OxiaClientBuilder;
 use crate::client_options::OxiaClientOptions;
 use crate::errors::OxiaError;
+use crate::key::KeyOrder;
 use crate::metrics::Metrics;
 use crate::notification_manager::NotificationManager;
 use crate::operations::Pending;
@@ -215,8 +216,9 @@ impl OxiaClient {
     /// - [`OxiaError::InvalidArgument`] when
     ///   [`sequence_key_deltas`](PutBuilder::sequence_key_deltas) is used
     ///   without a partition key, with a zero delta, or together with an
-    ///   expected version, or when the server rejects the put as invalid
-    ///   (e.g. a secondary index name containing `/`);
+    ///   expected version, when a
+    ///   [`secondary_index`](PutBuilder::secondary_index) name contains `/`,
+    ///   or when the server rejects the put as invalid;
     /// - [`OxiaError::UnexpectedVersionId`] when a
     ///   [`expected_version_id`](PutBuilder::expected_version_id) /
     ///   [`expected_record_not_exists`](PutBuilder::expected_record_not_exists)
@@ -319,14 +321,19 @@ impl OxiaClient {
     }
 
     /// Deletes every record with `min_key_inclusive <= key < max_key_exclusive`
-    /// (in Oxia's slash-aware key order).
+    /// (in the key order of the namespace). On the servers with
+    /// `FEATURE_DELETE_RANGE_NOTIFICATION_RECORDS`, an empty
+    /// `max_key_exclusive` deletes all the records from `min_key_inclusive`
+    /// on, up to Oxia's internal keys, which it leaves.
     ///
     /// Without a [`partition_key`](DeleteRangeBuilder::partition_key) the
     /// deletion is applied on every shard; it is not atomic across shards.
     ///
     /// # Errors
     ///
-    /// Awaiting the builder returns [`OxiaError::Timeout`],
+    /// Awaiting the builder returns [`OxiaError::InvalidArgument`] when the
+    /// range covers both records and Oxia's internal keys (on the servers with
+    /// `FEATURE_DELETE_RANGE_NOTIFICATION_RECORDS`), [`OxiaError::Timeout`],
     /// [`OxiaError::Closed`], or transient routing/transport errors. Deleting
     /// an empty range is not an error.
     ///
@@ -351,7 +358,8 @@ impl OxiaClient {
     }
 
     /// Lists the keys with `min_key_inclusive <= key < max_key_exclusive`
-    /// (in Oxia's slash-aware key order).
+    /// (in the key order of the namespace), or `<= max_key_exclusive` with
+    /// [`end_inclusive`](ListBuilder::end_inclusive).
     ///
     /// `.await` the builder for all keys at once (bounded by the request
     /// timeout), or call [`stream()`](ListBuilder::stream) for an
@@ -363,8 +371,10 @@ impl OxiaClient {
     ///
     /// Awaiting the builder returns [`OxiaError::Timeout`] when collecting
     /// all keys exceeds the request timeout, [`OxiaError::Closed`] after
-    /// [`close`](OxiaClient::close), or transient routing/transport errors.
-    /// An empty range yields an empty `Vec`, not an error.
+    /// [`close`](OxiaClient::close), [`OxiaError::EndInclusiveUnsupported`]
+    /// when [`end_inclusive`](ListBuilder::end_inclusive) reaches a shard
+    /// that leaves the end out, or transient routing/transport errors. An
+    /// empty range yields an empty `Vec`, not an error.
     ///
     /// # Example
     ///
@@ -386,7 +396,8 @@ impl OxiaClient {
     }
 
     /// Reads every record with `min_key_inclusive <= key < max_key_exclusive`
-    /// (in Oxia's slash-aware key order).
+    /// (in the key order of the namespace), or `<= max_key_exclusive` with
+    /// [`end_inclusive`](RangeScanBuilder::end_inclusive).
     ///
     /// `.await` the builder for all records at once (bounded by the request
     /// timeout), or call [`stream()`](RangeScanBuilder::stream) for an
@@ -399,7 +410,9 @@ impl OxiaClient {
     ///
     /// Awaiting the builder returns [`OxiaError::Timeout`] when collecting
     /// all records exceeds the request timeout, [`OxiaError::Closed`] after
-    /// [`close`](OxiaClient::close), or transient routing/transport errors.
+    /// [`close`](OxiaClient::close), [`OxiaError::EndInclusiveUnsupported`]
+    /// when [`end_inclusive`](RangeScanBuilder::end_inclusive) reaches a
+    /// shard that leaves the end out, or transient routing/transport errors.
     /// An empty range yields an empty `Vec`, not an error.
     ///
     /// # Example
@@ -734,6 +747,7 @@ impl OxiaClient {
         self.with_reroute_retry(|| {
             let request = request.clone();
             async move {
+                let order = self.inner.shard_manager.key_order();
                 let mut join_set = JoinSet::new();
                 for shard in self.inner.shard_manager.get_shard_ids() {
                     let client = self.clone();
@@ -759,7 +773,9 @@ impl OxiaClient {
                         Ok(candidate) => {
                             best = Some(match best.take() {
                                 None => candidate,
-                                Some(current) => pick_get_winner(current, candidate, comparison),
+                                Some(current) => {
+                                    pick_get_winner(current, candidate, comparison, order)
+                                }
                             })
                         }
                         // Not every shard has a matching record.
@@ -791,6 +807,7 @@ impl OxiaClient {
         partition_key: Option<&str>,
     ) -> Result<ListStream, OxiaError> {
         self.ensure_open()?;
+        let end_inclusive = request.end_inclusive;
         let opens = self.target_shards(partition_key)?.into_iter().map(|shard| {
             let client = self.clone();
             let request = request.clone();
@@ -802,16 +819,20 @@ impl OxiaClient {
                         async move { provider.list(request).await }
                     })
                     .await?;
-                let head = first
-                    .map(|response: proto::ListResponse| {
-                        response.keys.into_iter().map(Ok).collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                check_end_inclusive(end_inclusive, first.as_ref().map(|r| r.end_inclusive))?;
+                let to_keys = move |response: proto::ListResponse| match check_end_inclusive(
+                    end_inclusive,
+                    Some(response.end_inclusive),
+                ) {
+                    Ok(()) => response.keys.into_iter().map(Ok).collect(),
+                    Err(err) => vec![Err(err)],
+                };
+                let head = first.map(to_keys).unwrap_or_default();
                 let stream: ShardStream<String> = Box::pin(
                     futures::stream::iter(head).chain(
                         streaming
-                            .map(|chunk| match chunk {
-                                Ok(response) => response.keys.into_iter().map(Ok).collect(),
+                            .map(move |chunk| match chunk {
+                                Ok(response) => to_keys(response),
                                 Err(status) => vec![Err(OxiaError::from(status))],
                             })
                             .flat_map(futures::stream::iter),
@@ -820,7 +841,10 @@ impl OxiaClient {
                 Ok::<_, OxiaError>(stream)
             }
         });
-        Ok(ListStream::new(merged(try_join_all(opens).await?)))
+        Ok(ListStream::new(merged(
+            try_join_all(opens).await?,
+            self.inner.shard_manager.key_order(),
+        )))
     }
 
     pub(crate) async fn open_range_scan_stream(
@@ -829,6 +853,7 @@ impl OxiaClient {
         partition_key: Option<&str>,
     ) -> Result<RangeScanStream, OxiaError> {
         self.ensure_open()?;
+        let end_inclusive = request.end_inclusive;
         let opens = self.target_shards(partition_key)?.into_iter().map(|shard| {
             let client = self.clone();
             let request = request.clone();
@@ -840,12 +865,17 @@ impl OxiaClient {
                         async move { provider.range_scan(request).await }
                     })
                     .await?;
-                let to_items = |response: proto::RangeScanResponse| {
-                    response
+                check_end_inclusive(end_inclusive, first.as_ref().map(|r| r.end_inclusive))?;
+                let to_items = move |response: proto::RangeScanResponse| match check_end_inclusive(
+                    end_inclusive,
+                    Some(response.end_inclusive),
+                ) {
+                    Ok(()) => response
                         .records
                         .into_iter()
                         .map(|record| GetResult::from_proto(record, None))
-                        .collect::<Vec<_>>()
+                        .collect(),
+                    Err(err) => vec![Err(err)],
                 };
                 let head = first.map(to_items).unwrap_or_default();
                 let stream: ShardStream<GetResult> = Box::pin(
@@ -861,7 +891,10 @@ impl OxiaClient {
                 Ok::<_, OxiaError>(stream)
             }
         });
-        Ok(RangeScanStream::new(merged(try_join_all(opens).await?)))
+        Ok(RangeScanStream::new(merged(
+            try_join_all(opens).await?,
+            self.inner.shard_manager.key_order(),
+        )))
     }
 
     /// Opens a per-shard server stream, retrying — with backoff and leader
@@ -1050,15 +1083,35 @@ fn track(first_err: &mut Option<OxiaError>, result: Result<(), OxiaError>, what:
     }
 }
 
-/// Reduces two per-shard get results to the winner for the comparison type.
-fn pick_get_winner(a: GetResult, b: GetResult, comparison: ComparisonType) -> GetResult {
+/// Checks that a shard included the end of the range of a list or a range
+/// scan that asked for it ([`end_inclusive`](crate::ListBuilder::end_inclusive)),
+/// given the flag of one of its responses, or `None` when it sent none.
+/// Older servers ignore the request's flag and leave the end out, while a
+/// leader that includes it says so in all its responses, and sends at least
+/// one.
+fn check_end_inclusive(requested: bool, included: Option<bool>) -> Result<(), OxiaError> {
+    if requested && included != Some(true) {
+        return Err(OxiaError::EndInclusiveUnsupported);
+    }
+    Ok(())
+}
+
+/// Reduces two per-shard get results to the winner for the comparison type,
+/// comparing them in the key order of the namespace: through an index, by
+/// their secondary keys first ([`GetResult::compare_keys`]).
+fn pick_get_winner(
+    a: GetResult,
+    b: GetResult,
+    comparison: ComparisonType,
+    order: KeyOrder,
+) -> GetResult {
     let a_wins = match comparison {
         // The smallest matching key wins.
         ComparisonType::Equal | ComparisonType::Ceiling | ComparisonType::Higher => {
-            a.compare_keys(&b).is_le()
+            a.compare_keys(&b, order).is_le()
         }
         // The largest matching key wins.
-        ComparisonType::Floor | ComparisonType::Lower => a.compare_keys(&b).is_ge(),
+        ComparisonType::Floor | ComparisonType::Lower => a.compare_keys(&b, order).is_ge(),
     };
     if a_wins { a } else { b }
 }

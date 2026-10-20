@@ -135,7 +135,7 @@ async fn connect_with_retry(address: &str) -> OxiaClient {
 
 /// Routing and cross-shard queries against shards on different servers: every
 /// key round-trips, inequality gets reduce across shards on distinct nodes,
-/// and list / streaming range-scan come back in global slash-aware order.
+/// and list / streaming range-scan come back in the global key order.
 #[tokio::test]
 async fn test_multi_node_routing_and_global_order() {
     let cluster = start_cluster(2, 4).await;

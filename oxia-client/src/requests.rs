@@ -69,7 +69,9 @@ impl PutBuilder {
 
     /// Turns the key into a server-generated sequential key: each delta is
     /// added to the current highest sequence and appended as a zero-padded
-    /// suffix.
+    /// suffix. When the highest key of the sequence has more suffixes than
+    /// there are deltas, the missing deltas are 0 on the servers with
+    /// `FEATURE_SEQUENCE_KEY_VALIDATION`.
     ///
     /// Requires [`partition_key`](PutBuilder::partition_key); every delta must
     /// be greater than zero; and it cannot be combined with
@@ -82,6 +84,9 @@ impl PutBuilder {
 
     /// Additionally indexes the record under `secondary_key` in the named
     /// secondary index. May be called multiple times.
+    ///
+    /// The index name must not contain `/` (the secondary key may). Awaiting a
+    /// put with such a name fails with [`OxiaError::InvalidArgument`].
     pub fn secondary_index(
         mut self,
         index_name: impl Into<String>,
@@ -104,6 +109,20 @@ impl PutBuilder {
     async fn execute(self) -> Result<PutResult, OxiaError> {
         let client = self.client;
         client.ensure_open()?;
+        // Reject secondary index names containing '/' up front (matching the
+        // Go client): the server stores index entries under
+        // `__oxia/idx/{index_name}/{secondary_key}`, where such a name is
+        // ambiguous, and servers that predate the check accept it silently.
+        if let Some(index) = self
+            .secondary_indexes
+            .iter()
+            .find(|index| index.index_name.contains('/'))
+        {
+            return Err(OxiaError::InvalidArgument(format!(
+                "secondary index name {:?} must not contain '/'",
+                index.index_name
+            )));
+        }
         // Validate sequence-key puts up front (matching the Java client's
         // `PutOperation`): sequential keys require a partition key, are
         // incompatible with an expected version, and every delta must be
@@ -254,6 +273,7 @@ impl GetBuilder {
     }
 
     /// Queries the named secondary index instead of the primary key space.
+    /// Index names must not contain `/`.
     pub fn use_index(mut self, index_name: impl Into<String>) -> Self {
         self.secondary_index_name = Some(index_name.into());
         self
@@ -497,6 +517,7 @@ pub struct ListBuilder {
     partition_key: Option<String>,
     secondary_index_name: Option<String>,
     include_internal_keys: bool,
+    end_inclusive: bool,
 }
 
 impl ListBuilder {
@@ -512,6 +533,7 @@ impl ListBuilder {
             partition_key: None,
             secondary_index_name: None,
             include_internal_keys: false,
+            end_inclusive: false,
         }
     }
 
@@ -522,7 +544,7 @@ impl ListBuilder {
     }
 
     /// Lists keys from the named secondary index instead of the primary key
-    /// space.
+    /// space. Index names must not contain `/`.
     pub fn use_index(mut self, index_name: impl Into<String>) -> Self {
         self.secondary_index_name = Some(index_name.into());
         self
@@ -534,6 +556,20 @@ impl ListBuilder {
         self
     }
 
+    /// Includes the end of the range: the key `max_key_exclusive`, or with
+    /// [`use_index`](ListBuilder::use_index), the records whose secondary key
+    /// is `max_key_exclusive`. An empty end is then the empty key rather than
+    /// no bound, and with an index, a range from a key to the same key lists
+    /// the records whose secondary key is that key.
+    ///
+    /// The leader of a shard includes the end once all the servers of the
+    /// shard support it. Until then, the list fails with
+    /// [`OxiaError::EndInclusiveUnsupported`] rather than leave the end out.
+    pub fn end_inclusive(mut self) -> Self {
+        self.end_inclusive = true;
+        self
+    }
+
     fn into_request(self) -> (OxiaClient, Option<String>, proto::ListRequest) {
         let request = proto::ListRequest {
             shard: None,
@@ -541,6 +577,7 @@ impl ListBuilder {
             end_exclusive: self.max_key_exclusive,
             secondary_index_name: self.secondary_index_name,
             include_internal_keys: self.include_internal_keys,
+            end_inclusive: self.end_inclusive,
         };
         (self.client, self.partition_key, request)
     }
@@ -585,6 +622,7 @@ pub struct RangeScanBuilder {
     partition_key: Option<String>,
     secondary_index_name: Option<String>,
     include_internal_keys: bool,
+    end_inclusive: bool,
 }
 
 impl RangeScanBuilder {
@@ -600,6 +638,7 @@ impl RangeScanBuilder {
             partition_key: None,
             secondary_index_name: None,
             include_internal_keys: false,
+            end_inclusive: false,
         }
     }
 
@@ -610,6 +649,13 @@ impl RangeScanBuilder {
     }
 
     /// Scans the named secondary index instead of the primary key space.
+    /// Index names must not contain `/`.
+    ///
+    /// The records come in the order of their secondary keys. Without a
+    /// partition key, the client merges the records of the shards by the
+    /// secondary keys that the servers send with them (oxia-db/oxia#1508).
+    /// Older servers send none, and the merged records may then be out of
+    /// order.
     pub fn use_index(mut self, index_name: impl Into<String>) -> Self {
         self.secondary_index_name = Some(index_name.into());
         self
@@ -621,6 +667,21 @@ impl RangeScanBuilder {
         self
     }
 
+    /// Includes the end of the range: the record whose key is
+    /// `max_key_exclusive`, or with [`use_index`](RangeScanBuilder::use_index),
+    /// the records whose secondary key is `max_key_exclusive`. An empty end is
+    /// then the empty key rather than no bound, and with an index, a range
+    /// from a key to the same key scans the records whose secondary key is
+    /// that key.
+    ///
+    /// The leader of a shard includes the end once all the servers of the
+    /// shard support it. Until then, the scan fails with
+    /// [`OxiaError::EndInclusiveUnsupported`] rather than leave the end out.
+    pub fn end_inclusive(mut self) -> Self {
+        self.end_inclusive = true;
+        self
+    }
+
     fn into_request(self) -> (OxiaClient, Option<String>, proto::RangeScanRequest) {
         let request = proto::RangeScanRequest {
             shard: None,
@@ -628,6 +689,7 @@ impl RangeScanBuilder {
             end_exclusive: self.max_key_exclusive,
             secondary_index_name: self.secondary_index_name,
             include_internal_keys: self.include_internal_keys,
+            end_inclusive: self.end_inclusive,
         };
         (self.client, self.partition_key, request)
     }

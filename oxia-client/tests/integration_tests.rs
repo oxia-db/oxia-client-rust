@@ -10,13 +10,18 @@ const DEFAULT_OXIA_IMAGE: &str = "oxia/oxia";
 const DEFAULT_OXIA_TAG: &str = "main";
 
 async fn start_oxia() -> (ContainerAsync<GenericImage>, String) {
+    start_oxia_with(&[]).await
+}
+
+/// Starts `oxia standalone` with extra flags (e.g. `--shards 4`).
+async fn start_oxia_with(flags: &[&str]) -> (ContainerAsync<GenericImage>, String) {
     let image = std::env::var("OXIA_IMAGE").unwrap_or_else(|_| DEFAULT_OXIA_IMAGE.to_string());
     let tag = std::env::var("OXIA_TAG").unwrap_or_else(|_| DEFAULT_OXIA_TAG.to_string());
 
     let container = GenericImage::new(image, tag)
         .with_exposed_port(ContainerPort::Tcp(OXIA_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Started Grpc server"))
-        .with_cmd(vec!["oxia", "standalone"])
+        .with_cmd(["oxia", "standalone"].iter().chain(flags).copied())
         .start()
         .await
         .expect("Failed to start Oxia container");
@@ -424,6 +429,54 @@ async fn test_get_higher() {
     client.close().await.unwrap();
 }
 
+/// A floor get, a list and a range scan without a partition key go to every
+/// shard, and the client merges the answers of the shards in the key sorting
+/// of the namespace, which the server reports with the shard assignments. The
+/// keys are the example of oxia-db/oxia#1388: with 4 shards, the legacy
+/// slash-aware merge disagrees with the server's order in both sortings.
+///
+/// Run it against `oxia/oxia:nightly-beta`, built daily from oxia main:
+/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
+#[tokio::test]
+#[ignore = "needs a server that reports the key sorting (oxia-db/oxia#1388), which oxia/oxia:main predates"]
+async fn test_multi_shard_reads_merge_in_the_key_sorting() {
+    for (key_sorting, floor_of, floor, ordered) in [
+        (
+            "hierarchical",
+            "a/z",
+            "a/x",
+            ["a0", "b", "ab/y", "a/x", "a/y/z"],
+        ),
+        ("natural", "a1", "a0", ["a/x", "a/y/z", "a0", "ab/y", "b"]),
+    ] {
+        let (_container, address) =
+            start_oxia_with(&["--shards", "4", "--key-sorting", key_sorting]).await;
+        let client = new_client(&address).await;
+        for key in ["b", "a/y/z", "ab/y", "a0", "a/x"] {
+            client.put(key, key).await.unwrap();
+        }
+
+        let found = client
+            .get(floor_of)
+            .comparison(ComparisonType::Floor)
+            .await
+            .unwrap();
+        assert_eq!(found.key, floor, "{key_sorting}: floor of {floor_of:?}");
+        let listed = client.list("", "").await.unwrap();
+        assert_eq!(listed, ordered, "{key_sorting}: list");
+        let scanned: Vec<_> = client
+            .range_scan("", "")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.key)
+            .collect();
+        assert_eq!(scanned, ordered, "{key_sorting}: range scan");
+
+        client.close().await.unwrap();
+    }
+}
+
 // ============================================================
 // Ephemeral Key Tests
 // ============================================================
@@ -801,6 +854,163 @@ async fn test_secondary_index() {
         .delete_range("idx/".to_string(), "idx/~".to_string())
         .await
         .unwrap();
+    client.close().await.unwrap();
+}
+
+/// A range scan through an index without a partition key goes to every shard,
+/// and each shard returns its records in the order of their secondary keys:
+/// the client merges them in that order too, by the secondary keys that the
+/// server sends with them (oxia-db/oxia#1508). The records are those of the Go
+/// reference (`TestSyncClientImpl_RangeScanUseIndexKeySorting`): with 4 shards,
+/// they land on all of them, and their secondary keys sort in the opposite
+/// order of their keys.
+///
+/// Run it against a server with oxia-db/oxia#1508, such as
+/// `oxia/oxia:nightly-beta`:
+/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
+#[tokio::test]
+#[ignore = "needs a server that sends the secondary keys of a range scan (oxia-db/oxia#1508), which oxia/oxia:main predates"]
+async fn test_index_range_scan_merges_by_the_secondary_keys() {
+    let records = [
+        ("p1", "h"),
+        ("p2", "g"),
+        ("p3", "f"),
+        ("p4", "e"),
+        ("p5", "d"),
+        ("p6", "c"),
+        ("p7", "b"),
+        ("p8", "a"),
+    ];
+    for key_sorting in ["natural", "hierarchical"] {
+        let (_container, address) =
+            start_oxia_with(&["--shards", "4", "--key-sorting", key_sorting]).await;
+        let client = new_client(&address).await;
+        for (key, secondary_key) in records {
+            client
+                .put(key, key)
+                .secondary_index("idx", secondary_key)
+                .await
+                .unwrap();
+        }
+
+        let scanned: Vec<_> = client
+            .range_scan("a", "z")
+            .use_index("idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.key, record.secondary_index_key))
+            .collect();
+        let expected: Vec<_> = records
+            .iter()
+            .rev()
+            .map(|(key, secondary_key)| (key.to_string(), Some(secondary_key.to_string())))
+            .collect();
+        assert_eq!(scanned, expected, "{key_sorting}");
+
+        client.close().await.unwrap();
+    }
+}
+
+// ============================================================
+// Inclusive Range End Tests
+// ============================================================
+
+/// A list or a range scan with `end_inclusive` includes the end of its range,
+/// or fails with `EndInclusiveUnsupported` on a server that leaves the end out
+/// (such as `oxia/oxia:main`, which predates oxia-db/oxia#1608): it never
+/// returns the half-open range silently.
+#[tokio::test]
+async fn test_end_inclusive_includes_the_end_or_fails() {
+    let (_container, address) = start_oxia().await;
+    let client = new_client(&address).await;
+    for key in ["incl/a", "incl/b", "incl/c"] {
+        client.put(key, key).await.unwrap();
+    }
+
+    let listed = client.list("incl/a", "incl/b").end_inclusive().await;
+    let scanned = client
+        .range_scan("incl/a", "incl/b")
+        .end_inclusive()
+        .await
+        .map(|records| records.into_iter().map(|r| r.key).collect::<Vec<_>>());
+    match (listed, scanned) {
+        (Ok(listed), Ok(scanned)) => {
+            assert_eq!(listed, ["incl/a", "incl/b"]);
+            assert_eq!(scanned, ["incl/a", "incl/b"]);
+        }
+        (Err(OxiaError::EndInclusiveUnsupported), Err(OxiaError::EndInclusiveUnsupported)) => {}
+        other => panic!("expected the end, or EndInclusiveUnsupported from both: {other:?}"),
+    }
+
+    client.close().await.unwrap();
+}
+
+/// With `end_inclusive`, a list or a range scan ends at its end key, and
+/// through an index, a range from a key to the same key returns the records
+/// whose secondary key is that key. The records are the example of
+/// oxia-db/oxia#1608, where `["k-1", "k-1~")` also matches `k-12`, `k-1:a`
+/// and `k-1_b`.
+///
+/// Run it against a server with oxia-db/oxia#1608, such as an
+/// `oxia/oxia:nightly-beta` built after it:
+/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
+#[tokio::test]
+#[ignore = "needs FEATURE_RANGE_END_INCLUSIVE (oxia-db/oxia#1608), which oxia/oxia:main predates"]
+async fn test_list_and_range_scan_end_inclusive() {
+    let (_container, address) = start_oxia_with(&["--shards", "4"]).await;
+    let client = new_client(&address).await;
+    for (key, secondary_key) in [
+        ("/ledgers/1", "k-1"),
+        ("/ledgers/2", "k-1"),
+        ("/ledgers/3", "k-12"),
+        ("/ledgers/4", "k-1:a"),
+        ("/ledgers/5", "k-1_b"),
+        ("/ledgers/6", "k-0"),
+    ] {
+        client
+            .put(key, key)
+            .secondary_index("ledgers", secondary_key)
+            .await
+            .unwrap();
+    }
+
+    let mut listed = client
+        .list("k-1", "k-1")
+        .use_index("ledgers")
+        .end_inclusive()
+        .await
+        .unwrap();
+    listed.sort();
+    assert_eq!(listed, ["/ledgers/1", "/ledgers/2"]);
+    let mut scanned: Vec<_> = client
+        .range_scan("k-1", "k-1")
+        .use_index("ledgers")
+        .end_inclusive()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.key)
+        .collect();
+    scanned.sort();
+    assert_eq!(scanned, ["/ledgers/1", "/ledgers/2"]);
+
+    let listed = client
+        .list("/ledgers/2", "/ledgers/4")
+        .end_inclusive()
+        .await
+        .unwrap();
+    assert_eq!(listed, ["/ledgers/2", "/ledgers/3", "/ledgers/4"]);
+    let scanned: Vec<_> = client
+        .range_scan("/ledgers/2", "/ledgers/4")
+        .end_inclusive()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.key)
+        .collect();
+    assert_eq!(scanned, ["/ledgers/2", "/ledgers/3", "/ledgers/4"]);
+
     client.close().await.unwrap();
 }
 
