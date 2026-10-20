@@ -1397,13 +1397,13 @@ mod tests {
         }
     }
 
-    /// The child of a split of the whole hash space into shards `left` and
-    /// `right` that owns `key`.
-    fn child_owning(key: &str, (left, right): (i64, i64)) -> i64 {
+    /// Of the shards `lower` and `upper`, which own a half of the hash space
+    /// each, the one that owns `key`.
+    fn half_owning(key: &str, (lower, upper): (i64, i64)) -> i64 {
         if crate::hash::xxh3_32(key) <= u32::MAX / 2 {
-            left
+            lower
         } else {
-            right
+            upper
         }
     }
 
@@ -1438,7 +1438,7 @@ mod tests {
             mock.publish_assignments();
             let found = get.await.expect("join").expect(&case);
             let expected = match comparison {
-                Equal if child_owning("key", children) == 1 => "a",
+                Equal if half_owning("key", children) == 1 => "a",
                 Equal => "b",
                 // The largest of the children's answers.
                 _ => "b",
@@ -1447,85 +1447,62 @@ mod tests {
         }
     }
 
-    /// A list or a range scan without a partition key that opens a stream on
-    /// a shard split away: once the client has the new assignments, it opens
-    /// streams on the shard's children instead, and merges them with the
-    /// other shard's in the key order, with every key once.
+    /// A list or a range scan that opens a stream on a shard split away
+    /// fails with `ShardMoved` once the client has the new assignments,
+    /// rather than retry the shard until the request timeout, as the Go
+    /// client fails with `ErrShardNotFound`; with a partition key on the
+    /// shard too.
     #[tokio::test]
-    async fn lists_and_range_scans_reroute_a_split_shard_to_its_children() {
+    async fn lists_and_range_scans_of_a_split_shard_fail_with_shard_moved() {
         for leader_hint in [false, true] {
-            for scan in [false, true] {
-                let case = format!("leader hint: {leader_hint}, range scan: {scan}");
-                // The keys of shard 0 are on its children, shards 2 and 3,
-                // once it is split.
-                let mock = MockOxia::start(Behavior {
-                    shards: 2,
-                    shard_keys: HashMap::from([
-                        (0, vec!["a", "c", "e"]),
-                        (1, vec!["b", "f"]),
-                        (2, vec!["a", "e"]),
-                        (3, vec!["c"]),
-                    ]),
-                    ..Behavior::default()
-                })
-                .await;
-                let client = connect(&mock, Duration::from_secs(5)).await;
-                assert_eq!(mock.split_shard(0, leader_hint), (2, 3));
+            for partition_key in [None, Some("pk")] {
+                for scan in [false, true] {
+                    let case = format!(
+                        "leader hint: {leader_hint}, partition key: {partition_key:?}, \
+                         range scan: {scan}"
+                    );
+                    let mock = MockOxia::start(Behavior {
+                        shards: 2,
+                        ..Behavior::default()
+                    })
+                    .await;
+                    let client = connect(&mock, Duration::from_secs(10)).await;
+                    let shard = partition_key.map_or(0, |key| half_owning(key, (0, 1)));
+                    mock.split_shard(shard, leader_hint);
 
-                let keys = tokio::spawn({
-                    let client = client.clone();
-                    async move {
-                        if scan {
-                            let records = client.range_scan("", "").await?;
-                            Ok(records.into_iter().map(|record| record.key).collect())
-                        } else {
-                            client.list("", "").await
+                    let result = tokio::spawn({
+                        let client = client.clone();
+                        async move {
+                            if scan {
+                                let mut builder = client.range_scan("", "");
+                                if let Some(key) = partition_key {
+                                    builder = builder.partition_key(key);
+                                }
+                                builder.await.map(|records| records.len())
+                            } else {
+                                let mut builder = client.list("", "");
+                                if let Some(key) = partition_key {
+                                    builder = builder.partition_key(key);
+                                }
+                                builder.await.map(|keys| keys.len())
+                            }
                         }
-                    }
-                });
-                until_split_shard_requests(&mock, 1).await;
-                mock.publish_assignments();
-                let keys: Vec<String> = keys.await.expect("join").expect(&case);
-                assert_eq!(keys, ["a", "b", "c", "e", "f"], "{case}");
-            }
-        }
-    }
-
-    /// A list or a range scan with a partition key whose shard is split away
-    /// before its stream opens goes to the child that owns the partition key.
-    #[tokio::test]
-    async fn partition_key_lists_reroute_to_the_child_owning_the_key() {
-        for scan in [false, true] {
-            let case = format!("range scan: {scan}");
-            let mock = MockOxia::start(Behavior {
-                // The children of shard 0.
-                shard_keys: HashMap::from([(1, vec!["a", "c"]), (2, vec!["b"])]),
-                ..Behavior::default()
-            })
-            .await;
-            let client = connect(&mock, Duration::from_secs(5)).await;
-            let children = mock.split_shard(0, true);
-            assert_eq!(children, (1, 2));
-
-            let keys = tokio::spawn({
-                let client = client.clone();
-                async move {
-                    if scan {
-                        let records = client.range_scan("", "").partition_key("pk").await?;
-                        Ok(records.into_iter().map(|record| record.key).collect())
-                    } else {
-                        client.list("", "").partition_key("pk").await
-                    }
+                    });
+                    until_split_shard_requests(&mock, 1).await;
+                    let published = Instant::now();
+                    mock.publish_assignments();
+                    let result = result.await.expect("join");
+                    assert!(
+                        matches!(result, Err(OxiaError::ShardMoved)),
+                        "{case}: {result:?}"
+                    );
+                    assert!(
+                        published.elapsed() < Duration::from_secs(3),
+                        "{case}: failed after {:?}",
+                        published.elapsed()
+                    );
                 }
-            });
-            until_split_shard_requests(&mock, 1).await;
-            mock.publish_assignments();
-            let keys: Vec<String> = keys.await.expect("join").expect(&case);
-            let expected: &[&str] = match child_owning("pk", children) {
-                1 => &["a", "c"],
-                _ => &["b"],
-            };
-            assert_eq!(keys, expected, "{case}");
+            }
         }
     }
 }

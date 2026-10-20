@@ -457,12 +457,58 @@ async fn test_delete_range_across_live_split() {
     client.close().await.unwrap();
 }
 
+/// Runs `scan`, a list or a range scan, until `stop` is set, and returns how
+/// many times it ran. Each time, it returns `expected`, or fails with
+/// `ShardMoved` if it opened a stream on the parent once the parent no
+/// longer served: never with another error.
+async fn scan_until_stopped<F, Fut>(
+    stop: &AtomicBool,
+    kind: &str,
+    expected: &[String],
+    mut scan: F,
+) -> usize
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<String>, OxiaError>>,
+{
+    let mut scans = 0;
+    while !stop.load(Ordering::SeqCst) {
+        match scan().await {
+            Ok(keys) => assert_eq!(keys, expected, "{kind}"),
+            Err(OxiaError::ShardMoved) => {}
+            Err(e) => panic!("{kind} during the split: {e:?}"),
+        }
+        scans += 1;
+    }
+    scans
+}
+
+/// Runs `scan` again while it fails with `ShardMoved`, as a caller does to
+/// read the new shards.
+async fn retry_while_moved<F, Fut>(mut scan: F) -> Result<Vec<String>, OxiaError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<String>, OxiaError>>,
+{
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match scan().await {
+            Err(OxiaError::ShardMoved) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Reads across a live split of one of two shards, each kind in a loop of
 /// its own: lists and range scans without a partition key, lists with a
-/// partition key on the splitting shard, and gets. None fails: a read that
-/// reaches the parent once it no longer serves goes to the children once the
-/// client has their assignments, and a list or a range scan still returns
-/// every key once, in order.
+/// partition key on the splitting shard, and gets. A get never fails: one
+/// that reaches the parent once it no longer serves goes to the child that
+/// owns the key once the client has the children's assignments. A list or
+/// a range scan that opened a stream on the parent then fails with
+/// `ShardMoved` instead, as in the Go client, rather than with another error
+/// after the request timeout; run again, it reads the children.
 #[tokio::test]
 async fn test_reads_across_live_split() {
     let cluster = start_cluster(2, 2).await;
@@ -484,55 +530,51 @@ async fn test_reads_across_live_split() {
             .unwrap();
     }
 
+    let list = {
+        let client = client.clone();
+        move || client.list("reads/", "reads/~").into_future()
+    };
+    let range_scan = {
+        let client = client.clone();
+        move || {
+            let scan = client.range_scan("reads/", "reads/~");
+            async move {
+                let records = scan.await?;
+                Ok::<_, OxiaError>(records.into_iter().map(|record| record.key).collect())
+            }
+        }
+    };
+    let partition_list = {
+        let client = client.clone();
+        move || {
+            client
+                .list("partitioned/", "partitioned/~")
+                .partition_key(partition_key.clone())
+                .into_future()
+        }
+    };
+
     let stop = Arc::new(AtomicBool::new(false));
     // Each reader runs until stopped, and returns how many reads it made.
     let lists = tokio::spawn({
-        let (client, keys, stop) = (client.clone(), keys.clone(), stop.clone());
-        async move {
-            let mut reads = 0;
-            while !stop.load(Ordering::SeqCst) {
-                let listed = client
-                    .list("reads/", "reads/~")
-                    .await
-                    .expect("list during the split");
-                assert_eq!(listed, *keys);
-                reads += 1;
-            }
-            reads
-        }
+        let (stop, keys, list) = (stop.clone(), keys.clone(), list.clone());
+        async move { scan_until_stopped(&stop, "list", &keys, list).await }
     });
     let range_scans = tokio::spawn({
-        let (client, keys, stop) = (client.clone(), keys.clone(), stop.clone());
-        async move {
-            let mut reads = 0;
-            while !stop.load(Ordering::SeqCst) {
-                let scanned: Vec<String> = client
-                    .range_scan("reads/", "reads/~")
-                    .await
-                    .expect("range scan during the split")
-                    .into_iter()
-                    .map(|record| record.key)
-                    .collect();
-                assert_eq!(scanned, *keys);
-                reads += 1;
-            }
-            reads
-        }
+        let (stop, keys, range_scan) = (stop.clone(), keys.clone(), range_scan.clone());
+        async move { scan_until_stopped(&stop, "range scan", &keys, range_scan).await }
     });
     let partition_lists = tokio::spawn({
-        let (client, partitioned, stop) = (client.clone(), partitioned.clone(), stop.clone());
+        let (stop, partitioned, partition_list) =
+            (stop.clone(), partitioned.clone(), partition_list.clone());
         async move {
-            let mut reads = 0;
-            while !stop.load(Ordering::SeqCst) {
-                let listed = client
-                    .list("partitioned/", "partitioned/~")
-                    .partition_key(partition_key.clone())
-                    .await
-                    .expect("list with a partition key during the split");
-                assert_eq!(listed, *partitioned);
-                reads += 1;
-            }
-            reads
+            scan_until_stopped(
+                &stop,
+                "list with a partition key",
+                &partitioned,
+                partition_list,
+            )
+            .await
         }
     });
     let gets = tokio::spawn({
@@ -568,6 +610,15 @@ async fn test_reads_across_live_split() {
         let reads = reader.await.expect(kind);
         assert!(reads > 0, "no {kind} ran");
     }
+
+    // Once the split has completed, the lists and range scans read the
+    // children.
+    assert_eq!(retry_while_moved(list).await.unwrap(), *keys);
+    assert_eq!(retry_while_moved(range_scan).await.unwrap(), *keys);
+    assert_eq!(
+        retry_while_moved(partition_list).await.unwrap(),
+        *partitioned
+    );
 
     client.close().await.unwrap();
 }
