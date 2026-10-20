@@ -116,10 +116,48 @@ struct State {
     /// Keeps assignment streams open for the lifetime of the mock, with the
     /// namespace that each one asked for.
     assignment_senders: Mutex<Vec<(String, AssignmentSender)>>,
+    /// The notification batches of each shard, by shard id.
+    notifications: Mutex<HashMap<i64, ShardNotifications>>,
+    /// Signalled when the notifications change, for the notification streams
+    /// to send what they can.
+    notifications_changed: tokio::sync::watch::Sender<()>,
+    /// Every received `NotificationsRequest`, in order.
+    notification_requests: Mutex<Vec<proto::NotificationsRequest>>,
 }
 
 /// The sending end of a client's assignment stream.
 type AssignmentSender = mpsc::UnboundedSender<Result<proto::ShardAssignments, Status>>;
+
+/// The notification batches of a shard, as its leader keeps them.
+#[derive(Default)]
+struct ShardNotifications {
+    /// The batches, in offset order: those of the shard it was split from, on
+    /// its side of the split, then those published on it.
+    batches: Vec<proto::NotificationBatch>,
+    /// Whether the streams of the shard hold back its batches, as for a
+    /// subscriber that lags behind.
+    held: bool,
+    /// Bumped to end the streams open on the shard.
+    generation: u32,
+}
+
+impl ShardNotifications {
+    /// The offset of the last batch, or -1: where a subscription without a
+    /// start offset starts.
+    fn last_offset(&self) -> i64 {
+        self.batches.last().map_or(-1, |batch| batch.offset)
+    }
+}
+
+/// What a notification stream does next.
+enum NextBatch {
+    /// Send the batch.
+    Send(proto::NotificationBatch),
+    /// Wait for the notifications to change.
+    Wait,
+    /// End with an error: the streams of the shard were closed.
+    Close,
+}
 
 impl State {
     /// The current assignments of `namespace`, every shard led by `leader`.
@@ -155,6 +193,29 @@ impl State {
             allowed_authorities: vec![],
         }
     }
+
+    /// What a notification stream on `shard`, opened at `generation`, does
+    /// after it sent the batch at offset `cursor`.
+    fn next_notification_batch(&self, shard: i64, generation: u32, cursor: i64) -> NextBatch {
+        let notifications = self.notifications.lock().expect("notifications lock");
+        let Some(shard_notifications) = notifications.get(&shard) else {
+            return NextBatch::Wait;
+        };
+        if shard_notifications.generation != generation {
+            return NextBatch::Close;
+        }
+        if shard_notifications.held {
+            return NextBatch::Wait;
+        }
+        match shard_notifications
+            .batches
+            .iter()
+            .find(|batch| batch.offset > cursor)
+        {
+            Some(batch) => NextBatch::Send(batch.clone()),
+            None => NextBatch::Wait,
+        }
+    }
 }
 
 /// A running mock server. Dropping it stops the server.
@@ -187,6 +248,9 @@ impl MockOxia {
             write_batch_sizes: Mutex::new(Vec::new()),
             write_connections: AtomicU32::new(0),
             assignment_senders: Mutex::new(Vec::new()),
+            notifications: Mutex::new(HashMap::new()),
+            notifications_changed: tokio::sync::watch::Sender::new(()),
+            notification_requests: Mutex::new(Vec::new()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -224,10 +288,16 @@ impl MockOxia {
     /// Splits `shard` into two new shards, with a half of its hash range
     /// each, and returns their ids. Only the server sees the split until
     /// [`publish_assignments`](Self::publish_assignments): from now on, a
-    /// read, a list or a range scan of `shard` fails as on the node of a
-    /// parent that the split deleted, with `NODE_IS_NOT_LEADER`, and with a
-    /// leader hint at this server when `leader_hint` is set, as when the
-    /// node's assignments still list the parent.
+    /// read, a list, a range scan or a notification subscription of `shard`
+    /// fails as on the node of a parent that the split deleted, with
+    /// `NODE_IS_NOT_LEADER`, and with a leader hint at this server when
+    /// `leader_hint` is set, as when the node's assignments still list the
+    /// parent. The notification streams open on `shard` stay open, as until
+    /// the node deletes the parent
+    /// ([`close_notification_streams`](Self::close_notification_streams)).
+    /// Each child holds the notification batches of `shard`, at their
+    /// offsets, with the notifications on its side of the split, as a server
+    /// does.
     pub(crate) fn split_shard(&self, shard: i64, leader_hint: bool) -> (i64, i64) {
         let mut shards = self.state.shards.lock().expect("shards lock");
         let next = shards.iter().map(|&(id, _, _)| id).max().expect("shards") + 1;
@@ -237,13 +307,38 @@ impl MockOxia {
             .expect("the shard to split exists");
         let (_, min, max) = shards.remove(index);
         let middle = min + (max - min) / 2;
-        shards.push((next, min, middle));
-        shards.push((next + 1, middle + 1, max));
+        let children = [(next, min, middle), (next + 1, middle + 1, max)];
+        shards.extend(children);
         self.state
             .split_shards
             .lock()
             .expect("split shards lock")
             .insert(shard, leader_hint);
+
+        let mut notifications = self.state.notifications.lock().expect("notifications lock");
+        let inherited = notifications.entry(shard).or_default().batches.clone();
+        for (child, min, max) in children {
+            let batches = inherited
+                .iter()
+                .map(|batch| proto::NotificationBatch {
+                    shard: child,
+                    notifications: batch
+                        .notifications
+                        .iter()
+                        .filter(|entry| (min..=max).contains(&crate::hash::xxh3_32(entry.key())))
+                        .cloned()
+                        .collect(),
+                    ..batch.clone()
+                })
+                .collect();
+            notifications.insert(
+                child,
+                ShardNotifications {
+                    batches,
+                    ..ShardNotifications::default()
+                },
+            );
+        }
         (next, next + 1)
     }
 
@@ -255,8 +350,8 @@ impl MockOxia {
         }
     }
 
-    /// The reads, lists and range scans that failed because their shard was
-    /// split away.
+    /// The reads, lists, range scans and notification subscriptions that
+    /// failed because their shard was split away.
     pub(crate) fn split_shard_requests(&self) -> u32 {
         self.state.split_shard_requests.load(Ordering::SeqCst)
     }
@@ -281,6 +376,58 @@ impl MockOxia {
 
     pub(crate) fn write_connections(&self) -> u32 {
         self.state.write_connections.load(Ordering::SeqCst)
+    }
+
+    /// Publishes a notification batch on `shard`, at the offset after its
+    /// last one, with the creation of each of `keys`, and returns its offset.
+    pub(crate) fn notify(&self, shard: i64, keys: &[&str]) -> i64 {
+        let mut notifications = self.state.notifications.lock().expect("notifications lock");
+        let shard_notifications = notifications.entry(shard).or_default();
+        let offset = shard_notifications.last_offset() + 1;
+        shard_notifications.batches.push(proto::NotificationBatch {
+            shard,
+            offset,
+            timestamp: 1,
+            notifications: keys
+                .iter()
+                .map(|&key| proto::NotificationEntry {
+                    key: Some(key.to_string()),
+                    value: Some(proto::Notification {
+                        r#type: proto::NotificationType::KeyCreated as i32,
+                        version_id: Some(offset),
+                        key_range_last: None,
+                    }),
+                })
+                .collect(),
+        });
+        drop(notifications);
+        self.state.notifications_changed.send_replace(());
+        offset
+    }
+
+    /// From now on, the notification streams of `shard` hold back its
+    /// batches, as for a subscriber that lags behind.
+    pub(crate) fn hold_notifications(&self, shard: i64) {
+        let mut notifications = self.state.notifications.lock().expect("notifications lock");
+        notifications.entry(shard).or_default().held = true;
+    }
+
+    /// Ends the notification streams open on `shard` with `UNAVAILABLE`, as
+    /// the node of a shard does once it deletes it.
+    pub(crate) fn close_notification_streams(&self, shard: i64) {
+        let mut notifications = self.state.notifications.lock().expect("notifications lock");
+        notifications.entry(shard).or_default().generation += 1;
+        drop(notifications);
+        self.state.notifications_changed.send_replace(());
+    }
+
+    /// The notification subscriptions the server has received, in order.
+    pub(crate) fn notification_requests(&self) -> Vec<proto::NotificationsRequest> {
+        self.state
+            .notification_requests
+            .lock()
+            .expect("requests lock")
+            .clone()
     }
 }
 
@@ -399,9 +546,10 @@ impl Service {
         (keys.into_iter().map(|key| vec![key]).collect(), included)
     }
 
-    /// Fails a read, a list or a range scan of a shard split away, as the
-    /// node of the deleted parent does: with `NODE_IS_NOT_LEADER`, and with a
-    /// leader hint at this server if [`MockOxia::split_shard`] asked for one.
+    /// Fails a read, a list, a range scan or a notification subscription of a
+    /// shard split away, as the node of the deleted parent does: with
+    /// `NODE_IS_NOT_LEADER`, and with a leader hint at this server if
+    /// [`MockOxia::split_shard`] asked for one.
     fn reject_split_shard(&self, shard: Option<i64>) -> Result<(), Status> {
         let Some(shard) = shard else {
             return Ok(());
@@ -629,9 +777,59 @@ impl OxiaService for Service {
 
     async fn get_notifications(
         &self,
-        _: Request<proto::NotificationsRequest>,
+        request: Request<proto::NotificationsRequest>,
     ) -> Rpc<Self::GetNotificationsStream> {
-        Err(Status::unimplemented("not scripted"))
+        let request = request.into_inner();
+        let (shard, start_offset_exclusive) = (request.shard, request.start_offset_exclusive);
+        self.state
+            .notification_requests
+            .lock()
+            .expect("requests lock")
+            .push(request);
+        self.reject_split_shard(Some(shard))?;
+        // Taken before the batches are read: a batch published from then on
+        // wakes the stream.
+        let changed = self.state.notifications_changed.subscribe();
+        let (start, generation) = {
+            let mut notifications = self.state.notifications.lock().expect("notifications lock");
+            let shard_notifications = notifications.entry(shard).or_default();
+            (
+                start_offset_exclusive.unwrap_or_else(|| shard_notifications.last_offset()),
+                shard_notifications.generation,
+            )
+        };
+        // As a server, confirm the subscription with an empty batch at its
+        // start offset, then send the batches after it as they come.
+        let confirmation = proto::NotificationBatch {
+            shard,
+            offset: start,
+            timestamp: 0,
+            notifications: Vec::new(),
+        };
+        let state = self.state.clone();
+        let batches = futures::stream::unfold(Some((start, changed)), move |cursor| {
+            let state = state.clone();
+            async move {
+                let (cursor, mut changed) = cursor?;
+                loop {
+                    match state.next_notification_batch(shard, generation, cursor) {
+                        NextBatch::Send(batch) => {
+                            let offset = batch.offset;
+                            return Some((Ok(batch), Some((offset, changed))));
+                        }
+                        NextBatch::Wait => changed.changed().await.ok()?,
+                        NextBatch::Close => {
+                            return Some((Err(Status::unavailable("the shard was deleted")), None));
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Response::new(
+            futures::stream::once(async { Ok(confirmation) })
+                .chain(batches)
+                .boxed(),
+        ))
     }
 
     async fn create_session(
@@ -1504,5 +1702,137 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A key starting with `prefix` whose hash is in `[min, max]`.
+    fn key_hashed_in(prefix: &str, min: u32, max: u32) -> String {
+        (0u32..)
+            .map(|n| format!("{prefix}{n}"))
+            .find(|key| (min..=max).contains(&crate::hash::xxh3_32(key)))
+            .expect("a key in the range")
+    }
+
+    /// The keys of the next `n` notifications, sorted: the order across
+    /// shards is unspecified.
+    async fn next_keys(notifications: &mut crate::Notifications, n: usize) -> Vec<String> {
+        let mut keys = Vec::with_capacity(n);
+        for _ in 0..n {
+            let notification = tokio::time::timeout(Duration::from_secs(5), notifications.recv())
+                .await
+                .expect("a notification arrives")
+                .expect("the subscription is open");
+            keys.push(notification.key().to_string());
+        }
+        keys.sort();
+        keys
+    }
+
+    async fn assert_no_more_notifications(notifications: &mut crate::Notifications) {
+        let next = tokio::time::timeout(Duration::from_millis(200), notifications.recv()).await;
+        assert!(next.is_err(), "unexpected notification: {next:?}");
+    }
+
+    /// The start offsets of the notification subscriptions to `shard`.
+    fn start_offsets(mock: &MockOxia, shard: i64) -> Vec<Option<i64>> {
+        mock.notification_requests()
+            .into_iter()
+            .filter(|request| request.shard == shard)
+            .map(|request| request.start_offset_exclusive)
+            .collect()
+    }
+
+    /// A subscription follows the split of a shard: it subscribes to the
+    /// children from the last batch it received from the parent, whether
+    /// the parent's stream stays open, as until the node deletes the parent,
+    /// or ends before the client has the new assignments. Each child
+    /// delivers the parent's batches that the subscription had not received,
+    /// on its side of the split, then its own: every notification arrives
+    /// once. A child split in turn hands the subscription over the same way.
+    #[tokio::test]
+    async fn notifications_follow_a_split_from_the_last_batch_received() {
+        for parent_stream_ends in [false, true] {
+            let case = format!("parent stream ends: {parent_stream_ends}");
+            let mock = MockOxia::start(Behavior::default()).await;
+            let client = connect(&mock, Duration::from_secs(5)).await;
+            mock.notify(0, &["before"]);
+            let mut notifications = client.notifications().await.expect("subscribe");
+            assert_eq!(mock.notify(0, &["a"]), 1);
+            assert_eq!(next_keys(&mut notifications, 1).await, ["a"], "{case}");
+
+            // The subscriber lags behind as shard 0 is split into shards 1
+            // and 2: it does not receive the last batches of the parent.
+            let lower = key_hashed_in("lower-", 0, u32::MAX / 2);
+            let upper = key_hashed_in("upper-", u32::MAX / 2 + 1, u32::MAX);
+            mock.hold_notifications(0);
+            mock.notify(0, &[&lower]);
+            mock.notify(0, &[&upper]);
+            assert_eq!(mock.split_shard(0, false), (1, 2));
+            if parent_stream_ends {
+                mock.close_notification_streams(0);
+                until_split_shard_requests(&mock, 1).await;
+            }
+            mock.publish_assignments();
+            assert_eq!(
+                next_keys(&mut notifications, 2).await,
+                [lower, upper],
+                "{case}"
+            );
+            assert_eq!(mock.notify(1, &["b"]), 4);
+            assert_eq!(mock.notify(2, &["c"]), 4);
+            assert_eq!(next_keys(&mut notifications, 2).await, ["b", "c"], "{case}");
+            for child in [1, 2] {
+                assert_eq!(start_offsets(&mock, child), [Some(1)], "{case}: {child}");
+            }
+
+            // Shard 2 is split into shards 3 and 4, while the subscriber
+            // lags behind again.
+            let third_quarter = key_hashed_in("third-", u32::MAX / 2 + 1, u32::MAX / 4 * 3);
+            mock.hold_notifications(2);
+            mock.notify(2, &[&third_quarter]);
+            assert_eq!(mock.split_shard(2, false), (3, 4));
+            mock.publish_assignments();
+            assert_eq!(
+                next_keys(&mut notifications, 1).await,
+                [third_quarter],
+                "{case}"
+            );
+            mock.notify(3, &["d"]);
+            mock.notify(4, &["e"]);
+            assert_eq!(next_keys(&mut notifications, 2).await, ["d", "e"], "{case}");
+            for grandchild in [3, 4] {
+                assert_eq!(
+                    start_offsets(&mock, grandchild),
+                    [Some(4)],
+                    "{case}: {grandchild}"
+                );
+            }
+            assert_no_more_notifications(&mut notifications).await;
+        }
+    }
+
+    /// A shard split before the subscription to it is established: the
+    /// subscriptions to the children establish it in its place, from where
+    /// they start, as no batch of the parent tells where to start.
+    #[tokio::test]
+    async fn notifications_follow_a_split_before_the_subscription_is_established() {
+        let mock = MockOxia::start(Behavior::default()).await;
+        let client = connect(&mock, Duration::from_secs(5)).await;
+        // Only the server sees the split: it rejects the subscription to the
+        // parent.
+        assert_eq!(mock.split_shard(0, false), (1, 2));
+        let subscription = tokio::spawn(client.notifications().into_future());
+        until_split_shard_requests(&mock, 1).await;
+        mock.publish_assignments();
+        let mut notifications = subscription
+            .await
+            .expect("join")
+            .expect("the subscription is established");
+        for child in [1, 2] {
+            assert_eq!(start_offsets(&mock, child), [None], "shard {child}");
+        }
+        mock.notify(1, &["a"]);
+        mock.notify(2, &["b"]);
+        assert_eq!(next_keys(&mut notifications, 2).await, ["a", "b"]);
+        assert_no_more_notifications(&mut notifications).await;
     }
 }
