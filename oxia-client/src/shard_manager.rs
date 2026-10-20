@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::tokio_stream::StreamExt;
@@ -96,6 +96,8 @@ impl Assignments {
 struct Inner {
     provider_manager: Arc<ProviderManager>,
     assignments: ArcSwap<Assignments>,
+    /// Bumped after every update of `assignments`.
+    version: watch::Sender<u64>,
 }
 
 pub struct ShardManager {
@@ -158,6 +160,7 @@ async fn start_assignments_listener(
                                 local_inner
                                     .assignments
                                     .store(Arc::new(Assignments::from_namespace(na)));
+                                local_inner.version.send_modify(|version| *version += 1);
                                 if !init_sender.is_closed() {
                                     let _ = init_sender.send(Ok(())).await;
                                 }
@@ -201,6 +204,7 @@ impl ShardManager {
         let inner = Arc::new(Inner {
             provider_manager: options.provider_manager,
             assignments: ArcSwap::from_pointee(Assignments::empty()),
+            version: watch::Sender::new(0),
         });
         let (init_tx, mut init_rx) = mpsc::channel::<Result<(), OxiaError>>(1);
         let assignment_handle = tokio::spawn(start_assignments_listener(
@@ -260,21 +264,39 @@ impl ShardManager {
                     std::time::Duration::from_secs(1),
                 )),
                 assignments: ArcSwap::from_pointee(Assignments::empty()),
+                version: watch::Sender::new(0),
             }),
             context: CancellationToken::new(),
             assignment_handle: Mutex::new(None),
         })
     }
 
+    /// The shard's leader, or `None` if the shard is unknown or has no leader:
+    /// the coordinator publishes an empty leader while it elects one.
     pub fn get_leader(&self, shard_id: i64) -> Option<Node> {
         self.inner
             .assignments
             .load()
             .leaders
             .get(&shard_id)
+            .filter(|leader| !leader.is_empty())
             .map(|leader| Node {
                 service_address: ensure_protocol(leader.clone()),
             })
+    }
+
+    /// The version of the shard assignments, bumped on every update.
+    pub(crate) fn assignments_version(&self) -> u64 {
+        *self.inner.version.borrow()
+    }
+
+    /// Waits until the shard assignments are updated past `version`, for at
+    /// most `timeout`.
+    pub(crate) async fn wait_for_update(&self, version: u64, timeout: Duration) {
+        let mut updates = self.inner.version.subscribe();
+        // `self` owns the sender, so the wait cannot fail with `RecvError`.
+        let updated = updates.wait_for(|current| *current != version);
+        let _ = tokio::time::timeout(timeout, updated).await;
     }
 
     pub fn get_shard(&self, key: &str) -> Option<i64> {
@@ -377,5 +399,27 @@ mod tests {
             assert_eq!(Assignments::from_namespace(&namespace).key_order, order);
         }
         assert_eq!(Assignments::empty().key_order, KeyOrder::Legacy);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_update_ends_on_update_or_timeout() {
+        let manager = ShardManager::detached_for_tests();
+        let version = manager.assignments_version();
+
+        // No update: the wait lasts the whole timeout.
+        let start = tokio::time::Instant::now();
+        manager
+            .wait_for_update(version, Duration::from_secs(5))
+            .await;
+        assert!(start.elapsed() >= Duration::from_secs(5));
+
+        // An update past `version` ends the wait, even one made before the
+        // wait began.
+        manager.inner.version.send_modify(|version| *version += 1);
+        let start = tokio::time::Instant::now();
+        manager
+            .wait_for_update(version, Duration::from_secs(5))
+            .await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 }

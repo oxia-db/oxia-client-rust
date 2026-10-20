@@ -471,12 +471,13 @@ impl WriteBatcher {
     }
 
     async fn run_pump(self: Arc<Self>, init: PumpInit) {
+        let version = self.deps.shard_manager.assignments_version();
         let mut streaming = match init {
             PumpInit::Resume(streaming) => *streaming,
             PumpInit::Connect(rx) => match self.connect_stream(rx).await {
                 Ok(streaming) => streaming,
                 Err(err) => {
-                    self.pump_died(err);
+                    self.pump_died(err, version);
                     return;
                 }
             },
@@ -487,13 +488,14 @@ impl WriteBatcher {
                 // No response within the request timeout while batches are in
                 // flight: the stream is wedged. Not retried — the batch may
                 // have been applied.
-                Err(_) => return self.pump_died(OxiaError::Timeout.into()),
+                Err(_) => return self.pump_died(OxiaError::Timeout.into(), version),
                 Ok(None) => {
                     return self.pump_died(
                         OxiaError::Disconnected("write stream closed by server".to_string()).into(),
+                        version,
                     );
                 }
-                Ok(Some(Err(status))) => return self.pump_died(decode_status(status)),
+                Ok(Some(Err(status))) => return self.pump_died(decode_status(status), version),
                 Ok(Some(Ok(response))) => response,
             };
 
@@ -582,7 +584,12 @@ impl WriteBatcher {
     /// batches older than the request timeout, fail. Retrying re-sends batches
     /// whose fate is unknown, so unconditional writes may apply more than once
     /// — the same at-least-once semantics as the reference clients.
-    fn pump_died(self: &Arc<Self>, decoded: DecodedStatus) {
+    ///
+    /// The backoff ends early once the shard assignments are updated past
+    /// `version`, the one the pump started with: a leader elected or moved
+    /// meanwhile is tried right away, not when the backoff ends — possibly
+    /// past the request timeout.
+    fn pump_died(self: &Arc<Self>, decoded: DecodedStatus, version: u64) {
         let DecodedStatus { error, leader_hint } = decoded;
         warn!(shard = self.shard, error = %error, "write stream failed");
         let (expired, failed, drained) = {
@@ -613,12 +620,16 @@ impl WriteBatcher {
                 }
                 still.append(&mut st.retry);
                 st.retry = still;
-                // Hold dispatch until the backoff elapses, then reconnect.
+                // Hold dispatch until the backoff elapses (or the assignments
+                // change), then reconnect.
                 st.reconnecting = true;
                 let delay = retry_delay(st.failure_streak - 1);
                 let this = self.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
+                    this.deps
+                        .shard_manager
+                        .wait_for_update(version, delay)
+                        .await;
                     let mut st = this.state.lock().expect("write batcher poisoned");
                     st.reconnecting = false;
                     this.fill_capacity(&mut st);
