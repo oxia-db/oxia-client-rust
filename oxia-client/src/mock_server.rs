@@ -17,7 +17,7 @@ use futures::stream::BoxStream;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status, Streaming};
 use tonic_types::{ErrorDetails, StatusExt};
 
@@ -80,6 +80,10 @@ pub(crate) struct Behavior {
     /// without keys when they have none. The other shards ignore it, like an
     /// older server.
     pub(crate) end_inclusive_shards: Vec<i64>,
+    /// How long after the start the shards have no leader, as while one is
+    /// elected: the assignments name no leader until the server publishes
+    /// itself as the leader when this elapses.
+    pub(crate) leaderless_for: Duration,
 }
 
 impl Default for Behavior {
@@ -94,6 +98,7 @@ impl Default for Behavior {
             shard_keys: HashMap::new(),
             secondary_keys: HashMap::new(),
             end_inclusive_shards: Vec::new(),
+            leaderless_for: Duration::ZERO,
         }
     }
 }
@@ -108,6 +113,8 @@ struct State {
     split_shards: Mutex<HashMap<i64, bool>>,
     /// The requests that failed because their shard was split away.
     split_shard_requests: AtomicU32,
+    /// When the shards get their leader (see [`Behavior::leaderless_for`]).
+    leader_elected_at: Instant,
     /// Every received `WriteRequest`, in order.
     write_requests: Mutex<Vec<proto::WriteRequest>>,
     /// Operations per received `WriteRequest` (puts + deletes + delete-ranges).
@@ -240,6 +247,7 @@ impl MockOxia {
             })
             .collect();
         let state = Arc::new(State {
+            leader_elected_at: Instant::now() + behavior.leaderless_for,
             behavior: Mutex::new(behavior),
             shards: Mutex::new(shards),
             split_shards: Mutex::new(HashMap::new()),
@@ -601,8 +609,24 @@ impl OxiaService for Service {
         }
         let namespace = request.into_inner().namespace;
         let (tx, rx) = mpsc::unbounded();
-        tx.unbounded_send(Ok(self.state.assignments(&namespace, &self.advertised)))
-            .expect("first assignment");
+        let leaderless_for = self
+            .state
+            .leader_elected_at
+            .saturating_duration_since(Instant::now());
+        if leaderless_for.is_zero() {
+            tx.unbounded_send(Ok(self.state.assignments(&namespace, &self.advertised)))
+                .expect("first assignment");
+        } else {
+            // No leader yet: the coordinator publishes an empty one.
+            tx.unbounded_send(Ok(self.state.assignments(&namespace, "")))
+                .expect("first assignment");
+            let elected = self.state.assignments(&namespace, &self.advertised);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(leaderless_for).await;
+                let _ = tx.unbounded_send(Ok(elected));
+            });
+        }
         // Park the sender so the stream stays open, like a real server.
         self.state
             .assignment_senders
@@ -1292,6 +1316,52 @@ mod tests {
         assert_eq!(requests[1].deletes[0].partition_key.as_deref(), Some(""));
     }
 
+    /// A delete range without a partition key joins the batch of every shard
+    /// when it is issued, as a put or a delete does: the writes issued after
+    /// it follow it in the batch, with a higher `op_index`, so that a server
+    /// with ordered writes applies it before them.
+    #[tokio::test]
+    async fn delete_range_precedes_the_writes_issued_after_it() {
+        let mock = MockOxia::start(Behavior {
+            shards: 2,
+            ..Behavior::default()
+        })
+        .await;
+        let client = connect(&mock, Duration::from_secs(5)).await;
+
+        // `biased` polls the operations in order, and each one joins the open
+        // batches on its first poll. On this single-threaded runtime no batch
+        // is flushed before all of them are in it.
+        let (delete_range, put_a, put_b, put_c, put_d) = tokio::join!(
+            biased;
+            client.delete_range("range/", "range/~"),
+            client.put("range/a", "x"),
+            client.put("range/b", "x"),
+            client.put("range/c", "x"),
+            client.put("range/d", "x"),
+        );
+        delete_range.expect("delete range");
+        for put in [put_a, put_b, put_c, put_d] {
+            put.expect("put");
+        }
+
+        // One batch per shard: the delete range, then the puts routed there.
+        let requests = mock.write_requests();
+        assert_eq!(requests.len(), 2, "requests: {requests:?}");
+        for request in &requests {
+            let delete_ranges: Vec<_> = request.delete_ranges.iter().map(|r| r.op_index).collect();
+            let puts: Vec<_> = request.puts.iter().map(|p| p.op_index).collect();
+            assert!(!puts.is_empty(), "every shard gets a put: {requests:?}");
+            assert_eq!(delete_ranges, [0], "shard {:?}", request.shard);
+            assert_eq!(
+                puts,
+                (1..=puts.len() as u32).collect::<Vec<_>>(),
+                "shard {:?}",
+                request.shard
+            );
+        }
+    }
+
     /// A floor or ceiling get without a partition key goes to every shard,
     /// and the client keeps the largest or smallest answer in the key sorting
     /// that the assignments report. A server that reports none keeps the
@@ -1834,5 +1904,43 @@ mod tests {
         mock.notify(2, &["b"]);
         assert_eq!(next_keys(&mut notifications, 2).await, ["a", "b"]);
         assert_no_more_notifications(&mut notifications).await;
+    }
+
+    /// A shard without a leader fails with `LeaderNotFound`; its empty leader
+    /// address is not dialed.
+    #[tokio::test]
+    async fn leaderless_shard_reports_leader_not_found() {
+        let mock = MockOxia::start(Behavior {
+            leaderless_for: Duration::from_secs(60),
+            ..Behavior::default()
+        })
+        .await;
+        let client = connect(&mock, Duration::from_millis(500)).await;
+
+        let result = client.get("leaderless/key").await;
+        assert!(
+            matches!(result, Err(OxiaError::LeaderNotFound { shard: 0 })),
+            "got {result:?}"
+        );
+    }
+
+    /// A write waiting for a shard leader goes out as soon as one is elected,
+    /// not when its reconnect backoff ends.
+    #[tokio::test]
+    async fn write_goes_out_once_the_shard_gets_a_leader() {
+        // The reconnects back off 100, 200, 400, then 800 ms: the leader is
+        // elected 1 s in, during the last wait, which ends after the request
+        // timeout.
+        let mock = MockOxia::start(Behavior {
+            leaderless_for: Duration::from_secs(1),
+            ..Behavior::default()
+        })
+        .await;
+        let client = connect(&mock, Duration::from_millis(1300)).await;
+
+        client
+            .put("election/key", "x")
+            .await
+            .expect("put once the leader is elected");
     }
 }

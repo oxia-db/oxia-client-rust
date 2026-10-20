@@ -1077,13 +1077,15 @@ impl OxiaClient {
         request: proto::DeleteRangeRequest,
     ) -> Result<(), OxiaError> {
         send_to_every_shard(&self.inner.shard_manager, self.request_timeout(), |shard| {
-            let request = request.clone();
-            async move {
-                let response = self
-                    .submit_write(shard, request, WriteOp::DeleteRange)
-                    .await?;
-                check_status(response.status)
-            }
+            // Queue the copy when it is sent, before the first await, as
+            // `submit_write` does for a single write, so that each copy
+            // precedes in its shard's batch the writes issued after this
+            // delete range. Queued only once polled, a copy could follow those
+            // writes, and be applied after them. (A copy rerouted after a
+            // split can only follow what the successors already have.)
+            let (op, rx) = pending_write(request.clone(), WriteOp::DeleteRange);
+            self.write_batcher(shard).add(op);
+            async move { check_status(self.await_response(rx).await?.status) }
         })
         .await
     }
