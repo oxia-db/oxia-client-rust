@@ -1,6 +1,8 @@
 //! The Oxia client: construction, per-operation execution, and shutdown.
 
-use crate::batcher::{BatcherDeps, ReadBatcher, WriteBatcher, WriteOp, pending_write};
+use crate::batcher::{
+    BatcherDeps, ReadBatcher, WriteBatcher, WriteOp, absent_shard_error, pending_write,
+};
 use crate::client_builder::OxiaClientBuilder;
 use crate::client_options::OxiaClientOptions;
 use crate::errors::OxiaError;
@@ -26,7 +28,6 @@ use crate::types::{ComparisonType, GetResult};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
-use futures::future::try_join_all;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
 use std::fmt;
@@ -796,12 +797,25 @@ impl OxiaClient {
         .await
     }
 
-    /// Resolves the target shards for a list/scan: either the single shard
-    /// owning `partition_key`, or all shards.
-    fn target_shards(&self, partition_key: Option<&str>) -> Result<Vec<i64>, OxiaError> {
+    /// Opens the per-shard streams of a list/scan with `open`: on the single
+    /// shard owning `partition_key`, or on all shards. A shard split or
+    /// merged away before its stream opened is replaced by the shard that now
+    /// owns the partition key, or by the shards that took over its hash
+    /// range: merged, the streams still return every key once.
+    async fn open_shard_streams<T, F, Fut>(
+        &self,
+        partition_key: Option<&str>,
+        open: F,
+    ) -> Result<Vec<ShardStream<T>>, OxiaError>
+    where
+        F: Fn(i64) -> Fut,
+        Fut: Future<Output = Result<ShardStream<T>, OxiaError>>,
+    {
         match partition_key {
-            Some(pk) => Ok(vec![self.shard_for(pk)?]),
-            None => Ok(self.inner.shard_manager.get_shard_ids()),
+            Some(pk) => Ok(vec![self.with_shard_retry(pk, open).await?]),
+            None => {
+                send_to_every_shard(&self.inner.shard_manager, self.request_timeout(), open).await
+            }
         }
     }
 
@@ -812,7 +826,7 @@ impl OxiaClient {
     ) -> Result<ListStream, OxiaError> {
         self.ensure_open()?;
         let end_inclusive = request.end_inclusive;
-        let opens = self.target_shards(partition_key)?.into_iter().map(|shard| {
+        let open = |shard: i64| {
             let client = self.clone();
             let request = request.clone();
             async move {
@@ -844,9 +858,9 @@ impl OxiaClient {
                 );
                 Ok::<_, OxiaError>(stream)
             }
-        });
+        };
         Ok(ListStream::new(merged(
-            try_join_all(opens).await?,
+            self.open_shard_streams(partition_key, open).await?,
             self.inner.shard_manager.key_order(),
         )))
     }
@@ -858,7 +872,7 @@ impl OxiaClient {
     ) -> Result<RangeScanStream, OxiaError> {
         self.ensure_open()?;
         let end_inclusive = request.end_inclusive;
-        let opens = self.target_shards(partition_key)?.into_iter().map(|shard| {
+        let open = |shard: i64| {
             let client = self.clone();
             let request = request.clone();
             async move {
@@ -894,9 +908,9 @@ impl OxiaClient {
                 );
                 Ok::<_, OxiaError>(stream)
             }
-        });
+        };
         Ok(RangeScanStream::new(merged(
-            try_join_all(opens).await?,
+            self.open_shard_streams(partition_key, open).await?,
             self.inner.shard_manager.key_order(),
         )))
     }
@@ -905,7 +919,8 @@ impl OxiaClient {
     /// hints, bounded by the request timeout — until the first response (or a
     /// clean end of stream) has been received. Past that point the caller
     /// consumes the stream without retries, so results are never duplicated
-    /// (the reference client's "verified" pattern).
+    /// (the reference client's "verified" pattern). Fails at once with
+    /// [`OxiaError::ShardMoved`] once the shard is split or merged away.
     async fn open_streaming_with_retry<Resp, Fut>(
         &self,
         shard: i64,
@@ -922,13 +937,20 @@ impl OxiaClient {
         loop {
             let outcome: Result<_, DecodedStatus> = async {
                 let target = match hint.as_ref().and_then(|h| h.address_for(shard)) {
-                    Some(address) => crate::address::ensure_protocol(address.to_string()),
-                    None => {
+                    // As in the batchers, the hint of a shard split or merged
+                    // away is stale: the open fails with `ShardMoved`.
+                    Some(address) if self.inner.shard_manager.shard_exists(shard) => {
+                        crate::address::ensure_protocol(address.to_string())
+                    }
+                    _ => {
                         self.inner
                             .shard_manager
                             .get_leader(shard)
                             .ok_or_else(|| {
-                                DecodedStatus::from(OxiaError::LeaderNotFound { shard })
+                                DecodedStatus::from(absent_shard_error(
+                                    &self.inner.batcher_deps,
+                                    shard,
+                                ))
                             })?
                             .service_address
                     }
@@ -955,7 +977,10 @@ impl OxiaClient {
                     }
                     let delay = retry_delay(attempt);
                     attempt += 1;
+                    // A moved shard is retried by rerouting the open, not by
+                    // opening it again.
                     if !decoded.error.is_retryable()
+                        || matches!(decoded.error, OxiaError::ShardMoved)
                         || tokio::time::Instant::now() + delay >= deadline
                     {
                         return Err(decoded.error);
@@ -1068,28 +1093,29 @@ impl OxiaClient {
                 check_status(response.status)
             }
         })
-        .await
+        .await?;
+        Ok(())
     }
 }
 
 /// Runs `send` for every shard in the current assignments. Succeeds once every
-/// copy has succeeded; fails with the first error other than
-/// [`OxiaError::ShardMoved`], or with [`OxiaError::Timeout`] once `timeout`
-/// has elapsed.
+/// copy has succeeded, with what each returned; fails with the first error
+/// other than [`OxiaError::ShardMoved`], or with [`OxiaError::Timeout`] once
+/// `timeout` has elapsed.
 ///
 /// A copy fails with `ShardMoved` when its shard was split or merged away
 /// before the copy ran. The copy is then sent to that shard's successors, the
 /// shards now owning its hash range, except those that already have a copy in
 /// flight or applied. A successor that is split away in turn gets the same
 /// treatment, by its own range. No other shard is sent a second copy.
-async fn send_to_every_shard<F, Fut>(
+async fn send_to_every_shard<T, F, Fut>(
     shard_manager: &ShardManager,
     timeout: Duration,
     send: F,
-) -> Result<(), OxiaError>
+) -> Result<Vec<T>, OxiaError>
 where
     F: Fn(i64) -> Fut,
-    Fut: Future<Output = Result<(), OxiaError>>,
+    Fut: Future<Output = Result<T, OxiaError>>,
 {
     let deadline = tokio::time::Instant::now() + timeout;
     let send_copy = |range: ShardRange| {
@@ -1103,12 +1129,13 @@ where
         covered.insert(range.shard);
         copies.push(send_copy(range));
     }
+    let mut results = Vec::with_capacity(copies.len());
     while let Some((range, result)) = tokio::time::timeout_at(deadline, copies.next())
         .await
         .map_err(|_| OxiaError::Timeout)?
     {
         match result {
-            Ok(()) => {}
+            Ok(value) => results.push(value),
             Err(OxiaError::ShardMoved) => {
                 covered.remove(&range.shard);
                 let successors = shard_manager.get_successors(&range);
@@ -1124,7 +1151,7 @@ where
             Err(err) => return Err(err),
         }
     }
-    Ok(())
+    Ok(results)
 }
 
 fn track(first_err: &mut Option<OxiaError>, result: Result<(), OxiaError>, what: &str) {
@@ -1204,11 +1231,11 @@ mod tests {
     }
 
     /// Runs `send_to_every_shard` in the background, handing every copy it
-    /// sends to the test.
+    /// sends to the test. A copy that succeeds returns its shard.
     fn start_broadcast(
         shards: Arc<ShardManager>,
     ) -> (
-        JoinHandle<Result<(), OxiaError>>,
+        JoinHandle<Result<Vec<i64>, OxiaError>>,
         UnboundedReceiver<SentCopy>,
     ) {
         let (tx, rx) = unbounded_channel();
@@ -1217,9 +1244,12 @@ mod tests {
                 let (done, result) = oneshot::channel();
                 let _ = tx.send(SentCopy { shard, done });
                 async move {
-                    result.await.unwrap_or_else(|_| {
-                        Err(OxiaError::Disconnected("copy dropped".to_string()))
-                    })
+                    result
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(OxiaError::Disconnected("copy dropped".to_string()))
+                        })
+                        .map(|()| shard)
                 }
             })
             .await
@@ -1245,30 +1275,33 @@ mod tests {
         copies.iter().map(|copy| copy.shard).collect()
     }
 
-    async fn assert_pending(broadcast: &mut JoinHandle<Result<(), OxiaError>>) {
+    async fn assert_pending(broadcast: &mut JoinHandle<Result<Vec<i64>, OxiaError>>) {
         let waited = tokio::time::timeout(Duration::from_millis(100), broadcast).await;
         assert!(waited.is_err(), "the broadcast must still be waiting");
     }
 
-    /// Waits for the broadcast's result, and checks that it sent no copy the
-    /// test did not receive.
+    /// Waits for the broadcast's result, the shards of its copies in order,
+    /// and checks that it sent no copy the test did not receive.
     async fn finish(
-        broadcast: JoinHandle<Result<(), OxiaError>>,
+        broadcast: JoinHandle<Result<Vec<i64>, OxiaError>>,
         mut copies: UnboundedReceiver<SentCopy>,
-    ) -> Result<(), OxiaError> {
+    ) -> Result<Vec<i64>, OxiaError> {
         let result = tokio::time::timeout(2 * TIMEOUT, broadcast).await;
         let unexpected: Vec<i64> = std::iter::from_fn(|| copies.try_recv().ok())
             .map(|copy| copy.shard)
             .collect();
         assert!(unexpected.is_empty(), "unexpected copies to {unexpected:?}");
-        result
+        let mut shards = result
             .expect("the broadcast completes")
-            .expect("the broadcast does not panic")
+            .expect("the broadcast does not panic")?;
+        shards.sort_unstable();
+        Ok(shards)
     }
 
     /// Shard 0 is split into shards 2 and 3 before its copy runs: the copy is
     /// re-sent to the two children only, and shard 1, unrelated to the
-    /// split, gets exactly one copy.
+    /// split, gets exactly one copy. The broadcast returns what the copies
+    /// that succeeded returned, the rerouted ones included.
     #[tokio::test(start_paused = true)]
     async fn split_shard_copy_goes_to_its_children_only() {
         let shards = ShardManager::detached_for_tests();
@@ -1288,7 +1321,7 @@ mod tests {
         for copy in rerouted {
             copy.complete(Ok(()));
         }
-        finish(broadcast, copies).await.unwrap();
+        assert_eq!(finish(broadcast, copies).await.unwrap(), [1, 2, 3]);
     }
 
     /// The broadcast succeeds only once every copy has, the rerouted ones

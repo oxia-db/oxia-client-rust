@@ -456,3 +456,118 @@ async fn test_delete_range_across_live_split() {
 
     client.close().await.unwrap();
 }
+
+/// Reads across a live split of one of two shards, each kind in a loop of
+/// its own: lists and range scans without a partition key, lists with a
+/// partition key on the splitting shard, and gets. None fails: a read that
+/// reaches the parent once it no longer serves goes to the children once the
+/// client has their assignments, and a list or a range scan still returns
+/// every key once, in order.
+#[tokio::test]
+async fn test_reads_across_live_split() {
+    let cluster = start_cluster(2, 2).await;
+    let client = connect_with_retry(&cluster.address).await;
+
+    let keys: Arc<Vec<String>> = Arc::new((0..40).map(|i| format!("reads/k{i:02}")).collect());
+    for key in keys.iter() {
+        client.put(key.clone(), key.clone()).await.unwrap();
+    }
+    // Records with a partition key that shard 0 owns.
+    let partition_key = key_in_half("pk-", false);
+    let partitioned: Arc<Vec<String>> =
+        Arc::new((0..10).map(|i| format!("partitioned/k{i:02}")).collect());
+    for key in partitioned.iter() {
+        client
+            .put(key.clone(), "x")
+            .partition_key(partition_key.clone())
+            .await
+            .unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // Each reader runs until stopped, and returns how many reads it made.
+    let lists = tokio::spawn({
+        let (client, keys, stop) = (client.clone(), keys.clone(), stop.clone());
+        async move {
+            let mut reads = 0;
+            while !stop.load(Ordering::SeqCst) {
+                let listed = client
+                    .list("reads/", "reads/~")
+                    .await
+                    .expect("list during the split");
+                assert_eq!(listed, *keys);
+                reads += 1;
+            }
+            reads
+        }
+    });
+    let range_scans = tokio::spawn({
+        let (client, keys, stop) = (client.clone(), keys.clone(), stop.clone());
+        async move {
+            let mut reads = 0;
+            while !stop.load(Ordering::SeqCst) {
+                let scanned: Vec<String> = client
+                    .range_scan("reads/", "reads/~")
+                    .await
+                    .expect("range scan during the split")
+                    .into_iter()
+                    .map(|record| record.key)
+                    .collect();
+                assert_eq!(scanned, *keys);
+                reads += 1;
+            }
+            reads
+        }
+    });
+    let partition_lists = tokio::spawn({
+        let (client, partitioned, stop) = (client.clone(), partitioned.clone(), stop.clone());
+        async move {
+            let mut reads = 0;
+            while !stop.load(Ordering::SeqCst) {
+                let listed = client
+                    .list("partitioned/", "partitioned/~")
+                    .partition_key(partition_key.clone())
+                    .await
+                    .expect("list with a partition key during the split");
+                assert_eq!(listed, *partitioned);
+                reads += 1;
+            }
+            reads
+        }
+    });
+    let gets = tokio::spawn({
+        let (client, keys, stop) = (client.clone(), keys.clone(), stop.clone());
+        async move {
+            let mut reads = 0;
+            while !stop.load(Ordering::SeqCst) {
+                let key = &keys[reads % keys.len()];
+                let got = client.get(key.clone()).await.expect("get during the split");
+                assert_eq!(got.value.as_deref(), Some(key.as_bytes()));
+                reads += 1;
+            }
+            reads
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let split_output = cluster.split_shard(0).await;
+    assert!(
+        split_output.contains("\"Error\":null"),
+        "split must succeed, got: {split_output}"
+    );
+    cluster.wait_until_removed(0).await;
+    // A few more reads, from the children.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.store(true, Ordering::SeqCst);
+    for (kind, reader) in [
+        ("lists", lists),
+        ("range scans", range_scans),
+        ("lists with a partition key", partition_lists),
+        ("gets", gets),
+    ] {
+        let reads = reader.await.expect(kind);
+        assert!(reads > 0, "no {kind} ran");
+    }
+
+    client.close().await.unwrap();
+}
