@@ -1,6 +1,8 @@
 //! The Oxia client: construction, per-operation execution, and shutdown.
 
-use crate::batcher::{BatcherDeps, ReadBatcher, WriteBatcher, WriteOp, pending_write};
+use crate::batcher::{
+    BatcherDeps, ReadBatcher, WriteBatcher, WriteOp, absent_shard_error, pending_write,
+};
 use crate::client_builder::OxiaClientBuilder;
 use crate::client_options::OxiaClientOptions;
 use crate::errors::OxiaError;
@@ -375,8 +377,10 @@ impl OxiaClient {
     /// all keys exceeds the request timeout, [`OxiaError::Closed`] after
     /// [`close`](OxiaClient::close), [`OxiaError::EndInclusiveUnsupported`]
     /// when [`end_inclusive`](ListBuilder::end_inclusive) reaches a shard
-    /// that leaves the end out, or transient routing/transport errors. An
-    /// empty range yields an empty `Vec`, not an error.
+    /// that leaves the end out, [`OxiaError::ShardMoved`] when a shard is
+    /// split or merged before its keys start coming (listing again reads the
+    /// new shards), or transient routing/transport errors. An empty range
+    /// yields an empty `Vec`, not an error.
     ///
     /// # Example
     ///
@@ -414,8 +418,10 @@ impl OxiaClient {
     /// all records exceeds the request timeout, [`OxiaError::Closed`] after
     /// [`close`](OxiaClient::close), [`OxiaError::EndInclusiveUnsupported`]
     /// when [`end_inclusive`](RangeScanBuilder::end_inclusive) reaches a
-    /// shard that leaves the end out, or transient routing/transport errors.
-    /// An empty range yields an empty `Vec`, not an error.
+    /// shard that leaves the end out, [`OxiaError::ShardMoved`] when a shard
+    /// is split or merged before its records start coming (scanning again
+    /// reads the new shards), or transient routing/transport errors. An empty
+    /// range yields an empty `Vec`, not an error.
     ///
     /// # Example
     ///
@@ -905,7 +911,9 @@ impl OxiaClient {
     /// hints, bounded by the request timeout — until the first response (or a
     /// clean end of stream) has been received. Past that point the caller
     /// consumes the stream without retries, so results are never duplicated
-    /// (the reference client's "verified" pattern).
+    /// (the reference client's "verified" pattern). Once the shard is split or
+    /// merged away, fails with [`OxiaError::ShardMoved`] without retrying, as
+    /// the Go client fails with `ErrShardNotFound`.
     async fn open_streaming_with_retry<Resp, Fut>(
         &self,
         shard: i64,
@@ -922,13 +930,20 @@ impl OxiaClient {
         loop {
             let outcome: Result<_, DecodedStatus> = async {
                 let target = match hint.as_ref().and_then(|h| h.address_for(shard)) {
-                    Some(address) => crate::address::ensure_protocol(address.to_string()),
-                    None => {
+                    // As in the batchers, the hint of a shard split or merged
+                    // away is stale: the open fails with `ShardMoved`.
+                    Some(address) if self.inner.shard_manager.shard_exists(shard) => {
+                        crate::address::ensure_protocol(address.to_string())
+                    }
+                    _ => {
                         self.inner
                             .shard_manager
                             .get_leader(shard)
                             .ok_or_else(|| {
-                                DecodedStatus::from(OxiaError::LeaderNotFound { shard })
+                                DecodedStatus::from(absent_shard_error(
+                                    &self.inner.batcher_deps,
+                                    shard,
+                                ))
                             })?
                             .service_address
                     }
@@ -955,7 +970,9 @@ impl OxiaClient {
                     }
                     let delay = retry_delay(attempt);
                     attempt += 1;
+                    // Opening a moved shard again cannot succeed.
                     if !decoded.error.is_retryable()
+                        || matches!(decoded.error, OxiaError::ShardMoved)
                         || tokio::time::Instant::now() + delay >= deadline
                     {
                         return Err(decoded.error);
@@ -971,7 +988,7 @@ impl OxiaClient {
         buffer_size: usize,
     ) -> Result<Notifications, OxiaError> {
         self.ensure_open()?;
-        let shards = self.inner.shard_manager.get_shard_ids();
+        let shards = self.inner.shard_manager.get_shard_ranges();
         let shard_count = shards.len();
         let (tx, rx) = mpsc::channel(buffer_size);
         let (init_tx, mut init_rx) = mpsc::channel(shard_count.max(1));

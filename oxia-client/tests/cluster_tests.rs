@@ -9,7 +9,7 @@
 //! running.
 
 use futures::{StreamExt, TryStreamExt};
-use oxia::{ComparisonType, OxiaClient, OxiaClientBuilder, OxiaError};
+use oxia::{ComparisonType, Notification, Notifications, OxiaClient, OxiaClientBuilder, OxiaError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -453,6 +453,247 @@ async fn test_delete_range_across_live_split() {
             "round {i}: the delete range missed shard 0 or its children"
         );
     }
+
+    client.close().await.unwrap();
+}
+
+/// Runs `scan`, a list or a range scan, until `stop` is set, and returns how
+/// many times it ran. Each time, it returns `expected`, or fails with
+/// `ShardMoved` if it opened a stream on the parent once the parent no
+/// longer served: never with another error.
+async fn scan_until_stopped<F, Fut>(
+    stop: &AtomicBool,
+    kind: &str,
+    expected: &[String],
+    mut scan: F,
+) -> usize
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<String>, OxiaError>>,
+{
+    let mut scans = 0;
+    while !stop.load(Ordering::SeqCst) {
+        match scan().await {
+            Ok(keys) => assert_eq!(keys, expected, "{kind}"),
+            Err(OxiaError::ShardMoved) => {}
+            Err(e) => panic!("{kind} during the split: {e:?}"),
+        }
+        scans += 1;
+    }
+    scans
+}
+
+/// Runs `scan` again while it fails with `ShardMoved`, as a caller does to
+/// read the new shards.
+async fn retry_while_moved<F, Fut>(mut scan: F) -> Result<Vec<String>, OxiaError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<String>, OxiaError>>,
+{
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match scan().await {
+            Err(OxiaError::ShardMoved) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Reads across a live split of one of two shards, each kind in a loop of
+/// its own: lists and range scans without a partition key, lists with a
+/// partition key on the splitting shard, and gets. A get never fails: one
+/// that reaches the parent once it no longer serves goes to the child that
+/// owns the key once the client has the children's assignments. A list or
+/// a range scan that opened a stream on the parent then fails with
+/// `ShardMoved` instead, as in the Go client, rather than with another error
+/// after the request timeout; run again, it reads the children.
+#[tokio::test]
+async fn test_reads_across_live_split() {
+    let cluster = start_cluster(2, 2).await;
+    let client = connect_with_retry(&cluster.address).await;
+
+    let keys: Arc<Vec<String>> = Arc::new((0..40).map(|i| format!("reads/k{i:02}")).collect());
+    for key in keys.iter() {
+        client.put(key.clone(), key.clone()).await.unwrap();
+    }
+    // Records with a partition key that shard 0 owns.
+    let partition_key = key_in_half("pk-", false);
+    let partitioned: Arc<Vec<String>> =
+        Arc::new((0..10).map(|i| format!("partitioned/k{i:02}")).collect());
+    for key in partitioned.iter() {
+        client
+            .put(key.clone(), "x")
+            .partition_key(partition_key.clone())
+            .await
+            .unwrap();
+    }
+
+    let list = {
+        let client = client.clone();
+        move || client.list("reads/", "reads/~").into_future()
+    };
+    let range_scan = {
+        let client = client.clone();
+        move || {
+            let scan = client.range_scan("reads/", "reads/~");
+            async move {
+                let records = scan.await?;
+                Ok::<_, OxiaError>(records.into_iter().map(|record| record.key).collect())
+            }
+        }
+    };
+    let partition_list = {
+        let client = client.clone();
+        move || {
+            client
+                .list("partitioned/", "partitioned/~")
+                .partition_key(partition_key.clone())
+                .into_future()
+        }
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // Each reader runs until stopped, and returns how many reads it made.
+    let lists = tokio::spawn({
+        let (stop, keys, list) = (stop.clone(), keys.clone(), list.clone());
+        async move { scan_until_stopped(&stop, "list", &keys, list).await }
+    });
+    let range_scans = tokio::spawn({
+        let (stop, keys, range_scan) = (stop.clone(), keys.clone(), range_scan.clone());
+        async move { scan_until_stopped(&stop, "range scan", &keys, range_scan).await }
+    });
+    let partition_lists = tokio::spawn({
+        let (stop, partitioned, partition_list) =
+            (stop.clone(), partitioned.clone(), partition_list.clone());
+        async move {
+            scan_until_stopped(
+                &stop,
+                "list with a partition key",
+                &partitioned,
+                partition_list,
+            )
+            .await
+        }
+    });
+    let gets = tokio::spawn({
+        let (client, keys, stop) = (client.clone(), keys.clone(), stop.clone());
+        async move {
+            let mut reads = 0;
+            while !stop.load(Ordering::SeqCst) {
+                let key = &keys[reads % keys.len()];
+                let got = client.get(key.clone()).await.expect("get during the split");
+                assert_eq!(got.value.as_deref(), Some(key.as_bytes()));
+                reads += 1;
+            }
+            reads
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let split_output = cluster.split_shard(0).await;
+    assert!(
+        split_output.contains("\"Error\":null"),
+        "split must succeed, got: {split_output}"
+    );
+    cluster.wait_until_removed(0).await;
+    // A few more reads, from the children.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.store(true, Ordering::SeqCst);
+    for (kind, reader) in [
+        ("lists", lists),
+        ("range scans", range_scans),
+        ("lists with a partition key", partition_lists),
+        ("gets", gets),
+    ] {
+        let reads = reader.await.expect(kind);
+        assert!(reads > 0, "no {kind} ran");
+    }
+
+    // Once the split has completed, the lists and range scans read the
+    // children.
+    assert_eq!(retry_while_moved(list).await.unwrap(), *keys);
+    assert_eq!(retry_while_moved(range_scan).await.unwrap(), *keys);
+    assert_eq!(
+        retry_while_moved(partition_list).await.unwrap(),
+        *partitioned
+    );
+
+    client.close().await.unwrap();
+}
+
+/// The keys of the next `count` notifications, all creations, sorted, once
+/// no other arrives for a while: a duplicate would come after.
+async fn created_keys(notifications: &mut Notifications, count: usize) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut keys = Vec::with_capacity(count);
+    while keys.len() < count {
+        let notification = tokio::time::timeout_at(deadline, notifications.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{} of the {count} notifications arrived", keys.len()))
+            .expect("the subscription is open");
+        match notification {
+            Notification::KeyCreated { key, .. } => keys.push(key),
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+    let extra = tokio::time::timeout(Duration::from_millis(500), notifications.recv()).await;
+    assert!(extra.is_err(), "unexpected notification: {extra:?}");
+    keys.sort();
+    keys
+}
+
+/// Notifications across a live split of the only shard, by two
+/// subscriptions opened before it: one with a buffer that never fills, which
+/// reads the stream as the notifications come, and one that lags behind, as
+/// nothing reads it until the split has completed and its buffer holds a
+/// single notification. Each follows the split to the children, after the
+/// last batch it received from the parent: both get the creation of every
+/// key written before, during and after the split, once.
+#[tokio::test]
+async fn test_notifications_across_live_split() {
+    let cluster = start_cluster(2, 1).await;
+    let client = connect_with_retry(&cluster.address).await;
+    let mut prompt = client.notifications().buffer_size(100_000).await.unwrap();
+    let mut lagging = client.notifications().buffer_size(1).await.unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = tokio::spawn({
+        let (client, stop) = (client.clone(), stop.clone());
+        async move {
+            let mut written = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let key = format!("notified/during-{:05}", written.len());
+                client
+                    .put(key.clone(), "x")
+                    .await
+                    .expect("write during the split");
+                written.push(key);
+            }
+            written
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let split_output = cluster.split_shard(0).await;
+    assert!(
+        split_output.contains("\"Error\":null"),
+        "split must succeed, got: {split_output}"
+    );
+    cluster.wait_until_removed(0).await;
+    stop.store(true, Ordering::SeqCst);
+    let mut written = writer.await.expect("writer");
+    // Once the split has completed, the children take every write.
+    for i in 0..20 {
+        let key = format!("notified/after-{i:02}");
+        client.put(key.clone(), "x").await.unwrap();
+        written.push(key);
+    }
+    written.sort();
+
+    assert_eq!(created_keys(&mut prompt, written.len()).await, written);
+    assert_eq!(created_keys(&mut lagging, written.len()).await, written);
 
     client.close().await.unwrap();
 }
