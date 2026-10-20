@@ -2167,12 +2167,16 @@ async fn test_operations_survive_server_restart() {
 //   - session expiry + ephemeral cleanup on close: `test_ephemeral_keys`
 //
 // Two gate scenarios cannot be driven against the `oxia standalone` container
-// and are covered at the unit level instead:
+// and are covered elsewhere:
 //   - Shard split/merge under load: the standalone exposes only the public
 //     service (port 6648); it runs no coordinator/admin service, so the
 //     `OxiaAdmin.SplitShard` RPC is unreachable and no live split can be
-//     triggered. The re-routing logic (SHARD_NOT_FOUND -> re-hash + resubmit)
-//     is unit-tested in `client.rs`, matching how the Go/Java clients test it.
+//     triggered. `cluster_tests.rs` drives live splits against a multi-node
+//     cluster instead. No server reports a split shard: the batchers fail an
+//     operation whose shard has left the assignments with `ShardMoved`, and
+//     the operation is re-routed — re-hashed and resubmitted, or, for a
+//     delete range without a partition key, re-sent to the shards that took
+//     over the moved shard's range (unit-tested in `client.rs`).
 //   - Forced session expiry: the server persists sessions and, on restart,
 //     recovers them with a fresh heartbeat timer while the client transparently
 //     resumes keep-alive — so `SESSION_NOT_FOUND` cannot be provoked through the

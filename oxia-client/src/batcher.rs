@@ -293,7 +293,7 @@ struct WriteState {
 
 /// Batches write operations for one shard.
 /// Whether `shard` still exists; if not, an op targeting it must re-route.
-fn absent_shard_error(deps: &BatcherDeps, shard: i64) -> OxiaError {
+pub(crate) fn absent_shard_error(deps: &BatcherDeps, shard: i64) -> OxiaError {
     if deps.shard_manager.shard_exists(shard) {
         OxiaError::LeaderNotFound { shard }
     } else {
@@ -870,16 +870,21 @@ impl ReadBatcher {
         }
     }
 
-    /// One attempt: resolve the target (hint first), issue the RPC, and
-    /// collect every response before completing anything.
+    /// One attempt: resolve the target (hint first, as long as the shard
+    /// still exists), issue the RPC, and collect every response before
+    /// completing anything.
     async fn attempt_read(
         &self,
         requests: &[proto::GetRequest],
         hint: Option<&LeaderHint>,
     ) -> Result<Vec<proto::GetResponse>, DecodedStatus> {
         let target = match hint.and_then(|h| h.address_for(self.shard)) {
-            Some(address) => ensure_protocol(address.to_string()),
-            None => {
+            // Once the shard is split or merged away, its hint is stale too:
+            // fall through, so the read fails with `ShardMoved` and reroutes.
+            Some(address) if self.deps.shard_manager.shard_exists(self.shard) => {
+                ensure_protocol(address.to_string())
+            }
+            _ => {
                 self.deps
                     .shard_manager
                     .get_leader(self.shard)
@@ -1159,5 +1164,48 @@ mod tests {
         batcher.add(pending);
         let err = rx.await.expect("callback must fire").unwrap_err();
         assert!(matches!(err, OxiaError::Closed));
+    }
+
+    /// The same holds for a read batch that a failure left with a leader
+    /// hint: once the shard has been split away, the next attempt fails with
+    /// `ShardMoved`, so the gets reroute, instead of retrying against the
+    /// hint until the request timeout.
+    #[tokio::test]
+    async fn stale_hint_for_a_removed_shard_fails_reads_with_shard_moved() {
+        // The detached shard manager has no assignments: shard 0 is gone.
+        let batcher = ReadBatcher::new(0, test_deps(1024));
+        let hint = LeaderHint {
+            shard: 0,
+            leader: "127.0.0.1:1".to_string(),
+        };
+        let err = batcher
+            .attempt_read(&[proto::GetRequest::default()], Some(&hint))
+            .await
+            .unwrap_err()
+            .error;
+        assert!(matches!(err, OxiaError::ShardMoved), "got {err:?}");
+    }
+
+    /// While the shard exists, its hint still overrides the leader in the
+    /// assignments for reads too.
+    #[tokio::test]
+    async fn hint_for_an_existing_shard_overrides_the_assigned_leader_for_reads() {
+        let mock = MockOxia::start(Behavior::default()).await;
+        let deps = test_deps(1024);
+        // The assigned leader, `server-0:6648`, does not exist.
+        deps.shard_manager
+            .set_assignments_for_tests(&[(0, 0, u32::MAX)]);
+        let batcher = ReadBatcher::new(0, deps);
+        let hint = LeaderHint {
+            shard: 0,
+            leader: mock.address.clone(),
+        };
+        let responses = batcher
+            .attempt_read(&[proto::GetRequest::default()], Some(&hint))
+            .await
+            .map_err(|decoded| decoded.error)
+            .expect("the read goes to the hinted leader");
+        let statuses: Vec<i32> = responses.iter().map(|r| r.status).collect();
+        assert_eq!(statuses, [proto::Status::Ok as i32]);
     }
 }

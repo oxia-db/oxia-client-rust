@@ -28,10 +28,17 @@ pub(crate) struct Node {
 }
 
 /// One shard's hash range and leader, used to route keys to shards.
-struct ShardRange {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShardRange {
     min_hash: u32,
     max_hash: u32,
-    shard: i64,
+    pub(crate) shard: i64,
+}
+
+impl ShardRange {
+    fn overlaps(&self, other: &ShardRange) -> bool {
+        self.min_hash <= other.max_hash && other.min_hash <= self.max_hash
+    }
 }
 
 /// An immutable snapshot of a namespace's shard assignments.
@@ -100,6 +107,13 @@ struct Inner {
     version: watch::Sender<u64>,
 }
 
+impl Inner {
+    fn set_assignments(&self, assignments: Assignments) {
+        self.assignments.store(Arc::new(assignments));
+        self.version.send_modify(|version| *version += 1);
+    }
+}
+
 pub struct ShardManager {
     inner: Arc<Inner>,
     context: CancellationToken,
@@ -157,10 +171,7 @@ async fn start_assignments_listener(
                         Some(Err(status)) => return classify_status(status, &init_sender).await,
                         Some(Ok(assignments)) => {
                             if let Some(na) = assignments.namespaces.get(&ns) {
-                                local_inner
-                                    .assignments
-                                    .store(Arc::new(Assignments::from_namespace(na)));
-                                local_inner.version.send_modify(|version| *version += 1);
+                                local_inner.set_assignments(Assignments::from_namespace(na));
                                 if !init_sender.is_closed() {
                                     let _ = init_sender.send(Ok(())).await;
                                 }
@@ -332,6 +343,31 @@ impl ShardManager {
         self.inner.assignments.load().key_order
     }
 
+    /// The hash ranges of all shards in the namespace, per the current
+    /// assignments.
+    pub(crate) fn get_shard_ranges(&self) -> Vec<ShardRange> {
+        self.inner.assignments.load().ranges.clone()
+    }
+
+    /// The shards in the current assignments whose hash ranges overlap
+    /// `removed`'s: once `removed` has been split or merged away, the shards
+    /// that own its keys.
+    pub(crate) fn get_successors(&self, removed: &ShardRange) -> Vec<ShardRange> {
+        self.inner
+            .assignments
+            .load()
+            .ranges
+            .iter()
+            .filter(|range| range.overlaps(removed))
+            .copied()
+            .collect()
+    }
+
+    /// A receiver that sees each replacement of the assignments from now on.
+    pub(crate) fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.inner.version.subscribe()
+    }
+
     /// Replaces the assignments with `shards`, as `(shard, min_hash,
     /// max_hash)`, as if the coordinator had published them.
     #[cfg(test)]
@@ -349,15 +385,11 @@ impl ShardManager {
             })
             .collect();
         self.inner
-            .assignments
-            .store(Arc::new(Assignments::from_namespace(
-                &NamespaceShardsAssignment {
-                    assignments,
-                    shard_key_router: ShardKeyRouter::Xxhash3 as i32,
-                    ..Default::default()
-                },
-            )));
-        self.inner.version.send_modify(|version| *version += 1);
+            .set_assignments(Assignments::from_namespace(&NamespaceShardsAssignment {
+                assignments,
+                shard_key_router: ShardKeyRouter::Xxhash3 as i32,
+                ..Default::default()
+            }));
     }
 }
 
@@ -427,6 +459,44 @@ mod tests {
             assert_eq!(Assignments::from_namespace(&namespace).key_order, order);
         }
         assert_eq!(Assignments::empty().key_order, KeyOrder::Legacy);
+    }
+
+    fn range_of(manager: &ShardManager, shard: i64) -> ShardRange {
+        manager
+            .get_shard_ranges()
+            .into_iter()
+            .find(|r| r.shard == shard)
+            .expect("shard is assigned")
+    }
+
+    fn successor_ids(manager: &ShardManager, removed: &ShardRange) -> Vec<i64> {
+        let mut ids: Vec<i64> = manager
+            .get_successors(removed)
+            .iter()
+            .map(|r| r.shard)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn successors_are_the_shards_overlapping_a_removed_range() {
+        let manager = ShardManager::detached_for_tests();
+        manager.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
+        let shard_0 = range_of(&manager, 0);
+        let shard_1 = range_of(&manager, 1);
+
+        // Shard 0 is split into shards 2 and 3.
+        manager.set_assignments_for_tests(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]);
+        assert_eq!(successor_ids(&manager, &shard_0), vec![2, 3]);
+        let shard_3 = range_of(&manager, 3);
+
+        // Shard 3 is split too: shard 0's successors are now 2, 4 and 5.
+        manager.set_assignments_for_tests(&[(1, 100, 199), (2, 0, 49), (4, 50, 74), (5, 75, 99)]);
+        assert_eq!(successor_ids(&manager, &shard_0), vec![2, 4, 5]);
+        assert_eq!(successor_ids(&manager, &shard_3), vec![4, 5]);
+        // A shard that still exists is its own only successor.
+        assert_eq!(successor_ids(&manager, &shard_1), vec![1]);
     }
 
     #[tokio::test(start_paused = true)]

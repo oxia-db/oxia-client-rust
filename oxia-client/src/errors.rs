@@ -103,7 +103,9 @@ pub enum OxiaError {
 
     /// A shard was split or merged while an operation targeted it. The client
     /// re-routes such operations to the new shard automatically, so this is not
-    /// normally observed. Retryable (by re-routing).
+    /// normally observed, except from a [`list`](crate::OxiaClient::list) or a
+    /// [`range_scan`](crate::OxiaClient::range_scan) that was opening its
+    /// streams, as in the Go client. Retryable (by re-routing).
     #[error("shard was split or merged")]
     ShardMoved,
 
