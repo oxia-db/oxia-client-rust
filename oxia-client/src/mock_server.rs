@@ -5,9 +5,9 @@
 //! one by default), so an unmodified [`OxiaClient`](crate::OxiaClient)
 //! connects to it exactly as it would to a real cluster. Tests script server
 //! behavior — delayed, missing, erroneous, or absent responses; torn streams;
-//! the keys each shard returns — and assert on what the server observed
-//! (write requests, batch sizes, connection counts) and on what the client
-//! surfaced.
+//! the keys each shard returns; shard splits — and assert on what the server
+//! observed (write requests, batch sizes, connection counts) and on what the
+//! client surfaced.
 
 use crate::proto;
 use crate::proto::oxia_client_server::{OxiaClient as OxiaService, OxiaClientServer};
@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tonic::{Request, Response, Status, Streaming};
+use tonic_types::{ErrorDetails, StatusExt};
 
 /// Scripted behavior of the write stream.
 #[derive(Clone, Copy, PartialEq)]
@@ -99,13 +100,61 @@ impl Default for Behavior {
 
 struct State {
     behavior: Mutex<Behavior>,
+    /// The shards of the namespace, as `(shard, min_hash, max_hash)`: those
+    /// of [`Behavior::shards`], then as [`MockOxia::split_shard`] left them.
+    shards: Mutex<Vec<(i64, u32, u32)>>,
+    /// The shards split away, with whether the requests for one get a
+    /// leader hint.
+    split_shards: Mutex<HashMap<i64, bool>>,
+    /// The requests that failed because their shard was split away.
+    split_shard_requests: AtomicU32,
     /// Every received `WriteRequest`, in order.
     write_requests: Mutex<Vec<proto::WriteRequest>>,
     /// Operations per received `WriteRequest` (puts + deletes + delete-ranges).
     write_batch_sizes: Mutex<Vec<usize>>,
     write_connections: AtomicU32,
-    /// Keeps assignment streams open for the lifetime of the mock.
-    assignment_senders: Mutex<Vec<mpsc::UnboundedSender<Result<proto::ShardAssignments, Status>>>>,
+    /// Keeps assignment streams open for the lifetime of the mock, with the
+    /// namespace that each one asked for.
+    assignment_senders: Mutex<Vec<(String, AssignmentSender)>>,
+}
+
+/// The sending end of a client's assignment stream.
+type AssignmentSender = mpsc::UnboundedSender<Result<proto::ShardAssignments, Status>>;
+
+impl State {
+    /// The current assignments of `namespace`, every shard led by `leader`.
+    fn assignments(&self, namespace: &str, leader: &str) -> proto::ShardAssignments {
+        let key_sorting = self.behavior.lock().expect("behavior lock").key_sorting;
+        let shards = self.shards.lock().expect("shards lock");
+        proto::ShardAssignments {
+            namespaces: [(
+                namespace.to_string(),
+                proto::NamespaceShardsAssignment {
+                    assignments: shards
+                        .iter()
+                        .map(|&(shard, min_hash_inclusive, max_hash_inclusive)| {
+                            proto::ShardAssignment {
+                                shard,
+                                leader: leader.to_string(),
+                                shard_boundaries: Some(
+                                    proto::shard_assignment::ShardBoundaries::Int32HashRange(
+                                        proto::Int32HashRange {
+                                            min_hash_inclusive,
+                                            max_hash_inclusive,
+                                        },
+                                    ),
+                                ),
+                            }
+                        })
+                        .collect(),
+                    shard_key_router: proto::ShardKeyRouter::Xxhash3 as i32,
+                    key_sorting: key_sorting as i32,
+                },
+            )]
+            .into(),
+            allowed_authorities: vec![],
+        }
+    }
 }
 
 /// A running mock server. Dropping it stops the server.
@@ -123,8 +172,17 @@ impl Drop for MockOxia {
 
 impl MockOxia {
     pub(crate) async fn start(behavior: Behavior) -> MockOxia {
+        let shards = (0..behavior.shards)
+            .map(|shard| {
+                let (min, max) = hash_range(shard, behavior.shards);
+                (shard.into(), min, max)
+            })
+            .collect();
         let state = Arc::new(State {
             behavior: Mutex::new(behavior),
+            shards: Mutex::new(shards),
+            split_shards: Mutex::new(HashMap::new()),
+            split_shard_requests: AtomicU32::new(0),
             write_requests: Mutex::new(Vec::new()),
             write_batch_sizes: Mutex::new(Vec::new()),
             write_connections: AtomicU32::new(0),
@@ -161,6 +219,46 @@ impl MockOxia {
 
     pub(crate) fn set_read_mode(&self, read: ReadMode) {
         self.state.behavior.lock().expect("behavior lock").read = read;
+    }
+
+    /// Splits `shard` into two new shards, with a half of its hash range
+    /// each, and returns their ids. Only the server sees the split until
+    /// [`publish_assignments`](Self::publish_assignments): from now on, a
+    /// read, a list or a range scan of `shard` fails as on the node of a
+    /// parent that the split deleted, with `NODE_IS_NOT_LEADER`, and with a
+    /// leader hint at this server when `leader_hint` is set, as when the
+    /// node's assignments still list the parent.
+    pub(crate) fn split_shard(&self, shard: i64, leader_hint: bool) -> (i64, i64) {
+        let mut shards = self.state.shards.lock().expect("shards lock");
+        let next = shards.iter().map(|&(id, _, _)| id).max().expect("shards") + 1;
+        let index = shards
+            .iter()
+            .position(|&(id, _, _)| id == shard)
+            .expect("the shard to split exists");
+        let (_, min, max) = shards.remove(index);
+        let middle = min + (max - min) / 2;
+        shards.push((next, min, middle));
+        shards.push((next + 1, middle + 1, max));
+        self.state
+            .split_shards
+            .lock()
+            .expect("split shards lock")
+            .insert(shard, leader_hint);
+        (next, next + 1)
+    }
+
+    /// Sends the current shard assignments to the connected clients.
+    pub(crate) fn publish_assignments(&self) {
+        let senders = self.state.assignment_senders.lock().expect("senders lock");
+        for (namespace, sender) in senders.iter() {
+            let _ = sender.unbounded_send(Ok(self.state.assignments(namespace, &self.address)));
+        }
+    }
+
+    /// The reads, lists and range scans that failed because their shard was
+    /// split away.
+    pub(crate) fn split_shard_requests(&self) -> u32 {
+        self.state.split_shard_requests.load(Ordering::SeqCst)
     }
 
     /// The `WriteRequest`s the server has received, in order.
@@ -300,6 +398,38 @@ impl Service {
         }
         (keys.into_iter().map(|key| vec![key]).collect(), included)
     }
+
+    /// Fails a read, a list or a range scan of a shard split away, as the
+    /// node of the deleted parent does: with `NODE_IS_NOT_LEADER`, and with a
+    /// leader hint at this server if [`MockOxia::split_shard`] asked for one.
+    fn reject_split_shard(&self, shard: Option<i64>) -> Result<(), Status> {
+        let Some(shard) = shard else {
+            return Ok(());
+        };
+        let split_shards = self.state.split_shards.lock().expect("split shards lock");
+        let Some(&leader_hint) = split_shards.get(&shard) else {
+            return Ok(());
+        };
+        drop(split_shards);
+        self.state
+            .split_shard_requests
+            .fetch_add(1, Ordering::SeqCst);
+        let metadata = if leader_hint {
+            HashMap::from([
+                ("shard".to_string(), shard.to_string()),
+                ("leader".to_string(), self.advertised.clone()),
+            ])
+        } else {
+            HashMap::new()
+        };
+        let mut details = ErrorDetails::new();
+        details.set_error_info("NODE_IS_NOT_LEADER", "oxia.io", metadata);
+        Err(Status::with_error_details(
+            tonic::Code::Aborted,
+            "node is not leader",
+            details,
+        ))
+    }
 }
 
 type Rpc<T> = Result<Response<T>, Status>;
@@ -312,56 +442,25 @@ impl OxiaService for Service {
         &self,
         request: Request<proto::ShardAssignmentsRequest>,
     ) -> Rpc<Self::GetShardAssignmentsStream> {
-        let (scripted_error, shards, key_sorting) = {
-            let behavior = self.state.behavior.lock().expect("behavior lock");
-            (
-                behavior.assignments_error,
-                behavior.shards,
-                behavior.key_sorting,
-            )
-        };
+        let scripted_error = self
+            .state
+            .behavior
+            .lock()
+            .expect("behavior lock")
+            .assignments_error;
         if let Some(code) = scripted_error {
             return Err(Status::new(code, "scripted assignments failure"));
         }
         let namespace = request.into_inner().namespace;
-        let assignments = proto::ShardAssignments {
-            namespaces: [(
-                namespace,
-                proto::NamespaceShardsAssignment {
-                    assignments: (0..shards)
-                        .map(|shard| {
-                            let (min_hash_inclusive, max_hash_inclusive) =
-                                hash_range(shard, shards);
-                            proto::ShardAssignment {
-                                shard: shard.into(),
-                                leader: self.advertised.clone(),
-                                shard_boundaries: Some(
-                                    proto::shard_assignment::ShardBoundaries::Int32HashRange(
-                                        proto::Int32HashRange {
-                                            min_hash_inclusive,
-                                            max_hash_inclusive,
-                                        },
-                                    ),
-                                ),
-                            }
-                        })
-                        .collect(),
-                    shard_key_router: proto::ShardKeyRouter::Xxhash3 as i32,
-                    key_sorting: key_sorting as i32,
-                },
-            )]
-            .into(),
-            allowed_authorities: vec![],
-        };
         let (tx, rx) = mpsc::unbounded();
-        tx.unbounded_send(Ok(assignments))
+        tx.unbounded_send(Ok(self.state.assignments(&namespace, &self.advertised)))
             .expect("first assignment");
         // Park the sender so the stream stays open, like a real server.
         self.state
             .assignment_senders
             .lock()
             .expect("senders lock")
-            .push(tx);
+            .push((namespace, tx));
         Ok(Response::new(rx.boxed()))
     }
 
@@ -422,6 +521,7 @@ impl OxiaService for Service {
     async fn read(&self, request: Request<proto::ReadRequest>) -> Rpc<Self::ReadStream> {
         let mode = self.state.behavior.lock().expect("behavior lock").read;
         let request = request.into_inner();
+        self.reject_split_shard(request.shard)?;
         let gets = request.gets;
         match mode {
             ReadMode::Hang => {
@@ -476,6 +576,7 @@ impl OxiaService for Service {
 
     async fn list(&self, request: Request<proto::ListRequest>) -> Rpc<Self::ListStream> {
         let request = request.into_inner();
+        self.reject_split_shard(request.shard)?;
         let (responses, end_inclusive) = self.scan(request.shard, request.end_inclusive);
         let responses: Vec<_> = responses
             .into_iter()
@@ -496,6 +597,7 @@ impl OxiaService for Service {
         request: Request<proto::RangeScanRequest>,
     ) -> Rpc<Self::RangeScanStream> {
         let request = request.into_inner();
+        self.reject_split_shard(request.shard)?;
         let (responses, end_inclusive) = self.scan(request.shard, request.end_inclusive);
         let through_index = request.secondary_index_name.is_some();
         let responses: Vec<_> = responses
@@ -1279,6 +1381,69 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Waits until the mock has failed `count` requests for shards split
+    /// away.
+    async fn until_split_shard_requests(mock: &MockOxia, count: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mock.split_shard_requests() < count {
+            assert!(
+                Instant::now() < deadline,
+                "no request reached the split shard"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The child of a split of the whole hash space into shards `left` and
+    /// `right` that owns `key`.
+    fn child_owning(key: &str, (left, right): (i64, i64)) -> i64 {
+        if crate::hash::xxh3_32(key) <= u32::MAX / 2 {
+            left
+        } else {
+            right
+        }
+    }
+
+    /// A get whose shard is split away before the get reaches the server:
+    /// the node of the deleted parent rejects it, with a leader hint at
+    /// itself while its assignments still list the parent, and once the
+    /// client has the new assignments, it sends the get to the child that
+    /// owns the key, rather than retry the parent until the request timeout.
+    /// A get that goes to every shard, as a floor get does, goes to the
+    /// children.
+    #[tokio::test]
+    async fn gets_reroute_across_a_split() {
+        use crate::ComparisonType::{Equal, Floor};
+
+        for (leader_hint, comparison) in
+            [(false, Equal), (true, Equal), (false, Floor), (true, Floor)]
+        {
+            let case = format!("leader hint: {leader_hint}, {comparison:?}");
+            let mock = MockOxia::start(Behavior {
+                read: ReadMode::ShardKeys,
+                // The children of shard 0.
+                shard_keys: HashMap::from([(1, vec!["a"]), (2, vec!["b"])]),
+                ..Behavior::default()
+            })
+            .await;
+            let client = connect(&mock, Duration::from_secs(5)).await;
+            let children = mock.split_shard(0, leader_hint);
+            assert_eq!(children, (1, 2));
+
+            let get = tokio::spawn(client.get("key").comparison(comparison).into_future());
+            until_split_shard_requests(&mock, 1).await;
+            mock.publish_assignments();
+            let found = get.await.expect("join").expect(&case);
+            let expected = match comparison {
+                Equal if child_owning("key", children) == 1 => "a",
+                Equal => "b",
+                // The largest of the children's answers.
+                _ => "b",
+            };
+            assert_eq!(found.key, expected, "{case}");
         }
     }
 }
