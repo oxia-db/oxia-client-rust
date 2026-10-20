@@ -988,7 +988,7 @@ impl OxiaClient {
         buffer_size: usize,
     ) -> Result<Notifications, OxiaError> {
         self.ensure_open()?;
-        let shards = self.inner.shard_manager.get_shard_ids();
+        let shards = self.inner.shard_manager.get_shard_ranges();
         let shard_count = shards.len();
         let (tx, rx) = mpsc::channel(buffer_size);
         let (init_tx, mut init_rx) = mpsc::channel(shard_count.max(1));

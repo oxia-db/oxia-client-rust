@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::tokio_stream::StreamExt;
@@ -103,6 +103,15 @@ impl Assignments {
 struct Inner {
     provider_manager: Arc<ProviderManager>,
     assignments: ArcSwap<Assignments>,
+    /// Signalled each time the assignments are replaced.
+    changed: watch::Sender<()>,
+}
+
+impl Inner {
+    fn set_assignments(&self, assignments: Assignments) {
+        self.assignments.store(Arc::new(assignments));
+        self.changed.send_replace(());
+    }
 }
 
 pub struct ShardManager {
@@ -162,9 +171,7 @@ async fn start_assignments_listener(
                         Some(Err(status)) => return classify_status(status, &init_sender).await,
                         Some(Ok(assignments)) => {
                             if let Some(na) = assignments.namespaces.get(&ns) {
-                                local_inner
-                                    .assignments
-                                    .store(Arc::new(Assignments::from_namespace(na)));
+                                local_inner.set_assignments(Assignments::from_namespace(na));
                                 if !init_sender.is_closed() {
                                     let _ = init_sender.send(Ok(())).await;
                                 }
@@ -208,6 +215,7 @@ impl ShardManager {
         let inner = Arc::new(Inner {
             provider_manager: options.provider_manager,
             assignments: ArcSwap::from_pointee(Assignments::empty()),
+            changed: watch::Sender::new(()),
         });
         let (init_tx, mut init_rx) = mpsc::channel::<Result<(), OxiaError>>(1);
         let assignment_handle = tokio::spawn(start_assignments_listener(
@@ -267,6 +275,7 @@ impl ShardManager {
                     std::time::Duration::from_secs(1),
                 )),
                 assignments: ArcSwap::from_pointee(Assignments::empty()),
+                changed: watch::Sender::new(()),
             }),
             context: CancellationToken::new(),
             assignment_handle: Mutex::new(None),
@@ -337,6 +346,11 @@ impl ShardManager {
             .collect()
     }
 
+    /// A receiver that sees each replacement of the assignments from now on.
+    pub(crate) fn subscribe_changes(&self) -> watch::Receiver<()> {
+        self.inner.changed.subscribe()
+    }
+
     /// Replaces the assignments with `shards`, as `(shard, min_hash,
     /// max_hash)`, as if the coordinator had published them.
     #[cfg(test)]
@@ -354,14 +368,11 @@ impl ShardManager {
             })
             .collect();
         self.inner
-            .assignments
-            .store(Arc::new(Assignments::from_namespace(
-                &NamespaceShardsAssignment {
-                    assignments,
-                    shard_key_router: ShardKeyRouter::Xxhash3 as i32,
-                    ..Default::default()
-                },
-            )));
+            .set_assignments(Assignments::from_namespace(&NamespaceShardsAssignment {
+                assignments,
+                shard_key_router: ShardKeyRouter::Xxhash3 as i32,
+                ..Default::default()
+            }));
     }
 }
 
