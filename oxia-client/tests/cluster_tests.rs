@@ -30,13 +30,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use testcontainers::core::ports::ContainerPort;
 use testcontainers::core::wait::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::runners::SyncRunner;
+use testcontainers::{Container, GenericImage, ImageExt};
 
 mod common;
 
 struct Cluster {
-    container: ContainerAsync<GenericImage>,
+    /// Shared with the container commands, which run off the clients' thread.
+    container: Arc<Container<GenericImage>>,
     /// The first server's public address — the client's bootstrap address.
     address: String,
 }
@@ -93,7 +94,7 @@ async fn start_cluster(servers: usize, initial_shards: u32) -> Cluster {
         let public = 6648 + i * 10;
         request = request.with_mapped_port(*host_port, ContainerPort::Tcp(public as u16));
     }
-    let container = request.start().await.expect("Failed to start Oxia cluster");
+    let container = request.start().expect("Failed to start Oxia cluster");
 
     // Wait for every server, not just the bootstrap one. A server rejects
     // all client requests, writes to the shards it leads included, with
@@ -107,7 +108,7 @@ async fn start_cluster(servers: usize, initial_shards: u32) -> Cluster {
     }
 
     Cluster {
-        container,
+        container: Arc::new(container),
         address: format!("localhost:{}", host_ports[0]),
     }
 }
@@ -117,9 +118,8 @@ impl Cluster {
     /// container. The CLI returns once the split has started; use
     /// [`Cluster::wait_until_removed`] to wait for it to complete.
     async fn split_shard(&self, shard: i64) -> String {
-        let mut result = self
-            .container
-            .exec(testcontainers::core::ExecCommand::new([
+        self.exec(
+            &[
                 "oxia",
                 "admin",
                 "shard",
@@ -128,11 +128,10 @@ impl Cluster {
                 "default",
                 "--shard",
                 &shard.to_string(),
-            ]))
-            .await
-            .expect("exec shard split");
-        let stdout = result.stdout_to_vec().await.expect("split stdout");
-        String::from_utf8_lossy(&stdout).to_string()
+            ],
+            "shard split",
+        )
+        .await
     }
 
     /// Waits until the coordinator no longer lists `shard` in the namespace
@@ -141,21 +140,20 @@ impl Cluster {
         let entry = format!("\"{shard}\": {{");
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let mut result = self
-                .container
-                .exec(testcontainers::core::ExecCommand::new([
-                    "oxia",
-                    "admin",
-                    "namespace",
-                    "get",
-                    "default",
-                    "--output",
-                    "json",
-                ]))
-                .await
-                .expect("exec namespace get");
-            let stdout = result.stdout_to_vec().await.expect("namespace stdout");
-            let status = String::from_utf8_lossy(&stdout);
+            let status = self
+                .exec(
+                    &[
+                        "oxia",
+                        "admin",
+                        "namespace",
+                        "get",
+                        "default",
+                        "--output",
+                        "json",
+                    ],
+                    "namespace get",
+                )
+                .await;
             assert!(status.contains("\"shards\""), "unexpected status: {status}");
             if !status.contains(&entry) {
                 return;
@@ -164,8 +162,27 @@ impl Cluster {
                 Instant::now() < deadline,
                 "shard {shard} is still listed: {status}"
             );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            compio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Runs `cmd` in the container and returns its stdout. The command runs
+    /// off the clients' thread, which the blocking container API would
+    /// otherwise hold up: the clients keep running meanwhile.
+    async fn exec(&self, cmd: &[&str], what: &'static str) -> String {
+        let container = self.container.clone();
+        let cmd: Vec<String> = cmd.iter().map(|arg| arg.to_string()).collect();
+        compio::runtime::spawn_blocking(move || {
+            let mut result = container
+                .exec(testcontainers::core::ExecCommand::new(cmd))
+                .unwrap_or_else(|e| panic!("exec {what}: {e}"));
+            let stdout = result
+                .stdout_to_vec()
+                .unwrap_or_else(|e| panic!("{what} stdout: {e}"));
+            String::from_utf8_lossy(&stdout).to_string()
+        })
+        .await
+        .expect("the container command runs")
     }
 }
 
@@ -186,7 +203,7 @@ async fn connect_with_retry(address: &str) -> OxiaClient {
                     Instant::now() < deadline,
                     "client could not connect to the cluster before the deadline: {e}"
                 );
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                compio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     }
@@ -195,7 +212,7 @@ async fn connect_with_retry(address: &str) -> OxiaClient {
 /// Routing and cross-shard queries against shards on different servers: every
 /// key round-trips, inequality gets reduce across shards on distinct nodes,
 /// and list / streaming range-scan come back in the global key order.
-#[tokio::test]
+#[compio::test]
 async fn test_multi_node_routing_and_global_order() {
     let cluster = start_cluster(2, 4).await;
     let client = connect_with_retry(&cluster.address).await;
@@ -268,7 +285,7 @@ async fn test_multi_node_routing_and_global_order() {
 /// deleted mid-session while a writer keeps writing; the client re-routes to
 /// the child shards transparently, no operation fails, and data written
 /// before the split stays readable through the children.
-#[tokio::test]
+#[compio::test]
 async fn test_shard_split_reroutes_live_client() {
     let cluster = start_cluster(2, 1).await;
     let client = connect_with_retry(&cluster.address).await;
@@ -281,7 +298,7 @@ async fn test_shard_split_reroutes_live_client() {
     }
 
     // Writer running across the split; every write must succeed.
-    let writer = tokio::spawn({
+    let writer = compio::runtime::spawn({
         let client = client.clone();
         async move {
             let mut written = 0u32;
@@ -294,7 +311,7 @@ async fn test_shard_split_reroutes_live_client() {
                 if written >= 200 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                compio::time::sleep(Duration::from_millis(10)).await;
             }
             written
         }
@@ -302,7 +319,7 @@ async fn test_shard_split_reroutes_live_client() {
 
     // Split the only shard while the writer runs. The children may even land
     // on different servers, forcing new connections.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    compio::time::sleep(Duration::from_millis(300)).await;
     let split_output = cluster.split_shard(0).await;
     assert!(
         split_output.contains("\"Error\":null"),
@@ -377,7 +394,7 @@ async fn is_deleted(client: &OxiaClient, key: &str) -> bool {
 /// while the delete range is still pending on the splitting shard, is not
 /// deleted by a second application. The keys written before the delete
 /// range are gone from every shard, the children included.
-#[tokio::test]
+#[compio::test]
 async fn test_delete_range_across_live_split() {
     const ROUNDS: usize = 1000;
     let cluster = start_cluster(2, 2).await;
@@ -399,7 +416,7 @@ async fn test_delete_range_across_live_split() {
     // holds the shard's writes back for its retry backoff, the copy of the
     // delete range in progress included, until they fail with `ShardMoved`
     // once the children have taken over.
-    let writer = tokio::spawn({
+    let writer = compio::runtime::spawn({
         let client = client.clone();
         let stop = stop.clone();
         async move {
@@ -414,7 +431,7 @@ async fn test_delete_range_across_live_split() {
     // Runs rounds until stopped, and returns how many it ran. Apart from its
     // delete range, a round only touches shard 1, so rounds keep starting
     // while shard 0 rejects writes.
-    let prober = tokio::spawn({
+    let prober = compio::runtime::spawn({
         let client = client.clone();
         let rounds = rounds.clone();
         let stop = stop.clone();
@@ -439,7 +456,7 @@ async fn test_delete_range_across_live_split() {
                         Instant::now() < deadline,
                         "round {i}: shard 1 did not apply the delete range"
                     );
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    compio::time::sleep(Duration::from_millis(1)).await;
                 }
                 client
                     .put(round.late.clone(), "late")
@@ -450,13 +467,13 @@ async fn test_delete_range_across_live_split() {
                     !is_deleted(&client, &round.late).await,
                     "round {i}: shard 1 applied the delete range a second time"
                 );
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                compio::time::sleep(Duration::from_millis(10)).await;
             }
             panic!("the split did not complete within {ROUNDS} rounds");
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    compio::time::sleep(Duration::from_millis(300)).await;
     let split_output = cluster.split_shard(0).await;
     assert!(
         split_output.contains("\"Error\":null"),
@@ -464,7 +481,7 @@ async fn test_delete_range_across_live_split() {
     );
     cluster.wait_until_removed(0).await;
     // A few more rounds, against the children.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    compio::time::sleep(Duration::from_millis(200)).await;
     stop.store(true, Ordering::SeqCst);
     writer.await.expect("writer");
     let ran = prober.await.expect("prober");
@@ -517,7 +534,7 @@ where
     loop {
         match scan().await {
             Err(OxiaError::ShardMoved) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                compio::time::sleep(Duration::from_millis(100)).await;
             }
             result => return result,
         }
@@ -532,7 +549,7 @@ where
 /// a range scan that opened a stream on the parent then fails with
 /// `ShardMoved` instead, as in the Go client, rather than with another error
 /// after the request timeout; run again, it reads the children.
-#[tokio::test]
+#[compio::test]
 async fn test_reads_across_live_split() {
     let cluster = start_cluster(2, 2).await;
     let client = connect_with_retry(&cluster.address).await;
@@ -579,15 +596,15 @@ async fn test_reads_across_live_split() {
 
     let stop = Arc::new(AtomicBool::new(false));
     // Each reader runs until stopped, and returns how many reads it made.
-    let lists = tokio::spawn({
+    let lists = compio::runtime::spawn({
         let (stop, keys, list) = (stop.clone(), keys.clone(), list.clone());
         async move { scan_until_stopped(&stop, "list", &keys, list).await }
     });
-    let range_scans = tokio::spawn({
+    let range_scans = compio::runtime::spawn({
         let (stop, keys, range_scan) = (stop.clone(), keys.clone(), range_scan.clone());
         async move { scan_until_stopped(&stop, "range scan", &keys, range_scan).await }
     });
-    let partition_lists = tokio::spawn({
+    let partition_lists = compio::runtime::spawn({
         let (stop, partitioned, partition_list) =
             (stop.clone(), partitioned.clone(), partition_list.clone());
         async move {
@@ -600,7 +617,7 @@ async fn test_reads_across_live_split() {
             .await
         }
     });
-    let gets = tokio::spawn({
+    let gets = compio::runtime::spawn({
         let (client, keys, stop) = (client.clone(), keys.clone(), stop.clone());
         async move {
             let mut reads = 0;
@@ -614,7 +631,7 @@ async fn test_reads_across_live_split() {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    compio::time::sleep(Duration::from_millis(300)).await;
     let split_output = cluster.split_shard(0).await;
     assert!(
         split_output.contains("\"Error\":null"),
@@ -622,7 +639,7 @@ async fn test_reads_across_live_split() {
     );
     cluster.wait_until_removed(0).await;
     // A few more reads, from the children.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    compio::time::sleep(Duration::from_millis(200)).await;
     stop.store(true, Ordering::SeqCst);
     for (kind, reader) in [
         ("lists", lists),
@@ -649,10 +666,10 @@ async fn test_reads_across_live_split() {
 /// The keys of the next `count` notifications, all creations, sorted, once
 /// no other arrives for a while: a duplicate would come after.
 async fn created_keys(notifications: &mut Notifications, count: usize) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut keys = Vec::with_capacity(count);
     while keys.len() < count {
-        let notification = tokio::time::timeout_at(deadline, notifications.recv())
+        let notification = compio::time::timeout_at(deadline, notifications.recv())
             .await
             .unwrap_or_else(|_| panic!("{} of the {count} notifications arrived", keys.len()))
             .expect("the subscription is open");
@@ -661,7 +678,7 @@ async fn created_keys(notifications: &mut Notifications, count: usize) -> Vec<St
             other => panic!("unexpected notification: {other:?}"),
         }
     }
-    let extra = tokio::time::timeout(Duration::from_millis(500), notifications.recv()).await;
+    let extra = compio::time::timeout(Duration::from_millis(500), notifications.recv()).await;
     assert!(extra.is_err(), "unexpected notification: {extra:?}");
     keys.sort();
     keys
@@ -674,7 +691,7 @@ async fn created_keys(notifications: &mut Notifications, count: usize) -> Vec<St
 /// single notification. Each follows the split to the children, after the
 /// last batch it received from the parent: both get the creation of every
 /// key written before, during and after the split, once.
-#[tokio::test]
+#[compio::test]
 async fn test_notifications_across_live_split() {
     let cluster = start_cluster(2, 1).await;
     let client = connect_with_retry(&cluster.address).await;
@@ -682,7 +699,7 @@ async fn test_notifications_across_live_split() {
     let mut lagging = client.notifications().buffer_size(1).await.unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
-    let writer = tokio::spawn({
+    let writer = compio::runtime::spawn({
         let (client, stop) = (client.clone(), stop.clone());
         async move {
             let mut written = Vec::new();
@@ -698,7 +715,7 @@ async fn test_notifications_across_live_split() {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    compio::time::sleep(Duration::from_millis(300)).await;
     let split_output = cluster.split_shard(0).await;
     assert!(
         split_output.contains("\"Error\":null"),
@@ -727,11 +744,7 @@ async fn test_notifications_across_live_split() {
 /// split completes, some of the puts are pending on the parent, and are
 /// handed off to the children, while the puts issued once the client has the
 /// new assignments go to the children directly.
-///
-/// Runs on a multi-thread runtime, as a pipelined writer would: the parent's
-/// batcher hands its writes off while the writes issued meanwhile are queued
-/// on other threads.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[compio::test]
 async fn test_shard_split_keeps_the_write_order() {
     const KEYS: usize = 16;
     // Enough puts in flight for the writer to keep issuing them while the
@@ -741,7 +754,7 @@ async fn test_shard_split_keeps_the_write_order() {
     let client = connect_with_retry(&cluster.address).await;
 
     let stop = Arc::new(AtomicBool::new(false));
-    let writer = tokio::spawn({
+    let writer = compio::runtime::spawn({
         let client = client.clone();
         let stop = stop.clone();
         async move {
@@ -771,13 +784,13 @@ async fn test_shard_split_keeps_the_write_order() {
                 };
                 succeeded += 1;
                 let count = put.version.modifications_count;
-                if let Some(&(last_seq, last_count)) = last_applied.get(&key) {
-                    if count <= last_count {
-                        out_of_order.push(format!(
-                            "{key}: put #{seq} applied as modification {count}, \
-                             before put #{last_seq} (modification {last_count})"
-                        ));
-                    }
+                if let Some(&(last_seq, last_count)) = last_applied.get(&key)
+                    && count <= last_count
+                {
+                    out_of_order.push(format!(
+                        "{key}: put #{seq} applied as modification {count}, \
+                         before put #{last_seq} (modification {last_count})"
+                    ));
                 }
                 last_applied.insert(key, (seq, count));
             }
@@ -785,7 +798,7 @@ async fn test_shard_split_keeps_the_write_order() {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    compio::time::sleep(Duration::from_millis(300)).await;
     let split_output = cluster.split_shard(0).await;
     assert!(
         split_output.contains("\"Error\":null"),
@@ -793,7 +806,7 @@ async fn test_shard_split_keeps_the_write_order() {
     );
     cluster.wait_until_removed(0).await;
     // Keep writing to the children for a while.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    compio::time::sleep(Duration::from_secs(1)).await;
     stop.store(true, Ordering::SeqCst);
 
     let (succeeded, failed, out_of_order) = writer.await.expect("writer task");

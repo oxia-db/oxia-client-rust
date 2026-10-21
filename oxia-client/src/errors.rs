@@ -175,12 +175,6 @@ impl From<tonic::Status> for OxiaError {
     }
 }
 
-impl From<tonic::transport::Error> for OxiaError {
-    fn from(err: tonic::transport::Error) -> Self {
-        OxiaError::Disconnected(err.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

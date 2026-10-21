@@ -17,7 +17,7 @@ use std::time::Duration;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 
-#[tokio::main]
+#[compio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -35,7 +35,7 @@ async fn main() {
     info!("Subscribed to notifications, performing operations...");
 
     // Spawn a task to listen for notifications
-    let listener = tokio::spawn(async move {
+    let listener = compio::runtime::spawn(async move {
         let mut count = 0;
         while let Some(notification) = notifications.recv().await {
             match &notification {
@@ -67,7 +67,7 @@ async fn main() {
     });
 
     // Give the notification listener time to connect
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    compio::time::sleep(Duration::from_millis(500)).await;
 
     // Perform operations that will generate notifications
     client.put("notify/key1", "value1").await.unwrap();
@@ -86,7 +86,7 @@ async fn main() {
     info!("Delete range notify/*");
 
     // Wait for listener to process notifications (with timeout)
-    let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
+    let _ = compio::time::timeout(Duration::from_secs(5), listener).await;
 
     client.close().await.unwrap();
 }

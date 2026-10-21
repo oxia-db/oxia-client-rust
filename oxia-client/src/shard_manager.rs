@@ -20,12 +20,12 @@ use crate::proto::shard_assignment::ShardBoundaries;
 use crate::proto::{NamespaceShardsAssignment, ShardAssignmentsRequest, ShardKeyRouter};
 use crate::provider_manager::ProviderManager;
 use crate::retry::{RetryError, retry_until_cancelled};
-use arc_swap::ArcSwap;
+use compio::runtime::JoinHandle;
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::tokio_stream::StreamExt;
 use tracing::info;
@@ -33,7 +33,7 @@ use tracing::info;
 pub struct ShardManagerOptions {
     pub address: String,
     pub namespace: String,
-    pub provider_manager: Arc<ProviderManager>,
+    pub provider_manager: Rc<ProviderManager>,
     pub request_timeout: Duration,
 }
 
@@ -79,13 +79,11 @@ impl ShardReplacement {
     }
 }
 
-/// An immutable snapshot of a namespace's shard assignments.
+/// A namespace's shard assignments.
 ///
-/// The [`ShardManager`] publishes a fresh snapshot atomically via [`ArcSwap`] on
-/// every update, so lookups never observe a half-applied table (the previous
-/// `DashMap` was cleared then repopulated, exposing a window where a key routed
-/// to nothing). Hash ranges are kept sorted so routing is a binary search rather
-/// than a linear scan.
+/// The [`ShardManager`] replaces the whole table on every update, so lookups
+/// never observe a half-applied table. Hash ranges are kept sorted so routing
+/// is a binary search rather than a linear scan.
 struct Assignments {
     shard_key_router: i32,
     /// The order of the keys in the shards, from the namespace's key sorting.
@@ -96,7 +94,7 @@ struct Assignments {
     leaders: HashMap<i64, String>,
     /// The shards removed from the assignments since the first ones, in the
     /// order they were removed.
-    replacements: Vec<Arc<ShardReplacement>>,
+    replacements: Vec<Rc<ShardReplacement>>,
 }
 
 impl Assignments {
@@ -153,7 +151,7 @@ impl Assignments {
             if successors.is_empty() {
                 continue;
             }
-            next.replacements.push(Arc::new(ShardReplacement {
+            next.replacements.push(Rc::new(ShardReplacement {
                 removed: removed.shard,
                 successors,
                 shard_key_router: next.shard_key_router,
@@ -173,23 +171,23 @@ impl Assignments {
 }
 
 struct Inner {
-    provider_manager: Arc<ProviderManager>,
-    assignments: ArcSwap<Assignments>,
+    provider_manager: Rc<ProviderManager>,
+    assignments: RefCell<Assignments>,
     /// Bumped after every update of `assignments`.
     version: watch::Sender<u64>,
 }
 
 impl Inner {
     fn set_assignments(&self, assignments: Assignments) {
-        self.assignments.store(Arc::new(assignments));
+        *self.assignments.borrow_mut() = assignments;
         self.version.send_modify(|version| *version += 1);
     }
 }
 
 pub struct ShardManager {
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
     context: CancellationToken,
-    assignment_handle: Mutex<Option<JoinHandle<()>>>,
+    assignment_handle: RefCell<Option<JoinHandle<()>>>,
 }
 
 impl Drop for ShardManager {
@@ -202,7 +200,7 @@ async fn start_assignments_listener(
     context: CancellationToken,
     address: String,
     namespace: String,
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
     init_tx: mpsc::Sender<Result<(), OxiaError>>,
 ) {
     let op = || {
@@ -244,7 +242,7 @@ async fn start_assignments_listener(
                         Some(Ok(assignments)) => {
                             if let Some(na) = assignments.namespaces.get(&ns) {
                                 // This task is the only one to store them.
-                                let next = local_inner.assignments.load().next(na);
+                                let next = local_inner.assignments.borrow().next(na);
                                 local_inner.set_assignments(next);
                                 if !init_sender.is_closed() {
                                     let _ = init_sender.send(Ok(())).await;
@@ -286,13 +284,13 @@ async fn classify_status(
 impl ShardManager {
     pub async fn new(options: ShardManagerOptions) -> Result<Self, OxiaError> {
         let context = CancellationToken::new();
-        let inner = Arc::new(Inner {
+        let inner = Rc::new(Inner {
             provider_manager: options.provider_manager,
-            assignments: ArcSwap::from_pointee(Assignments::empty()),
+            assignments: RefCell::new(Assignments::empty()),
             version: watch::Sender::new(0),
         });
         let (init_tx, mut init_rx) = mpsc::channel::<Result<(), OxiaError>>(1);
-        let assignment_handle = tokio::spawn(start_assignments_listener(
+        let assignment_handle = compio::runtime::spawn(start_assignments_listener(
             context.clone(),
             options.address,
             options.namespace,
@@ -303,7 +301,7 @@ impl ShardManager {
         // Fail fast: never hand back a client with an empty routing table. Wait
         // for the first assignment, bounded by the request timeout, and surface a
         // permanent error (bad namespace or credentials) as soon as it is known.
-        match tokio::time::timeout(options.request_timeout, init_rx.recv()).await {
+        match compio::time::timeout(options.request_timeout, init_rx.recv()).await {
             Ok(Some(Ok(()))) => {}
             Ok(Some(Err(err))) => {
                 context.cancel();
@@ -324,14 +322,14 @@ impl ShardManager {
         Ok(ShardManager {
             inner,
             context,
-            assignment_handle: Mutex::new(Some(assignment_handle)),
+            assignment_handle: RefCell::new(Some(assignment_handle)),
         })
     }
 
     pub async fn close(&self) -> Result<(), OxiaError> {
         self.context.cancel();
-        let mut handle_guard = self.assignment_handle.lock().await;
-        if let Some(handle) = handle_guard.take() {
+        let handle = self.assignment_handle.borrow_mut().take();
+        if let Some(handle) = handle {
             handle
                 .await
                 .map_err(|err| OxiaError::Disconnected(err.to_string()))?;
@@ -342,17 +340,17 @@ impl ShardManager {
     /// A manager with no assignments and no watcher, for unit tests of code
     /// paths that never resolve a leader.
     #[cfg(test)]
-    pub(crate) fn detached_for_tests() -> Arc<Self> {
-        Arc::new(ShardManager {
-            inner: Arc::new(Inner {
-                provider_manager: Arc::new(crate::provider_manager::ProviderManager::new(
+    pub(crate) fn detached_for_tests() -> Rc<Self> {
+        Rc::new(ShardManager {
+            inner: Rc::new(Inner {
+                provider_manager: Rc::new(crate::provider_manager::ProviderManager::new(
                     std::time::Duration::from_secs(1),
                 )),
-                assignments: ArcSwap::from_pointee(Assignments::empty()),
+                assignments: RefCell::new(Assignments::empty()),
                 version: watch::Sender::new(0),
             }),
             context: CancellationToken::new(),
-            assignment_handle: Mutex::new(None),
+            assignment_handle: RefCell::new(None),
         })
     }
 
@@ -361,7 +359,7 @@ impl ShardManager {
     pub fn get_leader(&self, shard_id: i64) -> Option<Node> {
         self.inner
             .assignments
-            .load()
+            .borrow()
             .leaders
             .get(&shard_id)
             .filter(|leader| !leader.is_empty())
@@ -381,11 +379,11 @@ impl ShardManager {
         let mut updates = self.inner.version.subscribe();
         // `self` owns the sender, so the wait cannot fail with `RecvError`.
         let updated = updates.wait_for(|current| *current != version);
-        let _ = tokio::time::timeout(timeout, updated).await;
+        let _ = compio::time::timeout(timeout, updated).await;
     }
 
     pub fn get_shard(&self, key: &str) -> Option<i64> {
-        let snapshot = self.inner.assignments.load();
+        let snapshot = self.inner.assignments.borrow();
         let code = shard_key_hash(snapshot.shard_key_router, key);
         snapshot.shard_for_hash(code).map(|r| r.shard)
     }
@@ -396,7 +394,7 @@ impl ShardManager {
     pub fn shard_exists(&self, shard_id: i64) -> bool {
         self.inner
             .assignments
-            .load()
+            .borrow()
             .leaders
             .contains_key(&shard_id)
     }
@@ -404,7 +402,7 @@ impl ShardManager {
     pub fn get_shard_ids(&self) -> Vec<i64> {
         self.inner
             .assignments
-            .load()
+            .borrow()
             .leaders
             .keys()
             .copied()
@@ -414,14 +412,14 @@ impl ShardManager {
     /// The order of the keys in the shards of the namespace, per the current
     /// assignments.
     pub(crate) fn key_order(&self) -> KeyOrder {
-        self.inner.assignments.load().key_order
+        self.inner.assignments.borrow().key_order
     }
 
     /// The shards removed from the assignments after the first `from` of
     /// them, in the order they were removed, each with the shards that
     /// replaced it.
-    pub(crate) fn replacements(&self, from: usize) -> Vec<Arc<ShardReplacement>> {
-        let assignments = self.inner.assignments.load();
+    pub(crate) fn replacements(&self, from: usize) -> Vec<Rc<ShardReplacement>> {
+        let assignments = self.inner.assignments.borrow();
         assignments
             .replacements
             .get(from..)
@@ -432,7 +430,7 @@ impl ShardManager {
     /// The hash ranges of all shards in the namespace, per the current
     /// assignments.
     pub(crate) fn get_shard_ranges(&self) -> Vec<ShardRange> {
-        self.inner.assignments.load().ranges.clone()
+        self.inner.assignments.borrow().ranges.clone()
     }
 
     /// The shards in the current assignments whose hash ranges overlap
@@ -441,7 +439,7 @@ impl ShardManager {
     pub(crate) fn get_successors(&self, removed: &ShardRange) -> Vec<ShardRange> {
         self.inner
             .assignments
-            .load()
+            .borrow()
             .ranges
             .iter()
             .filter(|range| range.overlaps(removed))
@@ -473,7 +471,7 @@ impl ShardManager {
         let next = self
             .inner
             .assignments
-            .load()
+            .borrow()
             .next(&NamespaceShardsAssignment {
                 assignments,
                 shard_key_router: ShardKeyRouter::Xxhash3 as i32,
@@ -639,7 +637,7 @@ mod tests {
             .next(&namespace(&[(0, 0, 99), (1, 100, 199)]))
             .next(&namespace(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]))
             .next(&namespace(&[(2, 0, 49), (3, 50, 99), (4, 100, 199)]));
-        manager.inner.assignments.store(Arc::new(assignments));
+        *manager.inner.assignments.borrow_mut() = assignments;
         let removed = |from| -> Vec<i64> {
             manager
                 .replacements(from)
@@ -691,25 +689,26 @@ mod tests {
         assert_eq!(successor_ids(&manager, &shard_1), vec![1]);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
     async fn wait_for_update_ends_on_update_or_timeout() {
         let manager = ShardManager::detached_for_tests();
         let version = manager.assignments_version();
+        let timeout = Duration::from_millis(300);
 
         // No update: the wait lasts the whole timeout.
-        let start = tokio::time::Instant::now();
-        manager
-            .wait_for_update(version, Duration::from_secs(5))
-            .await;
-        assert!(start.elapsed() >= Duration::from_secs(5));
+        let start = std::time::Instant::now();
+        manager.wait_for_update(version, timeout).await;
+        assert!(start.elapsed() >= timeout);
 
         // An update past `version` ends the wait, even one made before the
         // wait began.
         manager.inner.version.send_modify(|version| *version += 1);
-        let start = tokio::time::Instant::now();
-        manager
-            .wait_for_update(version, Duration::from_secs(5))
-            .await;
-        assert_eq!(start.elapsed(), Duration::ZERO);
+        let start = std::time::Instant::now();
+        manager.wait_for_update(version, timeout).await;
+        assert!(
+            start.elapsed() < timeout / 2,
+            "waited {:?}",
+            start.elapsed()
+        );
     }
 }

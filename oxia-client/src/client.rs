@@ -40,32 +40,30 @@ use crate::streams::{
 };
 use crate::types::{ComparisonType, GetResult};
 use bytes::Bytes;
-use dashmap::DashMap;
 use futures::StreamExt;
 use futures::future::try_join_all;
 use futures::stream::FuturesUnordered;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
 use tracing::warn;
 
 pub(crate) struct Inner {
     pub(crate) options: OxiaClientOptions,
-    pub(crate) provider_manager: Arc<ProviderManager>,
-    pub(crate) shard_manager: Arc<ShardManager>,
-    pub(crate) session_manager: Arc<SessionManager>,
-    batcher_deps: Arc<BatcherDeps>,
+    pub(crate) provider_manager: Rc<ProviderManager>,
+    pub(crate) shard_manager: Rc<ShardManager>,
+    pub(crate) session_manager: Rc<SessionManager>,
+    batcher_deps: Rc<BatcherDeps>,
     metrics: Metrics,
-    notification_managers: DashMap<u64, NotificationManager>,
-    sequence_managers: DashMap<u64, SequenceUpdatesManager>,
-    next_subscription_id: AtomicU64,
-    write_manager: Arc<WriteManager>,
-    read_batchers: DashMap<i64, Arc<ReadBatcher>>,
-    closed: AtomicBool,
+    notification_managers: RefCell<HashMap<u64, NotificationManager>>,
+    sequence_managers: RefCell<HashMap<u64, SequenceUpdatesManager>>,
+    next_subscription_id: Cell<u64>,
+    write_manager: Rc<WriteManager>,
+    read_batchers: RefCell<HashMap<i64, Rc<ReadBatcher>>>,
+    closed: Cell<bool>,
 }
 
 /// Which registry a [`SubscriptionGuard`] cleans up.
@@ -88,12 +86,25 @@ impl Drop for SubscriptionGuard {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
+        // Never panics on a registry in use: the handle may be dropped where
+        // a panic aborts, as compio drops the futures of cancelled tasks.
+        // Each manager is dropped once its registry is no longer borrowed.
         match self.kind {
             SubscriptionKind::Notification => {
-                inner.notification_managers.remove(&self.id);
+                let removed = inner
+                    .notification_managers
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut managers| managers.remove(&self.id));
+                drop(removed);
             }
             SubscriptionKind::Sequence => {
-                inner.sequence_managers.remove(&self.id);
+                let removed = inner
+                    .sequence_managers
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut managers| managers.remove(&self.id));
+                drop(removed);
             }
         }
     }
@@ -101,8 +112,10 @@ impl Drop for SubscriptionGuard {
 
 /// The Oxia client.
 ///
-/// Cheap to clone (all clones share one set of connections, batchers and
-/// sessions) and safe to share across tasks. Obtain one with
+/// Cheap to clone: all clones share one set of connections, batchers and
+/// sessions. The client lives on the thread that built it, inside its compio
+/// runtime: it is neither `Send` nor `Sync`, and the tasks of that thread
+/// share it (see [Runtime](crate#runtime)). Obtain one with
 /// [`OxiaClient::connect`] or [`OxiaClient::builder`]; every data operation
 /// returns a request builder that is executed by `.await`ing it.
 ///
@@ -119,7 +132,7 @@ impl Drop for SubscriptionGuard {
 /// need certainty about what was applied.
 #[derive(Clone)]
 pub struct OxiaClient {
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
 }
 
 impl fmt::Debug for OxiaClient {
@@ -170,10 +183,15 @@ impl OxiaClient {
         let provider_manager = ProviderManager::new(options.request_timeout);
         let provider_manager = provider_manager.with_auth(options.auth.clone());
         #[cfg(feature = "tls")]
-        let provider_manager =
-            provider_manager.with_tls(options.tls.as_ref().map(|tls| tls.to_client_tls_config()));
-        let provider_manager = Arc::new(provider_manager);
-        let shard_manager = Arc::new(
+        let provider_manager = provider_manager.with_tls(
+            options
+                .tls
+                .as_ref()
+                .map(|tls| tls.to_tls_config())
+                .transpose()?,
+        );
+        let provider_manager = Rc::new(provider_manager);
+        let shard_manager = Rc::new(
             ShardManager::new(ShardManagerOptions {
                 address: options.service_address.clone(),
                 namespace: options.namespace.clone(),
@@ -182,7 +200,7 @@ impl OxiaClient {
             })
             .await?,
         );
-        let batcher_deps = Arc::new(BatcherDeps {
+        let batcher_deps = Rc::new(BatcherDeps {
             namespace: options.namespace.clone(),
             shard_manager: shard_manager.clone(),
             provider_manager: provider_manager.clone(),
@@ -192,7 +210,7 @@ impl OxiaClient {
             max_read_batches_in_flight: options.max_read_batches_in_flight as usize,
             request_timeout: options.request_timeout,
         });
-        let session_manager = Arc::new(SessionManager::new(
+        let session_manager = Rc::new(SessionManager::new(
             options.identity.clone(),
             options.session_timeout,
             options.session_keep_alive,
@@ -201,7 +219,7 @@ impl OxiaClient {
             provider_manager.clone(),
         ));
         Ok(OxiaClient {
-            inner: Arc::new(Inner {
+            inner: Rc::new(Inner {
                 options,
                 provider_manager,
                 shard_manager,
@@ -209,11 +227,11 @@ impl OxiaClient {
                 write_manager: WriteManager::new(batcher_deps.clone()),
                 batcher_deps,
                 metrics,
-                notification_managers: DashMap::new(),
-                sequence_managers: DashMap::new(),
-                next_subscription_id: AtomicU64::new(0),
-                read_batchers: DashMap::new(),
-                closed: AtomicBool::new(false),
+                notification_managers: RefCell::new(HashMap::new()),
+                sequence_managers: RefCell::new(HashMap::new()),
+                next_subscription_id: Cell::new(0),
+                read_batchers: RefCell::new(HashMap::new()),
+                closed: Cell::new(false),
             }),
         })
     }
@@ -556,7 +574,7 @@ impl OxiaClient {
     /// # Ok(()) }
     /// ```
     pub async fn close(&self) -> Result<(), OxiaError> {
-        if self.inner.closed.swap(true, Ordering::SeqCst) {
+        if self.inner.closed.replace(true) {
             return Ok(());
         }
         let mut first_err: Option<OxiaError> = None;
@@ -567,31 +585,39 @@ impl OxiaClient {
             self.inner.write_manager.close().await,
             "write batcher",
         );
-        let read_shards: Vec<i64> = self.inner.read_batchers.iter().map(|e| *e.key()).collect();
+        // Each component is removed from its registry before it is awaited:
+        // a registry must not stay borrowed across an await, as the
+        // operations still running need it.
+        let read_shards: Vec<i64> = self.inner.read_batchers.borrow().keys().copied().collect();
         for shard in read_shards {
-            if let Some((_, batcher)) = self.inner.read_batchers.remove(&shard) {
+            let batcher = self.inner.read_batchers.borrow_mut().remove(&shard);
+            if let Some(batcher) = batcher {
                 track(&mut first_err, batcher.close().await, "read batcher");
             }
         }
         let notification_ids: Vec<u64> = self
             .inner
             .notification_managers
-            .iter()
-            .map(|e| *e.key())
+            .borrow()
+            .keys()
+            .copied()
             .collect();
         for id in notification_ids {
-            if let Some((_, manager)) = self.inner.notification_managers.remove(&id) {
+            let manager = self.inner.notification_managers.borrow_mut().remove(&id);
+            if let Some(manager) = manager {
                 track(&mut first_err, manager.shutdown().await, "notifications");
             }
         }
         let sequence_ids: Vec<u64> = self
             .inner
             .sequence_managers
-            .iter()
-            .map(|e| *e.key())
+            .borrow()
+            .keys()
+            .copied()
             .collect();
         for id in sequence_ids {
-            if let Some((_, manager)) = self.inner.sequence_managers.remove(&id) {
+            let manager = self.inner.sequence_managers.borrow_mut().remove(&id);
+            if let Some(manager) = manager {
                 track(&mut first_err, manager.shutdown().await, "sequence updates");
             }
         }
@@ -615,7 +641,7 @@ impl OxiaClient {
     // ---- internals shared by the request builders -------------------------
 
     pub(crate) fn ensure_open(&self) -> Result<(), OxiaError> {
-        if self.inner.closed.load(Ordering::Acquire) {
+        if self.inner.closed.get() {
             return Err(OxiaError::Closed);
         }
         Ok(())
@@ -701,13 +727,12 @@ impl OxiaClient {
     }
 
     /// Returns (creating on first use) the read batcher for a shard.
-    fn read_batcher(&self, shard_id: i64) -> Arc<ReadBatcher> {
+    fn read_batcher(&self, shard_id: i64) -> Rc<ReadBatcher> {
         self.inner
             .read_batchers
+            .borrow_mut()
             .entry(shard_id)
-            .or_insert_with(|| {
-                Arc::new(ReadBatcher::new(shard_id, self.inner.batcher_deps.clone()))
-            })
+            .or_insert_with(|| Rc::new(ReadBatcher::new(shard_id, self.inner.batcher_deps.clone())))
             .clone()
     }
 
@@ -740,10 +765,10 @@ impl OxiaClient {
         &self,
         rx: oneshot::Receiver<Result<Resp, OxiaError>>,
     ) -> Result<Resp, OxiaError> {
-        match tokio::time::timeout(self.request_timeout(), rx).await {
+        match compio::time::timeout(self.request_timeout(), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => {
-                if self.inner.closed.load(Ordering::Acquire) {
+                if self.inner.closed.get() {
                     Err(OxiaError::Closed)
                 } else {
                     Err(OxiaError::Disconnected(
@@ -770,27 +795,23 @@ impl OxiaClient {
             let request = request.clone();
             async move {
                 let order = self.inner.shard_manager.key_order();
-                let mut join_set = JoinSet::new();
-                for shard in self.inner.shard_manager.get_shard_ids() {
-                    let client = self.clone();
-                    let request = request.clone();
-                    join_set.spawn(async move {
-                        let requested_key = request.key.clone();
-                        let response = client.submit_get(shard, request).await?;
-                        check_status(response.status)?;
-                        GetResult::from_proto(response, Some(requested_key))
-                    });
-                }
-                let mut best: Option<GetResult> = None;
-                let mut join_error: Option<OxiaError> = None;
-                while let Some(joined) = join_set.join_next().await {
-                    let result = match joined {
-                        Ok(result) => result,
-                        Err(err) => {
-                            join_error = Some(OxiaError::Disconnected(err.to_string()));
-                            continue;
+                let mut gets: FuturesUnordered<_> = self
+                    .inner
+                    .shard_manager
+                    .get_shard_ids()
+                    .into_iter()
+                    .map(|shard| {
+                        let request = request.clone();
+                        async move {
+                            let requested_key = request.key.clone();
+                            let response = self.submit_get(shard, request).await?;
+                            check_status(response.status)?;
+                            GetResult::from_proto(response, Some(requested_key))
                         }
-                    };
+                    })
+                    .collect();
+                let mut best: Option<GetResult> = None;
+                while let Some(result) = gets.next().await {
                     match result {
                         Ok(candidate) => {
                             best = Some(match best.take() {
@@ -804,9 +825,6 @@ impl OxiaClient {
                         Err(OxiaError::KeyNotFound) => {}
                         Err(err) => return Err(err),
                     }
-                }
-                if let Some(err) = join_error {
-                    return Err(err);
                 }
                 best.ok_or(OxiaError::KeyNotFound)
             }
@@ -936,7 +954,7 @@ impl OxiaClient {
     where
         Fut: Future<Output = Result<tonic::Response<tonic::Streaming<Resp>>, tonic::Status>>,
     {
-        let deadline = tokio::time::Instant::now() + self.request_timeout();
+        let deadline = Instant::now() + self.request_timeout();
         let mut hint: Option<LeaderHint> = None;
         let mut attempt: u32 = 0;
         loop {
@@ -985,11 +1003,11 @@ impl OxiaClient {
                     // Opening a moved shard again cannot succeed.
                     if !decoded.error.is_retryable()
                         || matches!(decoded.error, OxiaError::ShardMoved)
-                        || tokio::time::Instant::now() + delay >= deadline
+                        || Instant::now() + delay >= deadline
                     {
                         return Err(decoded.error);
                     }
-                    tokio::time::sleep(delay).await;
+                    compio::time::sleep(delay).await;
                 }
             }
         }
@@ -1014,11 +1032,11 @@ impl OxiaClient {
         // Make the subscription live before returning, so no change in the
         // window between here and the first stream is missed. Returning early
         // (on error/timeout) drops `manager`, cancelling every listener.
-        let deadline = tokio::time::Instant::now() + self.request_timeout();
+        let deadline = Instant::now() + self.request_timeout();
         let mut ready = 0;
         while ready < shard_count {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, init_rx.recv()).await {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match compio::time::timeout(remaining, init_rx.recv()).await {
                 Ok(Some(Ok(()))) => ready += 1,
                 Ok(Some(Err(err))) => return Err(err),
                 Ok(None) => break,
@@ -1047,11 +1065,11 @@ impl OxiaClient {
             self.inner.provider_manager.clone(),
             tx,
         );
-        let id = self
-            .inner
-            .next_subscription_id
-            .fetch_add(1, Ordering::Relaxed);
-        self.inner.sequence_managers.insert(id, manager);
+        let id = self.next_subscription_id();
+        self.inner
+            .sequence_managers
+            .borrow_mut()
+            .insert(id, manager);
         Ok(SequenceUpdates::new(
             rx,
             self.subscription_guard(id, SubscriptionKind::Sequence),
@@ -1061,11 +1079,17 @@ impl OxiaClient {
     /// Registers a live notification manager so [`close`](Self::close) can shut
     /// it down, returning the id used to remove it when its handle is dropped.
     fn register_notification_manager(&self, manager: NotificationManager) -> u64 {
-        let id = self
-            .inner
-            .next_subscription_id
-            .fetch_add(1, Ordering::Relaxed);
-        self.inner.notification_managers.insert(id, manager);
+        let id = self.next_subscription_id();
+        self.inner
+            .notification_managers
+            .borrow_mut()
+            .insert(id, manager);
+        id
+    }
+
+    fn next_subscription_id(&self) -> u64 {
+        let id = self.inner.next_subscription_id.get();
+        self.inner.next_subscription_id.set(id + 1);
         id
     }
 
@@ -1073,7 +1097,7 @@ impl OxiaClient {
     /// (and thereby stops) the registered manager.
     fn subscription_guard(&self, id: u64, kind: SubscriptionKind) -> SubscriptionGuard {
         SubscriptionGuard {
-            inner: Arc::downgrade(&self.inner),
+            inner: Rc::downgrade(&self.inner),
             id,
             kind,
         }
@@ -1126,7 +1150,7 @@ where
     F: Fn(i64) -> Fut,
     Fut: Future<Output = Result<(), OxiaError>>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
     let send_copy = |range: ShardRange| {
         let copy = send(range.shard);
         async move { (range, copy.await) }
@@ -1138,7 +1162,7 @@ where
         covered.insert(range.shard);
         copies.push(send_copy(range));
     }
-    while let Some((range, result)) = tokio::time::timeout_at(deadline, copies.next())
+    while let Some((range, result)) = compio::time::timeout_at(deadline, copies.next())
         .await
         .map_err(|_| OxiaError::Timeout)?
     {
@@ -1219,10 +1243,10 @@ pub(crate) fn check_status(status: i32) -> Result<(), OxiaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compio::runtime::JoinHandle;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-    use tokio::task::JoinHandle;
 
-    const TIMEOUT: Duration = Duration::from_secs(10);
+    const TIMEOUT: Duration = Duration::from_secs(1);
 
     /// A copy sent by the broadcast: its shard, and the channel the test
     /// completes it through, as the write batcher would.
@@ -1241,13 +1265,13 @@ mod tests {
     /// Runs `send_to_every_shard` in the background, handing every copy it
     /// sends to the test.
     fn start_broadcast(
-        shards: Arc<ShardManager>,
+        shards: Rc<ShardManager>,
     ) -> (
         JoinHandle<Result<(), OxiaError>>,
         UnboundedReceiver<SentCopy>,
     ) {
         let (tx, rx) = unbounded_channel();
-        let broadcast = tokio::spawn(async move {
+        let broadcast = compio::runtime::spawn(async move {
             send_to_every_shard(&shards, TIMEOUT, |shard| {
                 let (done, result) = oneshot::channel();
                 let _ = tx.send(SentCopy { shard, done });
@@ -1266,7 +1290,7 @@ mod tests {
     async fn next_copies(copies: &mut UnboundedReceiver<SentCopy>, n: usize) -> Vec<SentCopy> {
         let mut received = Vec::with_capacity(n);
         for _ in 0..n {
-            let copy = tokio::time::timeout(Duration::from_secs(1), copies.recv())
+            let copy = compio::time::timeout(Duration::from_secs(1), copies.recv())
                 .await
                 .expect("the broadcast sends a copy")
                 .expect("the broadcast is running");
@@ -1281,7 +1305,7 @@ mod tests {
     }
 
     async fn assert_pending(broadcast: &mut JoinHandle<Result<(), OxiaError>>) {
-        let waited = tokio::time::timeout(Duration::from_millis(100), broadcast).await;
+        let waited = compio::time::timeout(Duration::from_millis(100), broadcast).await;
         assert!(waited.is_err(), "the broadcast must still be waiting");
     }
 
@@ -1291,7 +1315,7 @@ mod tests {
         broadcast: JoinHandle<Result<(), OxiaError>>,
         mut copies: UnboundedReceiver<SentCopy>,
     ) -> Result<(), OxiaError> {
-        let result = tokio::time::timeout(2 * TIMEOUT, broadcast).await;
+        let result = compio::time::timeout(2 * TIMEOUT, broadcast).await;
         let unexpected: Vec<i64> = std::iter::from_fn(|| copies.try_recv().ok())
             .map(|copy| copy.shard)
             .collect();
@@ -1304,7 +1328,7 @@ mod tests {
     /// Shard 0 is split into shards 2 and 3 before its copy runs: the copy is
     /// re-sent to the two children only, and shard 1, unrelated to the
     /// split, gets exactly one copy.
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
     async fn split_shard_copy_goes_to_its_children_only() {
         let shards = ShardManager::detached_for_tests();
         shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
@@ -1328,7 +1352,7 @@ mod tests {
 
     /// The broadcast succeeds only once every copy has, the rerouted ones
     /// included, whatever the order they complete in.
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
     async fn broadcast_waits_for_every_copy() {
         let shards = ShardManager::detached_for_tests();
         shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
@@ -1350,7 +1374,7 @@ mod tests {
 
     /// Any error but `ShardMoved` fails the broadcast at once, without
     /// waiting for the copies still in flight.
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
     async fn broadcast_fails_on_the_first_other_error() {
         let shards = ShardManager::detached_for_tests();
         shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
@@ -1374,7 +1398,7 @@ mod tests {
 
     /// Shard 3, a child of shard 0, is split in turn before the rerouted copy
     /// runs: that copy goes to shard 3's own children, by shard 3's range.
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
     async fn nested_split_reroutes_by_the_childs_range() {
         let shards = ShardManager::detached_for_tests();
         shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
@@ -1403,7 +1427,7 @@ mod tests {
     /// Assignments listing the children next to the parent they replace
     /// (published between the coordinator's updates): the parent's copy is
     /// not re-sent to the children, which have their own.
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
     async fn copy_is_not_resent_to_shards_that_have_one() {
         let shards = ShardManager::detached_for_tests();
         shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199), (2, 0, 49), (3, 50, 99)]);
@@ -1424,7 +1448,7 @@ mod tests {
 
     /// A copy whose shard's range has no owner in the assignments cannot be
     /// rerouted: the broadcast fails with `ShardMoved`.
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
     async fn copy_without_successors_fails_with_shard_moved() {
         let shards = ShardManager::detached_for_tests();
         shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
@@ -1442,16 +1466,16 @@ mod tests {
     }
 
     /// The timeout bounds the broadcast as a whole, rerouted copies included.
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
     async fn broadcast_is_bounded_by_the_timeout() {
-        let start = tokio::time::Instant::now();
+        let start = Instant::now();
         let shards = ShardManager::detached_for_tests();
         shards.set_assignments_for_tests(&[(0, 0, 99), (1, 100, 199)]);
         let (broadcast, mut copies) = start_broadcast(shards.clone());
 
         let [to_0, to_1]: [SentCopy; 2] = next_copies(&mut copies, 2).await.try_into().unwrap();
         to_1.complete(Ok(()));
-        tokio::time::sleep(TIMEOUT / 2).await;
+        compio::time::sleep(TIMEOUT / 2).await;
         shards.set_assignments_for_tests(&[(1, 100, 199), (2, 0, 49), (3, 50, 99)]);
         to_0.complete(Err(OxiaError::ShardMoved));
         // The rerouted copies never complete.

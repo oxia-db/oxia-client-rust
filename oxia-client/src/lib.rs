@@ -50,6 +50,38 @@
 //! # }
 //! ```
 //!
+//! # Runtime
+//!
+//! The client is single-threaded, for a thread-per-core design: it runs on a
+//! [compio](https://github.com/compio-rs/compio) runtime (io_uring on Linux,
+//! falling back to polling where io_uring is unavailable, as in most
+//! containers) and lives on the thread that built it. [`OxiaClient`], its
+//! request builders and its subscriptions are neither `Send` nor `Sync`; the
+//! tasks of that thread share the client by cloning it.
+//!
+//! ```no_run
+//! #[compio::main]
+//! async fn main() -> Result<(), oxia::OxiaError> {
+//!     let client = oxia::OxiaClient::connect("localhost:6648").await?;
+//!     client.put("greeting", "hello").await?;
+//!     client.close().await
+//! }
+//! ```
+//!
+//! - The client needs a compio 0.19 runtime (with the `macros` feature of
+//!   `compio` for `#[compio::main]`); [`OxiaClientBuilder::build`] fails
+//!   outside one.
+//! - Never block the client's thread: all the work of the client runs on it.
+//!   Run blocking work with `compio::runtime::spawn_blocking`.
+//! - To use more cores, run one client per thread, each in its own runtime:
+//!   an [`OxiaClientBuilder`] is `Send` and `Clone`, so clone it into each
+//!   thread. Each client has its own connections, sessions and batches.
+//! - An application on another runtime, such as tokio, runs the client on a
+//!   thread of its own, with a compio runtime, and sends it work over
+//!   channels.
+//! - Dropping the runtime without [`close`](OxiaClient::close) tears the
+//!   client down abruptly, as dropping the client does.
+//!
 //! # Concepts
 //!
 //! Each concept links to its Rust entry point and to the matching guide on the
@@ -174,6 +206,9 @@
 // `.unwrap()` in library code so every fallible result is handled. Unit tests
 // (compiled with `cfg(test)`) are exempt, where unwrapping is the idiom.
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
+// The client's state lives in `RefCell`s shared by the tasks of its thread: a
+// borrow held across an await would fail the next task that needs it.
+#![deny(clippy::await_holding_refcell_ref)]
 
 mod address;
 mod auth;
@@ -199,6 +234,7 @@ mod shard_manager;
 mod streams;
 #[cfg(feature = "tls")]
 mod tls;
+mod transport;
 mod types;
 
 #[allow(

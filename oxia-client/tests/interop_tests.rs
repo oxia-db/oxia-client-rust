@@ -25,8 +25,8 @@ use std::time::Duration;
 use testcontainers::core::ports::ContainerPort;
 use testcontainers::core::wait::WaitFor;
 use testcontainers::core::{CmdWaitFor, ExecCommand};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::runners::SyncRunner;
+use testcontainers::{Container, GenericImage, ImageExt};
 
 mod common;
 
@@ -36,7 +36,7 @@ const KEY_COUNT: usize = 24;
 
 /// Starts a standalone Oxia server with `SHARDS` shards so keys actually spread
 /// across shards and routing is exercised.
-async fn start_oxia_multishard() -> (ContainerAsync<GenericImage>, String) {
+async fn start_oxia_multishard() -> (Container<GenericImage>, String) {
     let container = common::oxia_image()
         .with_exposed_port(ContainerPort::Tcp(OXIA_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Started Grpc server"))
@@ -47,12 +47,10 @@ async fn start_oxia_multishard() -> (ContainerAsync<GenericImage>, String) {
             SHARDS.to_string(),
         ])
         .start()
-        .await
         .expect("Failed to start Oxia container");
 
     let host_port = container
         .get_host_port_ipv4(OXIA_PORT)
-        .await
         .expect("Failed to get host port");
     (container, format!("http://127.0.0.1:{}", host_port))
 }
@@ -68,14 +66,13 @@ async fn new_client(address: &str) -> OxiaClient {
 
 /// Runs `oxia client <args>` (the Go client) inside the container and returns
 /// its trimmed stdout. Requires exit code 0, so a failed get/put panics.
-async fn oxia_cli(container: &ContainerAsync<GenericImage>, args: &[&str]) -> String {
+async fn oxia_cli(container: &Container<GenericImage>, args: &[&str]) -> String {
     let mut cmd: Vec<String> = vec!["oxia".to_string(), "client".to_string()];
     cmd.extend(args.iter().map(|s| s.to_string()));
     let mut result = container
         .exec(ExecCommand::new(cmd).with_cmd_ready_condition(CmdWaitFor::exit_code(0)))
-        .await
         .unwrap_or_else(|e| panic!("`oxia client {}` failed: {e}", args.join(" ")));
-    let out = result.stdout_to_vec().await.expect("read exec stdout");
+    let out = result.stdout_to_vec().expect("read exec stdout");
     String::from_utf8(out)
         .expect("exec stdout is not utf-8")
         .trim_end()
@@ -84,7 +81,7 @@ async fn oxia_cli(container: &ContainerAsync<GenericImage>, args: &[&str]) -> St
 
 /// Rust writes across shards; the Go CLI must find every record on the shard it
 /// routes to. A routing-hash mismatch would make the Go get fail (KeyNotFound).
-#[tokio::test]
+#[compio::test]
 async fn rust_writes_go_reads_across_shards() {
     let (container, address) = start_oxia_multishard().await;
     let client = new_client(&address).await;
@@ -110,7 +107,7 @@ async fn rust_writes_go_reads_across_shards() {
 
 /// The Go CLI writes across shards; the Rust client must read every value back,
 /// confirming value/proto round-tripping across clients.
-#[tokio::test]
+#[compio::test]
 async fn go_writes_rust_reads_across_shards() {
     let (container, address) = start_oxia_multishard().await;
     let client = new_client(&address).await;

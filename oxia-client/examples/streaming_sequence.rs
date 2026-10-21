@@ -17,7 +17,7 @@ use std::time::Duration;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 
-#[tokio::main]
+#[compio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -42,7 +42,7 @@ async fn main() {
     info!("Subscribed to sequence updates for key '{}'", base_key);
 
     // Spawn a task to listen for sequence updates
-    let listener = tokio::spawn(async move {
+    let listener = compio::runtime::spawn(async move {
         let mut count = 0;
         while let Some(highest_key) = updates.recv().await {
             info!("Sequence update: highest_sequence_key={:?}", highest_key);
@@ -55,7 +55,7 @@ async fn main() {
     });
 
     // Give the listener time to connect
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    compio::time::sleep(Duration::from_millis(500)).await;
 
     // Put records with sequence key deltas - the server assigns sequential
     // suffixes and returns the generated key.
@@ -70,7 +70,7 @@ async fn main() {
     }
 
     // Wait for listener to process updates (with timeout)
-    let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
+    let _ = compio::time::timeout(Duration::from_secs(5), listener).await;
 
     // Cleanup
     client

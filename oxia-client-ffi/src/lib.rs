@@ -13,26 +13,97 @@
 // limitations under the License.
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+use futures::channel::mpsc;
+use futures::future::LocalBoxFuture;
+use futures::StreamExt;
 use std::ffi::{c_char, CStr, CString};
+use std::future::Future;
 use std::slice;
-use std::sync::OnceLock;
-use tokio::runtime::Runtime;
+use std::thread::JoinHandle;
 
 use oxia::OxiaClient as NativeOxiaClient;
-use oxia::OxiaError;
+use oxia::{OxiaClientBuilder, OxiaError};
 
-static GLOBAL_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+/// A call to run on the client's thread.
+type Job = Box<dyn FnOnce(NativeOxiaClient) -> LocalBoxFuture<'static, ()> + Send>;
 
-fn get_runtime() -> &'static Runtime {
-    GLOBAL_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    })
+/// A client and the thread it runs on. The native client is single-threaded:
+/// it lives on a thread of its own, in a compio runtime, and every call runs
+/// there while the calling thread waits for its result. Calls from several
+/// threads run concurrently, and batch together.
+pub struct OxiaClient {
+    jobs: mpsc::UnboundedSender<Job>,
+    worker: Option<JoinHandle<()>>,
 }
 
-pub struct OxiaClient(Box<NativeOxiaClient>);
+impl OxiaClient {
+    /// Builds the client on a new thread, and returns once it is connected.
+    fn start(builder: OxiaClientBuilder) -> Result<OxiaClient, OxiaError> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (jobs, mut job_rx) = mpsc::unbounded::<Job>();
+        let worker = std::thread::spawn(move || {
+            let runtime = match compio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(OxiaError::Disconnected(err.to_string())));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let client = match builder.build().await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+                while let Some(job) = job_rx.next().await {
+                    compio::runtime::spawn(job(client.clone())).detach();
+                }
+            });
+        });
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(OxiaClient {
+                jobs,
+                worker: Some(worker),
+            }),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(OxiaError::Closed),
+        }
+    }
+
+    /// Runs `op` on the client's thread and waits for its result.
+    fn run<T, F, Fut>(&self, op: F) -> Result<T, OxiaError>
+    where
+        T: Send + 'static,
+        F: FnOnce(NativeOxiaClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, OxiaError>> + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job: Job = Box::new(move |client| {
+            Box::pin(async move {
+                let _ = tx.send(op(client).await);
+            })
+        });
+        if self.jobs.unbounded_send(job).is_err() {
+            return Err(OxiaError::Closed);
+        }
+        // The job is dropped unanswered if the client's thread has stopped.
+        rx.recv().unwrap_or(Err(OxiaError::Closed))
+    }
+}
+
+impl Drop for OxiaClient {
+    fn drop(&mut self) {
+        // Stops the client's thread once the calls in progress have returned,
+        // tearing down the client.
+        self.jobs.close_channel();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
 #[repr(C)]
 pub struct COxiaClientOptions {
@@ -99,7 +170,6 @@ pub extern "C" fn oxia_client_new(
     options: COxiaClientOptions,
     client_ptr: *mut *mut OxiaClient,
 ) -> COxiaError {
-    let rt = get_runtime();
     let service_address = unsafe {
         CStr::from_ptr(options.service_address)
             .to_str()
@@ -113,18 +183,16 @@ pub extern "C" fn oxia_client_new(
             .to_string()
     };
 
-    let res = rt.block_on(async {
+    let res = OxiaClient::start(
         NativeOxiaClient::builder()
             .service_address(service_address)
-            .namespace(namespace)
-            .build()
-            .await
-    });
+            .namespace(namespace),
+    );
 
     match res {
         Ok(client) => {
             unsafe {
-                *client_ptr = Box::into_raw(Box::new(OxiaClient(Box::new(client))));
+                *client_ptr = Box::into_raw(Box::new(client));
             }
             COxiaError::Ok
         }
@@ -149,13 +217,10 @@ pub extern "C" fn oxia_client_put(
     value_len: usize,
     result_ptr: *mut *mut COxiaPutResult,
 ) -> COxiaError {
-    let rt = get_runtime();
     let key = unsafe { CStr::from_ptr(key).to_str().unwrap().to_string() };
     let value = unsafe { slice::from_raw_parts(value, value_len).to_vec() };
-    let result = rt.block_on(async {
-        let rust_client = unsafe { &*client };
-        rust_client.0.put(key, value).await
-    });
+    let rust_client = unsafe { &*client };
+    let result = rust_client.run(move |client| async move { client.put(key, value).await });
 
     match result {
         Ok(put_result) => {
@@ -178,12 +243,9 @@ pub extern "C" fn oxia_client_get(
     key: *const c_char,
     result_ptr: *mut *mut COxiaGetResult,
 ) -> COxiaError {
-    let rt = get_runtime();
     let key = unsafe { CStr::from_ptr(key).to_str().unwrap().to_string() };
-    let result = rt.block_on(async {
-        let rust_client = unsafe { &*client };
-        rust_client.0.get(key).await
-    });
+    let rust_client = unsafe { &*client };
+    let result = rust_client.run(move |client| async move { client.get(key).await });
 
     match result {
         Ok(get_result) => {
@@ -221,11 +283,8 @@ pub extern "C" fn oxia_client_get(
 
 #[no_mangle]
 pub extern "C" fn oxia_client_shutdown(client: *mut OxiaClient) -> COxiaError {
-    let rt = get_runtime();
-    let res = rt.block_on(async {
-        let rust_client = unsafe { Box::from_raw(client) };
-        rust_client.0.close().await
-    });
+    let rust_client = unsafe { Box::from_raw(client) };
+    let res = rust_client.run(|client| async move { client.close().await });
 
     match res {
         Ok(_) => COxiaError::Ok,
@@ -247,12 +306,9 @@ pub extern "C" fn oxia_put_result_free(result: *mut COxiaPutResult) {
 
 #[no_mangle]
 pub extern "C" fn oxia_client_delete(client: *const OxiaClient, key: *const c_char) -> COxiaError {
-    let rt = get_runtime();
     let key = unsafe { CStr::from_ptr(key).to_str().unwrap().to_string() };
-    let result = rt.block_on(async {
-        let rust_client = unsafe { &*client };
-        rust_client.0.delete(key).await
-    });
+    let rust_client = unsafe { &*client };
+    let result = rust_client.run(move |client| async move { client.delete(key).await });
 
     match result {
         Ok(_) => COxiaError::Ok,
@@ -273,7 +329,6 @@ pub extern "C" fn oxia_client_list(
     max_key_exclusive: *const c_char,
     result_ptr: *mut *mut COxiaListResult,
 ) -> COxiaError {
-    let rt = get_runtime();
     let min_key = unsafe {
         CStr::from_ptr(min_key_inclusive)
             .to_str()
@@ -286,10 +341,8 @@ pub extern "C" fn oxia_client_list(
             .unwrap()
             .to_string()
     };
-    let result = rt.block_on(async {
-        let rust_client = unsafe { &*client };
-        rust_client.0.list(min_key, max_key).await
-    });
+    let rust_client = unsafe { &*client };
+    let result = rust_client.run(move |client| async move { client.list(min_key, max_key).await });
 
     match result {
         Ok(keys) => {
@@ -338,7 +391,6 @@ pub extern "C" fn oxia_client_delete_range(
     min_key_inclusive: *const c_char,
     max_key_exclusive: *const c_char,
 ) -> COxiaError {
-    let rt = get_runtime();
     let min_key = unsafe {
         CStr::from_ptr(min_key_inclusive)
             .to_str()
@@ -351,10 +403,9 @@ pub extern "C" fn oxia_client_delete_range(
             .unwrap()
             .to_string()
     };
-    let result = rt.block_on(async {
-        let rust_client = unsafe { &*client };
-        rust_client.0.delete_range(min_key, max_key).await
-    });
+    let rust_client = unsafe { &*client };
+    let result =
+        rust_client.run(move |client| async move { client.delete_range(min_key, max_key).await });
 
     match result {
         Ok(_) => COxiaError::Ok,

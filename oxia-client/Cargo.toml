@@ -14,11 +14,11 @@
 
 [package]
 name = "oxia-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 
-description = "Native Rust client SDK for Oxia, a distributed key-value store. Provides an idiomatic, asynchronous API built on Tokio."
+description = "Native Rust client SDK for Oxia, a distributed key-value store. Provides an idiomatic, asynchronous API on a single-threaded compio runtime."
 license = "Apache-2.0"
 repository = "https://github.com/oxia-db/oxia-client-rust"
 homepage = "https://github.com/oxia-db/oxia-client-rust"
@@ -34,23 +34,28 @@ name = "oxia"
 tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
+compio = { workspace = true }
+cyper-core = { workspace = true }
+hyper = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+h2 = { workspace = true }
 thiserror = { workspace = true }
-dashmap = { workspace = true }
 xxhash-rust = { workspace = true }
 uuid = { workspace = true }
 tokio-util = { workspace = true }
-arc-swap = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 tonic-types = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 [features]
 # OpenTelemetry metrics (meter `oxia_client`); off by default for a zero-cost build.
 otel = ["dep:opentelemetry"]
 # TLS connections (rustls with the ring provider; OS trust roots by default).
-tls = ["tonic/tls-ring", "tonic/tls-native-roots"]
+tls = ["compio/rustls", "compio/ring", "dep:rustls-native-certs"]
 
 # Build docs.rs with all optional features so the `otel` API is documented,
 # with "Available on crate feature otel" badges (see the `docsrs` cfg in lib.rs).
@@ -60,15 +65,19 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
-# The `signal` feature is for the graceful_shutdown example's Ctrl-C handling.
-tokio = { workspace = true, features = ["signal"] }
+# Tests and examples run the client in a compio runtime; `signal` is for the
+# examples' Ctrl-C handling.
+compio = { workspace = true, features = ["macros", "signal"] }
+# The in-process mock server (src/mock_server.rs) serves tonic's gRPC server,
+# which runs on tokio, on threads of its own.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
+tonic = { workspace = true, features = ["transport", "router"] }
 jsonwebtoken = "9"
 serde = { version = "1", features = ["derive"] }
 opentelemetry_sdk = { workspace = true, features = ["metrics", "testing", "rt-tokio"] }
 rcgen = { workspace = true }
-testcontainers = "0.23"
+testcontainers = { version = "0.23", features = ["blocking"] }
 testcontainers-modules = "0.11"
-tokio-test = "0.4"
 
 [build-dependencies]
 tonic-build = { workspace = true }

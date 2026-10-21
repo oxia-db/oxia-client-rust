@@ -34,9 +34,10 @@
 //! - for reads, one future per in-flight read RPC.
 //!
 //! Writes on a shard must reach the server in submission order: every dispatch
-//! decision *and* the hand-off to the write stream happen under one mutex, so
-//! stream order always equals dispatch order. Reads have no ordering
-//! constraint and run as independent RPCs.
+//! decision *and* the hand-off to the write stream happen in one borrow of the
+//! batcher's state, with no await in between, so stream order always equals
+//! dispatch order. Reads have no ordering constraint and run as independent
+//! RPCs.
 //!
 //! The order also holds across a shard split ([`WriteManager`]): the batcher
 //! of the split shard hands its pending writes off to the batchers of the
@@ -51,11 +52,11 @@ use crate::provider_manager::ProviderManager;
 use crate::retry::retry_delay;
 use crate::server_error::{DecodedStatus, LeaderHint, decode_status};
 use crate::shard_manager::{ShardManager, ShardReplacement};
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 use futures::stream::FuturesUnordered;
-use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, Mutex, Weak};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::{Rc, Weak};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::{Notify, oneshot};
@@ -70,8 +71,8 @@ const WRITE_STREAM_HEADER_SHARD_ID: &str = "shard-id";
 /// Dependencies and limits shared by every shard batcher of one client.
 pub(crate) struct BatcherDeps {
     pub(crate) namespace: String,
-    pub(crate) shard_manager: Arc<ShardManager>,
-    pub(crate) provider_manager: Arc<ProviderManager>,
+    pub(crate) shard_manager: Rc<ShardManager>,
+    pub(crate) provider_manager: Rc<ProviderManager>,
     pub(crate) max_batch_size: usize,
     pub(crate) max_requests_per_batch: usize,
     pub(crate) max_write_batches_in_flight: usize,
@@ -158,6 +159,21 @@ impl<B> Queues<B> {
     fn is_drained(&self) -> bool {
         self.open.is_none() && self.ready.is_empty()
     }
+}
+
+/// Yields to the other tasks of the thread once, so that the operations they
+/// queue meanwhile coalesce into the open batch.
+async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
 }
 
 fn fail_all<Resp>(
@@ -396,9 +412,9 @@ struct WriteState {
 /// A shard removed from the assignments, after a split: the writes queued for
 /// it go to the shards that replaced it.
 struct Retired {
-    replacement: Arc<ShardReplacement>,
+    replacement: Rc<ShardReplacement>,
     /// The batchers of the shards in `replacement.successors`, in order.
-    successors: Vec<Arc<WriteBatcher>>,
+    successors: Vec<Rc<WriteBatcher>>,
     /// Whether the successors no longer hold their writes for this shard.
     released: bool,
 }
@@ -455,7 +471,7 @@ fn copy_delete_range(pending: PendingDeleteRange, shards: usize) -> Vec<PendingD
     let Pending { request, callback } = pending;
     let (copies, responses): (Vec<PendingDeleteRange>, Vec<_>) =
         (0..shards).map(|_| Pending::new(request.clone())).unzip();
-    tokio::spawn(async move {
+    compio::runtime::spawn(async move {
         let mut responses: FuturesUnordered<_> = responses.into_iter().collect();
         let mut result = None;
         while let Some(response) = responses.next().await {
@@ -473,7 +489,8 @@ fn copy_delete_range(pending: PendingDeleteRange, shards: usize) -> Vec<PendingD
         if let Some(result) = result {
             let _ = callback.send(result);
         }
-    });
+    })
+    .detach();
     copies
 }
 
@@ -490,20 +507,20 @@ pub(crate) fn absent_shard_error(deps: &BatcherDeps, shard: i64) -> OxiaError {
 
 pub(crate) struct WriteBatcher {
     shard: i64,
-    deps: Arc<BatcherDeps>,
+    deps: Rc<BatcherDeps>,
     /// Retires the shard once it leaves the assignments.
     manager: Weak<WriteManager>,
-    state: Mutex<WriteState>,
+    state: RefCell<WriteState>,
     drained: Notify,
 }
 
 impl WriteBatcher {
-    pub(crate) fn new(shard: i64, deps: Arc<BatcherDeps>, manager: Weak<WriteManager>) -> Self {
+    pub(crate) fn new(shard: i64, deps: Rc<BatcherDeps>, manager: Weak<WriteManager>) -> Self {
         WriteBatcher {
             shard,
             deps,
             manager,
-            state: Mutex::new(WriteState {
+            state: RefCell::new(WriteState {
                 queues: Queues::default(),
                 pending: VecDeque::new(),
                 retry: VecDeque::new(),
@@ -523,7 +540,7 @@ impl WriteBatcher {
 
     /// Queues a write. Infallible: failures are delivered through the
     /// operation's callback.
-    pub(crate) fn add(self: &Arc<Self>, op: WriteOp) {
+    pub(crate) fn add(self: &Rc<Self>, op: WriteOp) {
         let size = op.size();
         if size > self.deps.max_batch_size {
             op.fail(OxiaError::RequestTooLarge);
@@ -531,7 +548,7 @@ impl WriteBatcher {
         }
         let mut spawn_flusher = false;
         let rejected = {
-            let mut st = self.state.lock().expect("write batcher poisoned");
+            let mut st = self.state.borrow_mut();
             if st.queues.closed {
                 Some(op)
             } else if let Some(retired) = &st.retired {
@@ -587,16 +604,17 @@ impl WriteBatcher {
         }
         if spawn_flusher {
             let this = self.clone();
-            tokio::spawn(async move {
-                tokio::task::yield_now().await;
+            compio::runtime::spawn(async move {
+                yield_now().await;
                 this.flush_open();
-            });
+            })
+            .detach();
         }
     }
 
     /// Dispatches the open batch if the window still has capacity.
-    fn flush_open(self: &Arc<Self>) {
-        let mut st = self.state.lock().expect("write batcher poisoned");
+    fn flush_open(self: &Rc<Self>) {
+        let mut st = self.state.borrow_mut();
         st.queues.flush_scheduled = false;
         self.fill_capacity(&mut st);
     }
@@ -618,8 +636,8 @@ impl WriteBatcher {
     /// those handed off by the shards this one replaced, then sealed batches,
     /// then the open one — while the window has capacity. Retries whose
     /// deadline has passed fail here instead of being re-sent. Must be called
-    /// with the state lock held.
-    fn fill_capacity(self: &Arc<Self>, st: &mut WriteState) {
+    /// with the state borrowed.
+    fn fill_capacity(self: &Rc<Self>, st: &mut WriteState) {
         while self.can_dispatch(st) {
             if let Some(inflight) = st.retry.pop_front() {
                 if inflight.first_dispatch.elapsed() >= self.deps.request_timeout {
@@ -644,9 +662,9 @@ impl WriteBatcher {
     }
 
     /// Hands a batch to the shard's write stream. The pending-callback push and
-    /// the stream send happen under the state lock, so response FIFO order and
-    /// server-side apply order both equal dispatch order.
-    fn dispatch_locked(self: &Arc<Self>, st: &mut WriteState, body: WriteBody) {
+    /// the stream send happen in one borrow of the state, so response FIFO
+    /// order and server-side apply order both equal dispatch order.
+    fn dispatch_locked(self: &Rc<Self>, st: &mut WriteState, body: WriteBody) {
         let (request, callbacks) = body.into_request(self.shard);
         self.send_locked(
             st,
@@ -659,8 +677,8 @@ impl WriteBatcher {
     }
 
     /// Sends an in-flight batch (fresh or retried) on the stream, creating the
-    /// stream and pump as needed. Must be called with the state lock held.
-    fn send_locked(self: &Arc<Self>, st: &mut WriteState, inflight: InFlightWrite) {
+    /// stream and pump as needed. Must be called with the state borrowed.
+    fn send_locked(self: &Rc<Self>, st: &mut WriteState, inflight: InFlightWrite) {
         let request = inflight.request.clone();
         st.pending.push_back(inflight);
 
@@ -674,7 +692,8 @@ impl WriteBatcher {
             st.parked = None;
             st.pump_running = true;
             let this = self.clone();
-            tokio::spawn(async move { this.run_pump(PumpInit::Connect(rx)).await });
+            compio::runtime::spawn(async move { this.run_pump(PumpInit::Connect(rx)).await })
+                .detach();
         } else if !st.pump_running {
             let streaming = st
                 .parked
@@ -683,12 +702,15 @@ impl WriteBatcher {
             st.pump_running = true;
             debug!(shard = self.shard, "resuming write-stream pump");
             let this = self.clone();
-            tokio::spawn(async move { this.run_pump(PumpInit::Resume(Box::new(streaming))).await });
+            compio::runtime::spawn(async move {
+                this.run_pump(PumpInit::Resume(Box::new(streaming))).await
+            })
+            .detach();
         }
 
         if let Some(tx) = &st.stream_tx {
             // The receiver lives until the pump's death path clears
-            // `stream_tx` under this same lock, so this send cannot fail.
+            // `stream_tx` in a borrow of the state, so this send cannot fail.
             let _ = tx.send(request);
         }
     }
@@ -698,20 +720,20 @@ impl WriteBatcher {
     ///
     /// [`release`]: WriteBatcher::release
     fn hold(&self) {
-        self.state.lock().expect("write batcher poisoned").held += 1;
+        self.state.borrow_mut().held += 1;
     }
 
     /// A shard that this one replaced has handed off all its writes.
-    fn release(self: &Arc<Self>) {
-        let mut st = self.state.lock().expect("write batcher poisoned");
+    fn release(self: &Rc<Self>) {
+        let mut st = self.state.borrow_mut();
         st.held -= 1;
         self.make_progress(&mut st);
     }
 
     /// Takes over writes that were pending on a shard that this one replaced:
     /// they go out before the writes queued here.
-    fn hand_off(self: &Arc<Self>, ops: Vec<WriteOp>) {
-        let mut st = self.state.lock().expect("write batcher poisoned");
+    fn hand_off(self: &Rc<Self>, ops: Vec<WriteOp>) {
+        let mut st = self.state.borrow_mut();
         for op in ops {
             let size = op.size();
             let fits = st.handed_off.back().is_some_and(|body| {
@@ -732,15 +754,15 @@ impl WriteBatcher {
 
     /// Retires the shard, removed from the assignments: from now on, its
     /// writes go to the shards that replaced it.
-    fn retire(self: &Arc<Self>, retired: Retired) {
-        let mut st = self.state.lock().expect("write batcher poisoned");
+    fn retire(self: &Rc<Self>, retired: Retired) {
+        let mut st = self.state.borrow_mut();
         st.retired = Some(retired);
         self.make_progress(&mut st);
     }
 
     /// Sends what the window allows, or, once the shard is retired, hands it
-    /// off. Must be called with the state lock held.
-    fn make_progress(self: &Arc<Self>, st: &mut WriteState) {
+    /// off. Must be called with the state borrowed.
+    fn make_progress(self: &Rc<Self>, st: &mut WriteState) {
         if st.retired.is_some() {
             self.drain_retired(st);
         } else {
@@ -756,8 +778,8 @@ impl WriteBatcher {
     /// those queued here (the batches to retry, then the writes handed off to
     /// this shard), then, once the shards it replaced have handed off theirs,
     /// the writes queued here. Then releases the successors. Must be called
-    /// with the state lock held.
-    fn drain_retired(self: &Arc<Self>, st: &mut WriteState) {
+    /// with the state borrowed.
+    fn drain_retired(self: &Rc<Self>, st: &mut WriteState) {
         if st.retired.is_none() || st.pump_running {
             return;
         }
@@ -804,12 +826,12 @@ impl WriteBatcher {
     /// The stream failed, or could not be created. A shard that has left the
     /// assignments is retired first, so that its writes go to the shards
     /// that replaced it rather than to a new stream.
-    fn stream_failed(self: &Arc<Self>, decoded: DecodedStatus, version: u64) {
+    fn stream_failed(self: &Rc<Self>, decoded: DecodedStatus, version: u64) {
         self.retire_if_removed();
         self.pump_died(decoded, version);
     }
 
-    async fn run_pump(self: Arc<Self>, init: PumpInit) {
+    async fn run_pump(self: Rc<Self>, init: PumpInit) {
         let version = self.deps.shard_manager.assignments_version();
         let mut streaming = match init {
             PumpInit::Resume(streaming) => *streaming,
@@ -822,7 +844,7 @@ impl WriteBatcher {
             },
         };
         loop {
-            let next = tokio::time::timeout(self.deps.request_timeout, streaming.next()).await;
+            let next = compio::time::timeout(self.deps.request_timeout, streaming.next()).await;
             let response = match next {
                 // No response within the request timeout while batches are in
                 // flight: the stream is wedged. Not retried — the batch may
@@ -838,7 +860,7 @@ impl WriteBatcher {
                 Ok(Some(Ok(response))) => response,
             };
 
-            let mut st = self.state.lock().expect("write batcher poisoned");
+            let mut st = self.state.borrow_mut();
             // A response confirms the current leader and a healthy stream.
             st.failure_streak = 0;
             st.hint = None;
@@ -879,7 +901,7 @@ impl WriteBatcher {
         rx: UnboundedReceiver<proto::WriteRequest>,
     ) -> Result<Streaming<proto::WriteResponse>, DecodedStatus> {
         let hinted = {
-            let st = self.state.lock().expect("write batcher poisoned");
+            let st = self.state.borrow_mut();
             st.hint
                 .as_ref()
                 .and_then(|hint| hint.address_for(self.shard).map(str::to_string))
@@ -939,11 +961,11 @@ impl WriteBatcher {
     ///
     /// Once the shard is retired, the batches that would be retried are
     /// handed off to the shards that replaced it instead.
-    fn pump_died(self: &Arc<Self>, decoded: DecodedStatus, version: u64) {
+    fn pump_died(self: &Rc<Self>, decoded: DecodedStatus, version: u64) {
         let DecodedStatus { error, leader_hint } = decoded;
         warn!(shard = self.shard, error = %error, "write stream failed");
         let (expired, failed, drained) = {
-            let mut st = self.state.lock().expect("write batcher poisoned");
+            let mut st = self.state.borrow_mut();
             st.pump_running = false;
             st.stream_tx = None;
             st.parked = None;
@@ -989,7 +1011,7 @@ impl WriteBatcher {
                 st.reconnecting = true;
                 let delay = retry_delay(st.failure_streak - 1);
                 let this = self.clone();
-                tokio::spawn(async move {
+                compio::runtime::spawn(async move {
                     this.deps
                         .shard_manager
                         .wait_for_update(version, delay)
@@ -997,10 +1019,11 @@ impl WriteBatcher {
                     // A shard that has left the assignments hands off its
                     // writes rather than reconnecting.
                     this.retire_if_removed();
-                    let mut st = this.state.lock().expect("write batcher poisoned");
+                    let mut st = this.state.borrow_mut();
                     st.reconnecting = false;
                     this.fill_capacity(&mut st);
-                });
+                })
+                .detach();
             } else {
                 failed = st.pending.drain(..).map(|i| i.callbacks).collect();
                 // Queued batches still get a fresh stream; each batch fails at
@@ -1031,9 +1054,9 @@ impl WriteBatcher {
     /// Flushes everything queued and waits (bounded) for in-flight batches to
     /// complete, then tears the stream down. Late leftovers fail with
     /// [`OxiaError::Closed`].
-    pub(crate) async fn close(self: &Arc<Self>) -> Result<(), OxiaError> {
+    pub(crate) async fn close(self: &Rc<Self>) -> Result<(), OxiaError> {
         {
-            let mut st = self.state.lock().expect("write batcher poisoned");
+            let mut st = self.state.borrow_mut();
             st.queues.closed = true;
             // A retired shard hands its writes off instead, once none is in
             // flight.
@@ -1056,18 +1079,18 @@ impl WriteBatcher {
                 }
             }
         }
-        let deadline = tokio::time::Instant::now() + self.deps.request_timeout;
+        let deadline = Instant::now() + self.deps.request_timeout;
         loop {
             let notified = self.drained.notified();
             {
-                let st = self.state.lock().expect("write batcher poisoned");
+                let st = self.state.borrow_mut();
                 if self.is_drained(&st) {
                     break;
                 }
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            if compio::time::timeout_at(deadline, notified).await.is_err() {
                 let leftovers: Vec<WriteCallbacks> = {
-                    let mut st = self.state.lock().expect("write batcher poisoned");
+                    let mut st = self.state.borrow_mut();
                     let mut leftovers: Vec<WriteCallbacks> =
                         st.pending.drain(..).map(|i| i.callbacks).collect();
                     leftovers.extend(st.retry.drain(..).map(|i| i.callbacks));
@@ -1090,7 +1113,7 @@ impl WriteBatcher {
         }
         // Drop the stream: the request channel closes, the server completes
         // the RPC, and any parked/pumping response stream winds down.
-        let mut st = self.state.lock().expect("write batcher poisoned");
+        let mut st = self.state.borrow_mut();
         st.stream_tx = None;
         st.parked = None;
         Ok(())
@@ -1107,20 +1130,20 @@ impl WriteBatcher {
 /// write issued once the client has the new assignments is not applied
 /// before an older write to the same key.
 pub(crate) struct WriteManager {
-    deps: Arc<BatcherDeps>,
-    batchers: DashMap<i64, Arc<WriteBatcher>>,
+    deps: Rc<BatcherDeps>,
+    batchers: RefCell<HashMap<i64, Rc<WriteBatcher>>>,
     /// The number of shard replacements processed, in the order the shard
     /// manager recorded them.
-    processed: Mutex<usize>,
+    processed: RefCell<usize>,
     this: Weak<WriteManager>,
 }
 
 impl WriteManager {
-    pub(crate) fn new(deps: Arc<BatcherDeps>) -> Arc<Self> {
-        Arc::new_cyclic(|this| WriteManager {
+    pub(crate) fn new(deps: Rc<BatcherDeps>) -> Rc<Self> {
+        Rc::new_cyclic(|this| WriteManager {
             deps,
-            batchers: DashMap::new(),
-            processed: Mutex::new(0),
+            batchers: RefCell::new(HashMap::new()),
+            processed: RefCell::new(0),
             this: this.clone(),
         })
     }
@@ -1131,8 +1154,8 @@ impl WriteManager {
         self.batcher(shard).add(op);
     }
 
-    fn batcher(&self, shard: i64) -> Arc<WriteBatcher> {
-        if let Some(batcher) = self.batchers.get(&shard) {
+    fn batcher(&self, shard: i64) -> Rc<WriteBatcher> {
+        if let Some(batcher) = self.batchers.borrow().get(&shard) {
             return batcher.clone();
         }
         // The shard's first write. A shard that replaced split ones must hold
@@ -1146,21 +1169,20 @@ impl WriteManager {
     fn get_or_create(
         &self,
         shard: i64,
-        init: impl FnOnce(&Arc<WriteBatcher>),
-    ) -> (Arc<WriteBatcher>, bool) {
-        match self.batchers.entry(shard) {
-            Entry::Occupied(entry) => (entry.get().clone(), false),
-            Entry::Vacant(entry) => {
-                let batcher = Arc::new(WriteBatcher::new(
-                    shard,
-                    self.deps.clone(),
-                    self.this.clone(),
-                ));
-                init(&batcher);
-                entry.insert(batcher.clone());
-                (batcher, true)
-            }
+        init: impl FnOnce(&Rc<WriteBatcher>),
+    ) -> (Rc<WriteBatcher>, bool) {
+        if let Some(batcher) = self.batchers.borrow().get(&shard) {
+            return (batcher.clone(), false);
         }
+        let batcher = Rc::new(WriteBatcher::new(
+            shard,
+            self.deps.clone(),
+            self.this.clone(),
+        ));
+        // With the map not borrowed: retiring a batcher reaches others.
+        init(&batcher);
+        self.batchers.borrow_mut().insert(shard, batcher.clone());
+        (batcher, true)
     }
 
     /// Retires the shards removed from the assignments since the last call,
@@ -1169,10 +1191,11 @@ impl WriteManager {
     /// hold their own writes until then. A removed shard without a batcher
     /// gets one, which forwards the writes still routed to it.
     fn process_replacements(&self) {
-        let mut processed = self.processed.lock().expect("write manager poisoned");
+        // Borrowed throughout, so each replacement is processed once.
+        let mut processed = self.processed.borrow_mut();
         for replacement in self.deps.shard_manager.replacements(*processed) {
             *processed += 1;
-            let successors: Vec<Arc<WriteBatcher>> = replacement
+            let successors: Vec<Rc<WriteBatcher>> = replacement
                 .successors
                 .iter()
                 .map(|range| {
@@ -1215,17 +1238,17 @@ impl WriteManager {
                 .iter()
                 .map(|replacement| replacement.removed)
                 .collect();
-            shards.extend(self.batchers.iter().map(|entry| *entry.key()));
+            shards.extend(self.batchers.borrow().keys().copied());
             shards.retain(|shard| !closed.contains(shard));
             if shards.is_empty() {
                 return Ok(());
             }
             for shard in shards {
-                let batcher = self.batchers.get(&shard).map(|entry| entry.clone());
-                if closed.insert(shard) {
-                    if let Some(batcher) = batcher {
-                        batcher.close().await?;
-                    }
+                let batcher = self.batchers.borrow().get(&shard).cloned();
+                if closed.insert(shard)
+                    && let Some(batcher) = batcher
+                {
+                    batcher.close().await?;
                 }
             }
         }
@@ -1256,17 +1279,17 @@ struct ReadState {
 /// independent `Read` RPC, up to `max_read_batches_in_flight` concurrently.
 pub(crate) struct ReadBatcher {
     shard: i64,
-    deps: Arc<BatcherDeps>,
-    state: Mutex<ReadState>,
+    deps: Rc<BatcherDeps>,
+    state: RefCell<ReadState>,
     drained: Notify,
 }
 
 impl ReadBatcher {
-    pub(crate) fn new(shard: i64, deps: Arc<BatcherDeps>) -> Self {
+    pub(crate) fn new(shard: i64, deps: Rc<BatcherDeps>) -> Self {
         ReadBatcher {
             shard,
             deps,
-            state: Mutex::new(ReadState {
+            state: RefCell::new(ReadState {
                 queues: Queues::default(),
                 in_flight: 0,
             }),
@@ -1275,10 +1298,10 @@ impl ReadBatcher {
     }
 
     /// Queues a get. Infallible: failures are delivered through the callback.
-    pub(crate) fn add(self: &Arc<Self>, get: PendingGet) {
+    pub(crate) fn add(self: &Rc<Self>, get: PendingGet) {
         let mut spawn_flusher = false;
         let rejected = {
-            let mut st = self.state.lock().expect("read batcher poisoned");
+            let mut st = self.state.borrow_mut();
             if st.queues.closed {
                 Some(get)
             } else {
@@ -1308,20 +1331,21 @@ impl ReadBatcher {
         }
         if spawn_flusher {
             let this = self.clone();
-            tokio::spawn(async move {
-                tokio::task::yield_now().await;
+            compio::runtime::spawn(async move {
+                yield_now().await;
                 this.flush_open();
-            });
+            })
+            .detach();
         }
     }
 
-    fn flush_open(self: &Arc<Self>) {
-        let mut st = self.state.lock().expect("read batcher poisoned");
+    fn flush_open(self: &Rc<Self>) {
+        let mut st = self.state.borrow_mut();
         st.queues.flush_scheduled = false;
         self.fill_capacity(&mut st);
     }
 
-    fn fill_capacity(self: &Arc<Self>, st: &mut ReadState) {
+    fn fill_capacity(self: &Rc<Self>, st: &mut ReadState) {
         while st.in_flight < self.deps.max_read_batches_in_flight {
             match st.queues.take_next() {
                 Some(body) => self.dispatch_locked(st, body),
@@ -1330,13 +1354,13 @@ impl ReadBatcher {
         }
     }
 
-    fn dispatch_locked(self: &Arc<Self>, st: &mut ReadState, body: ReadBody) {
+    fn dispatch_locked(self: &Rc<Self>, st: &mut ReadState, body: ReadBody) {
         st.in_flight += 1;
         let this = self.clone();
-        tokio::spawn(async move {
+        compio::runtime::spawn(async move {
             this.send_batch(body).await;
             let drained = {
-                let mut st = this.state.lock().expect("read batcher poisoned");
+                let mut st = this.state.borrow_mut();
                 st.in_flight -= 1;
                 this.fill_capacity(&mut st);
                 st.queues.closed && st.queues.is_drained() && st.in_flight == 0
@@ -1344,7 +1368,8 @@ impl ReadBatcher {
             if drained {
                 this.drained.notify_waiters();
             }
-        });
+        })
+        .detach();
     }
 
     /// Executes one read batch, retrying retryable failures with backoff and
@@ -1384,7 +1409,7 @@ impl ReadBatcher {
                         error = %decoded.error,
                         "read batch failed, retrying in {delay:?}"
                     );
-                    tokio::time::sleep(delay).await;
+                    compio::time::sleep(delay).await;
                 }
             }
         }
@@ -1438,24 +1463,24 @@ impl ReadBatcher {
     }
 
     /// Flushes everything queued and waits (bounded) for in-flight reads.
-    pub(crate) async fn close(self: &Arc<Self>) -> Result<(), OxiaError> {
+    pub(crate) async fn close(self: &Rc<Self>) -> Result<(), OxiaError> {
         {
-            let mut st = self.state.lock().expect("read batcher poisoned");
+            let mut st = self.state.borrow_mut();
             st.queues.closed = true;
             while let Some(body) = st.queues.take_next() {
                 self.dispatch_locked(&mut st, body);
             }
         }
-        let deadline = tokio::time::Instant::now() + self.deps.request_timeout;
+        let deadline = Instant::now() + self.deps.request_timeout;
         loop {
             let notified = self.drained.notified();
             {
-                let st = self.state.lock().expect("read batcher poisoned");
+                let st = self.state.borrow_mut();
                 if st.queues.is_drained() && st.in_flight == 0 {
                     break;
                 }
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            if compio::time::timeout_at(deadline, notified).await.is_err() {
                 debug!(shard = self.shard, "read batcher close timed out");
                 break;
             }
@@ -1597,13 +1622,13 @@ mod tests {
         assert_eq!(delete_ranges, [("range-3", 3)]);
     }
 
-    fn test_deps(max_batch_size: usize) -> Arc<BatcherDeps> {
+    fn test_deps(max_batch_size: usize) -> Rc<BatcherDeps> {
         // Managers are only touched at dispatch time; the rejection paths
         // exercised here never dispatch. Use an address nothing connects to.
-        Arc::new(BatcherDeps {
+        Rc::new(BatcherDeps {
             namespace: "default".to_string(),
             shard_manager: ShardManager::detached_for_tests(),
-            provider_manager: Arc::new(ProviderManager::new(Duration::from_secs(1))),
+            provider_manager: Rc::new(ProviderManager::new(Duration::from_secs(1))),
             max_batch_size,
             max_requests_per_batch: 1000,
             max_write_batches_in_flight: 4,
@@ -1612,22 +1637,22 @@ mod tests {
         })
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn oversized_write_is_rejected_before_batching() {
-        let batcher = Arc::new(WriteBatcher::new(0, test_deps(16), Weak::new()));
+        let batcher = Rc::new(WriteBatcher::new(0, test_deps(16), Weak::new()));
         let (op, rx) = put_op("key", &[0u8; 64]);
         batcher.add(op);
         let err = rx.await.expect("callback must fire").unwrap_err();
         assert!(matches!(err, OxiaError::RequestTooLarge));
         // Nothing was queued or dispatched.
-        let st = batcher.state.lock().unwrap();
+        let st = batcher.state.borrow();
         assert!(st.queues.is_drained());
         assert!(st.pending.is_empty());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn writes_after_close_fail_with_closed() {
-        let batcher = Arc::new(WriteBatcher::new(0, test_deps(1024), Weak::new()));
+        let batcher = Rc::new(WriteBatcher::new(0, test_deps(1024), Weak::new()));
         batcher.close().await.unwrap();
         let (op, rx) = put_op("key", b"value");
         batcher.add(op);
@@ -1639,11 +1664,11 @@ mod tests {
     /// must not keep steering the write stream to the hinted leader: the
     /// write fails with `ShardMoved`, so the caller reroutes it, instead of
     /// retrying against the hint until the request timeout.
-    #[tokio::test]
+    #[compio::test]
     async fn stale_hint_for_a_removed_shard_fails_with_shard_moved() {
         // The detached shard manager has no assignments: shard 0 is gone.
-        let batcher = Arc::new(WriteBatcher::new(0, test_deps(1024), Weak::new()));
-        batcher.state.lock().unwrap().hint = Some(LeaderHint {
+        let batcher = Rc::new(WriteBatcher::new(0, test_deps(1024), Weak::new()));
+        batcher.state.borrow_mut().hint = Some(LeaderHint {
             shard: 0,
             leader: "127.0.0.1:1".to_string(),
         });
@@ -1655,15 +1680,15 @@ mod tests {
 
     /// While the shard exists, its hint still overrides the leader in the
     /// assignments.
-    #[tokio::test]
+    #[compio::test]
     async fn hint_for_an_existing_shard_overrides_the_assigned_leader() {
         let mock = MockOxia::start(Behavior::default()).await;
         let deps = test_deps(1024);
         // The assigned leader, `server-0:6648`, does not exist.
         deps.shard_manager
             .set_assignments_for_tests(&[(0, 0, u32::MAX)]);
-        let batcher = Arc::new(WriteBatcher::new(0, deps, Weak::new()));
-        batcher.state.lock().unwrap().hint = Some(LeaderHint {
+        let batcher = Rc::new(WriteBatcher::new(0, deps, Weak::new()));
+        batcher.state.borrow_mut().hint = Some(LeaderHint {
             shard: 0,
             leader: mock.address.clone(),
         });
@@ -1676,9 +1701,9 @@ mod tests {
         assert_eq!(response.status, proto::Status::Ok as i32);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn reads_after_close_fail_with_closed() {
-        let batcher = Arc::new(ReadBatcher::new(0, test_deps(1024)));
+        let batcher = Rc::new(ReadBatcher::new(0, test_deps(1024)));
         batcher.close().await.unwrap();
         let (pending, rx) = Pending::new(proto::GetRequest::default());
         batcher.add(pending);
@@ -1690,7 +1715,7 @@ mod tests {
     /// hint: once the shard has been split away, the next attempt fails with
     /// `ShardMoved`, so the gets reroute, instead of retrying against the
     /// hint until the request timeout.
-    #[tokio::test]
+    #[compio::test]
     async fn stale_hint_for_a_removed_shard_fails_reads_with_shard_moved() {
         // The detached shard manager has no assignments: shard 0 is gone.
         let batcher = ReadBatcher::new(0, test_deps(1024));
@@ -1708,7 +1733,7 @@ mod tests {
 
     /// While the shard exists, its hint still overrides the leader in the
     /// assignments for reads too.
-    #[tokio::test]
+    #[compio::test]
     async fn hint_for_an_existing_shard_overrides_the_assigned_leader_for_reads() {
         let mock = MockOxia::start(Behavior::default()).await;
         let deps = test_deps(1024);
@@ -1732,7 +1757,7 @@ mod tests {
     /// A delete range copied for the shards that replaced a split one
     /// succeeds once every copy has, and fails with the first copy that
     /// fails, an error or a status other than OK.
-    #[tokio::test]
+    #[compio::test]
     async fn copied_delete_range_reports_every_copy() {
         let status = |status: proto::Status| proto::DeleteRangeResponse {
             status: status as i32,

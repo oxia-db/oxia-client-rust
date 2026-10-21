@@ -28,8 +28,8 @@ use serde::Serialize;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use testcontainers::core::ports::ContainerPort;
 use testcontainers::core::wait::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::runners::SyncRunner;
+use testcontainers::{Container, GenericImage, ImageExt};
 
 mod common;
 
@@ -72,7 +72,7 @@ fn sign_token(aud: &'static str, validity: Duration) -> String {
 }
 
 struct AuthCluster {
-    _container: ContainerAsync<GenericImage>,
+    _container: Container<GenericImage>,
     address: String,
 }
 
@@ -120,7 +120,6 @@ async fn start_auth_oxia() -> AuthCluster {
         .with_copy_to("/oxia/auth/cluster.yaml", cluster_yaml.into_bytes())
         .with_cmd(vec!["bash".to_string(), "-c".to_string(), script])
         .start()
-        .await
         .expect("Failed to start auth-enabled Oxia cluster");
 
     AuthCluster {
@@ -147,7 +146,7 @@ async fn connect_with_retry(
                     Instant::now() < deadline,
                     "authenticated client could not connect before the deadline: {e}"
                 );
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                compio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     }
@@ -156,7 +155,7 @@ async fn connect_with_retry(
 /// Static-token auth end to end: an authenticated client operates across
 /// shards (unary and stream RPCs all carry the header), while clients with no
 /// token or a token for the wrong audience are rejected.
-#[tokio::test]
+#[compio::test]
 async fn test_auth_token_end_to_end() {
     let cluster = start_auth_oxia().await;
 
@@ -209,7 +208,7 @@ async fn test_auth_token_end_to_end() {
 /// Token rotation: the provider is consulted per RPC, so a client whose
 /// tokens expire quickly keeps working as long as the provider mints fresh
 /// ones.
-#[tokio::test]
+#[compio::test]
 async fn test_auth_token_provider_rotation() {
     let cluster = start_auth_oxia().await;
 
@@ -223,7 +222,7 @@ async fn test_auth_token_provider_rotation() {
 
     // Let the token used above expire; new RPCs must succeed because the
     // provider is called again for each of them.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    compio::time::sleep(Duration::from_secs(3)).await;
 
     client.put("rotate/key", b"v2".to_vec()).await.unwrap();
     let got = client.get("rotate/key").await.unwrap();

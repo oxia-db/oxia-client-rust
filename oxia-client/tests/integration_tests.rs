@@ -16,36 +16,35 @@ use oxia::{ComparisonType, Notification, OxiaClient, OxiaClientBuilder, OxiaErro
 use std::time::Duration;
 use testcontainers::core::ports::ContainerPort;
 use testcontainers::core::wait::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::runners::SyncRunner;
+use testcontainers::{Container, GenericImage, ImageExt};
 
 mod common;
 
 const OXIA_PORT: u16 = 6648;
 
-async fn start_oxia() -> (ContainerAsync<GenericImage>, String) {
+async fn start_oxia() -> (Container<GenericImage>, String) {
     start_oxia_with(&[]).await
 }
 
 /// Starts `oxia standalone` with extra flags (e.g. `--shards 4`).
-async fn start_oxia_with(flags: &[&str]) -> (ContainerAsync<GenericImage>, String) {
+async fn start_oxia_with(flags: &[&str]) -> (Container<GenericImage>, String) {
     let container = common::oxia_image()
         .with_exposed_port(ContainerPort::Tcp(OXIA_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Started Grpc server"))
         .with_cmd(["oxia", "standalone"].iter().chain(flags).copied())
         .start()
-        .await
         .expect("Failed to start Oxia container");
 
     // Under heavy parallel container churn, docker inspect can briefly race
     // the port mapping; retry a few times before giving up.
-    let mut host_port = container.get_host_port_ipv4(OXIA_PORT).await;
+    let mut host_port = container.get_host_port_ipv4(OXIA_PORT);
     for _ in 0..20 {
         if host_port.is_ok() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        host_port = container.get_host_port_ipv4(OXIA_PORT).await;
+        compio::time::sleep(Duration::from_millis(250)).await;
+        host_port = container.get_host_port_ipv4(OXIA_PORT);
     }
     let host_port = host_port.expect("Failed to get host port");
 
@@ -66,7 +65,7 @@ async fn new_client(address: &str) -> OxiaClient {
 // Basic CRUD Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_put_and_get() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -90,7 +89,7 @@ async fn test_put_and_get() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_put_overwrite() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -112,7 +111,7 @@ async fn test_put_overwrite() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_delete() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -129,7 +128,7 @@ async fn test_delete() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_get_nonexistent() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -140,7 +139,7 @@ async fn test_get_nonexistent() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_delete_range() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -176,7 +175,7 @@ async fn test_delete_range() {
 // List and RangeScan Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_list() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -203,7 +202,7 @@ async fn test_list() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_range_scan() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -234,7 +233,7 @@ async fn test_range_scan() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_list_empty_range() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -252,7 +251,7 @@ async fn test_list_empty_range() {
 // Versioning / Conditional Operations Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_expected_version_id() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -284,7 +283,7 @@ async fn test_expected_version_id() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_expected_record_not_exists() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -310,7 +309,7 @@ async fn test_expected_record_not_exists() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_delete_with_expected_version() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -344,7 +343,7 @@ async fn test_delete_with_expected_version() {
 // Comparison Query Tests (Floor, Ceiling, Lower, Higher)
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_get_floor() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -368,7 +367,7 @@ async fn test_get_floor() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_get_ceiling() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -392,7 +391,7 @@ async fn test_get_ceiling() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_get_lower() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -416,7 +415,7 @@ async fn test_get_lower() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_get_higher() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -445,7 +444,7 @@ async fn test_get_higher() {
 /// of the namespace, which the server reports with the shard assignments. The
 /// keys are the example of oxia-db/oxia#1388: with 4 shards, the legacy
 /// slash-aware merge disagrees with the server's order in both sortings.
-#[tokio::test]
+#[compio::test]
 async fn test_multi_shard_reads_merge_in_the_key_sorting() {
     for (key_sorting, floor_of, floor, ordered) in [
         (
@@ -488,7 +487,7 @@ async fn test_multi_shard_reads_merge_in_the_key_sorting() {
 // Ephemeral Key Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_ephemeral_keys() {
     let (_container, address) = start_oxia().await;
 
@@ -514,7 +513,7 @@ async fn test_ephemeral_keys() {
     let client2 = new_client(&address).await;
     let mut found_deleted = false;
     for attempt in 0..10 {
-        tokio::time::sleep(Duration::from_millis(500 * (attempt + 1))).await;
+        compio::time::sleep(Duration::from_millis(500 * (attempt + 1))).await;
         let result = client2.get("eph/key1".to_string()).await;
         if matches!(result, Err(OxiaError::KeyNotFound)) {
             found_deleted = true;
@@ -529,11 +528,44 @@ async fn test_ephemeral_keys() {
     client2.close().await.unwrap();
 }
 
+/// The first ephemeral puts on a shard, issued together, share the one
+/// session the client creates for it: the others wait for the session that
+/// the first is creating.
+#[compio::test]
+async fn test_concurrent_ephemeral_puts_share_one_session() {
+    let (_container, address) = start_oxia().await;
+    let client = new_client(&address).await;
+
+    let puts: Vec<_> = (0..20)
+        .map(|i| {
+            client
+                .put(format!("eph-concurrent/{i:02}"), "x")
+                .ephemeral()
+                .into_future()
+        })
+        .collect();
+    let mut sessions: Vec<i64> = futures::future::try_join_all(puts)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|put| {
+            put.version
+                .session_id
+                .expect("an ephemeral record has a session")
+        })
+        .collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    assert_eq!(sessions.len(), 1, "sessions: {sessions:?}");
+
+    client.close().await.unwrap();
+}
+
 // ============================================================
 // Multiple Records / Batch Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_multiple_puts_batch() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -542,7 +574,7 @@ async fn test_multiple_puts_batch() {
     let mut handles = Vec::new();
     for i in 0..20 {
         let c = client.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(compio::runtime::spawn(async move {
             c.put(format!("batch/{:03}", i), format!("val-{}", i).into_bytes())
                 .await
         }));
@@ -571,7 +603,7 @@ async fn test_multiple_puts_batch() {
 /// issued (the requests' `op_index`), so the last put wins. A server without
 /// ordered writes applies every put before any delete, leaving the key
 /// deleted.
-#[tokio::test]
+#[compio::test]
 async fn test_batched_writes_apply_in_issue_order() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -599,7 +631,7 @@ async fn test_batched_writes_apply_in_issue_order() {
 /// without waiting, share a write batch. The server applies them in the order
 /// they were issued, so the put survives the delete range. A server without
 /// ordered writes applies the put first, and the delete range deletes it.
-#[tokio::test]
+#[compio::test]
 async fn test_put_issued_after_a_delete_range_survives_it() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -628,7 +660,7 @@ async fn test_put_issued_after_a_delete_range_survives_it() {
 // Notification Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_notifications() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -654,7 +686,7 @@ async fn test_notifications() {
 
     // Collect notifications with timeout
     let mut notifications = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         tokio::select! {
             Some(n) = notification_rx.recv() => {
@@ -663,7 +695,7 @@ async fn test_notifications() {
                     break;
                 }
             }
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = compio::time::sleep_until(deadline) => {
                 break;
             }
         }
@@ -696,7 +728,7 @@ async fn test_notifications() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_notifications_live_on_return() {
     // The subscription must be live the instant `notifications()` returns: a
     // change made immediately afterwards, with no delay, is still delivered.
@@ -709,7 +741,7 @@ async fn test_notifications_live_on_return() {
         .await
         .unwrap();
 
-    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+    let got = compio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("notification not delivered in time")
         .expect("notification stream closed");
@@ -721,7 +753,7 @@ async fn test_notifications_live_on_return() {
     client.close().await.unwrap();
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_notifications_drop_releases_subscription() {
     // Dropping the handle stops its listeners and leaves the client healthy:
     // a fresh subscription still works and shutdown completes promptly.
@@ -736,7 +768,7 @@ async fn test_notifications_drop_releases_subscription() {
         .put("drop/key".to_string(), b"v".to_vec())
         .await
         .unwrap();
-    let got = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
+    let got = compio::time::timeout(Duration::from_secs(5), rx2.recv())
         .await
         .expect("notification not delivered in time")
         .expect("notification stream closed");
@@ -745,7 +777,7 @@ async fn test_notifications_drop_releases_subscription() {
         Notification::KeyCreated { key, .. } if key == "drop/key"
     ));
 
-    tokio::time::timeout(Duration::from_secs(5), client.close())
+    compio::time::timeout(Duration::from_secs(5), client.close())
         .await
         .expect("close hung after dropping a subscription")
         .unwrap();
@@ -755,7 +787,7 @@ async fn test_notifications_drop_releases_subscription() {
 // Partition Key Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_partition_key() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -798,7 +830,7 @@ async fn test_partition_key() {
 // Sequence Key Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_sequence_keys() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -837,7 +869,7 @@ async fn test_sequence_keys() {
 // Secondary Index Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_secondary_index() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -896,7 +928,7 @@ async fn test_secondary_index() {
 /// reference (`TestSyncClientImpl_RangeScanUseIndexKeySorting`): with 4 shards,
 /// they land on all of them, and their secondary keys sort in the opposite
 /// order of their keys.
-#[tokio::test]
+#[compio::test]
 async fn test_index_range_scan_merges_by_the_secondary_keys() {
     let records = [
         ("p1", "h"),
@@ -947,7 +979,7 @@ async fn test_index_range_scan_merges_by_the_secondary_keys() {
 /// or fails with `EndInclusiveUnsupported` on a server that leaves the end out
 /// (such as `oxia/oxia:main`, which predates oxia-db/oxia#1608): it never
 /// returns the half-open range silently.
-#[tokio::test]
+#[compio::test]
 async fn test_end_inclusive_includes_the_end_or_fails() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -978,7 +1010,7 @@ async fn test_end_inclusive_includes_the_end_or_fails() {
 /// whose secondary key is that key. The records are the example of
 /// oxia-db/oxia#1608, where `["k-1", "k-1~")` also matches `k-12`, `k-1:a`
 /// and `k-1_b`.
-#[tokio::test]
+#[compio::test]
 async fn test_list_and_range_scan_end_inclusive() {
     let (_container, address) = start_oxia_with(&["--shards", "4"]).await;
     let client = new_client(&address).await;
@@ -1040,7 +1072,7 @@ async fn test_list_and_range_scan_end_inclusive() {
 // Client Builder Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_client_builder_options() {
     let (_container, address) = start_oxia().await;
 
@@ -1076,7 +1108,7 @@ async fn test_client_builder_options() {
 // Clone / Multi-reference Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_client_clone_concurrent() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1085,7 +1117,7 @@ async fn test_client_clone_concurrent() {
     let mut handles = Vec::new();
     for i in 0..10 {
         let c = client.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(compio::runtime::spawn(async move {
             c.put(format!("clone/{}", i), format!("value-{}", i).into_bytes())
                 .await
                 .unwrap();
@@ -1118,7 +1150,7 @@ async fn test_client_clone_concurrent() {
 // Version metadata Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_version_metadata() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1153,7 +1185,7 @@ async fn test_version_metadata() {
 // Get without value (metadata only)
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_get_without_value() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1192,7 +1224,7 @@ async fn test_get_without_value() {
 // Large value Tests
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_large_value() {
     let (_container, address) = start_oxia().await;
     // A 1MiB value exceeds the default 128KiB batch_max_size (which would
@@ -1227,7 +1259,7 @@ async fn test_large_value() {
 // Delete non-existent key
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_delete_nonexistent_key() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1244,7 +1276,7 @@ async fn test_delete_nonexistent_key() {
 // Multiple sequential operations on same key
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_sequential_operations() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1289,7 +1321,7 @@ async fn test_sequential_operations() {
 // Range scan with values verification
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_range_scan_values() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1328,7 +1360,7 @@ async fn test_range_scan_values() {
 // Empty value test
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_empty_value() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1357,7 +1389,7 @@ async fn test_empty_value() {
 // Special characters in keys
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_special_chars_in_keys() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1393,14 +1425,14 @@ async fn test_special_chars_in_keys() {
 // Notification buffer size option
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_notifications_with_buffer_size() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
 
     let mut notification_rx = client.notifications().buffer_size(10).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    compio::time::sleep(Duration::from_millis(500)).await;
 
     client
         .put("notif2/key1".to_string(), b"v1".to_vec())
@@ -1408,7 +1440,7 @@ async fn test_notifications_with_buffer_size() {
         .unwrap();
 
     // Should receive at least 1 notification
-    let notification = tokio::time::timeout(Duration::from_secs(5), notification_rx.recv())
+    let notification = compio::time::timeout(Duration::from_secs(5), notification_rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -1426,7 +1458,7 @@ async fn test_notifications_with_buffer_size() {
 // Concurrent reads and writes
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_concurrent_read_write() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1445,7 +1477,7 @@ async fn test_concurrent_read_write() {
     // Writers
     for i in 0..10 {
         let c = client.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(compio::runtime::spawn(async move {
             c.put(format!("crw/{}", i), format!("updated-{}", i).into_bytes())
                 .await
                 .unwrap();
@@ -1455,7 +1487,7 @@ async fn test_concurrent_read_write() {
     // Readers
     for i in 0..10 {
         let c = client.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(compio::runtime::spawn(async move {
             let _ = c.get(format!("crw/{}", i)).await;
             // Value should be either initial or updated - both are valid
         }));
@@ -1485,7 +1517,7 @@ async fn test_concurrent_read_write() {
 // Delete range with partition key
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_delete_range_with_partition_key() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1522,7 +1554,7 @@ async fn test_delete_range_with_partition_key() {
 // Range scan with partition key
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_range_scan_with_partition_key() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1557,7 +1589,7 @@ async fn test_range_scan_with_partition_key() {
 // Stress / throughput test
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_high_throughput_writes() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1568,7 +1600,7 @@ async fn test_high_throughput_writes() {
     // Flood with concurrent put operations
     for i in 0..num_ops {
         let c = client.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(compio::runtime::spawn(async move {
             c.put(
                 format!("stress/{:04}", i),
                 format!("val-{}", i).into_bytes(),
@@ -1603,7 +1635,7 @@ async fn test_high_throughput_writes() {
     let mut del_handles = Vec::new();
     for i in 0..num_ops {
         let c = client.clone();
-        del_handles.push(tokio::spawn(async move {
+        del_handles.push(compio::runtime::spawn(async move {
             c.delete(format!("stress/{:04}", i)).await
         }));
     }
@@ -1625,7 +1657,7 @@ async fn test_high_throughput_writes() {
 // Notification Display test
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_notification_display() {
     let created = Notification::KeyCreated {
         key: "test/key".to_string(),
@@ -1657,7 +1689,7 @@ async fn test_notification_display() {
 // Multiple secondary indexes per record
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_multiple_secondary_indexes() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1697,7 +1729,7 @@ async fn test_multiple_secondary_indexes() {
 // List and scan partial ranges
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_list_partial_range() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1726,7 +1758,7 @@ async fn test_list_partial_range() {
 // Put and immediately get - verify consistency
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_read_your_writes() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1753,7 +1785,7 @@ async fn test_read_your_writes() {
 // Multiple clients operating concurrently
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_multiple_clients() {
     let (_container, address) = start_oxia().await;
     let client1 = new_client(&address).await;
@@ -1797,7 +1829,7 @@ async fn test_multiple_clients() {
 // CAS (Compare-And-Swap) loop pattern
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_cas_loop() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1837,7 +1869,7 @@ async fn test_cas_loop() {
 // Binary (non-UTF8) data
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_binary_values() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1863,7 +1895,7 @@ async fn test_binary_values() {
 // Overwrite with different value sizes
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_overwrite_different_sizes() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1904,7 +1936,7 @@ async fn test_overwrite_different_sizes() {
 // Concurrent CAS conflict detection
 // ============================================================
 
-#[tokio::test]
+#[compio::test]
 async fn test_concurrent_cas_conflict() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -1920,13 +1952,13 @@ async fn test_concurrent_cas_conflict() {
     let c1 = client.clone();
     let c2 = client.clone();
 
-    let h1 = tokio::spawn(async move {
+    let h1 = compio::runtime::spawn(async move {
         c1.put("conflict/key".to_string(), b"v1-from-c1".to_vec())
             .expected_version_id(version)
             .await
     });
 
-    let h2 = tokio::spawn(async move {
+    let h2 = compio::runtime::spawn(async move {
         c2.put("conflict/key".to_string(), b"v1-from-c2".to_vec())
             .expected_version_id(version)
             .await
@@ -1952,7 +1984,7 @@ async fn test_concurrent_cas_conflict() {
 /// P1-3: building a client against an unreachable cluster must fail fast within
 /// the request timeout instead of returning a client with an empty routing
 /// table (or hanging). No server is started here.
-#[tokio::test]
+#[compio::test]
 async fn build_fails_fast_when_cluster_unreachable() {
     let build = OxiaClientBuilder::new()
         .service_address("http://127.0.0.1:1".to_string())
@@ -1960,7 +1992,7 @@ async fn build_fails_fast_when_cluster_unreachable() {
         .build();
     // Bound the whole thing well above the request timeout: if `build` returns
     // an error we failed fast; if this outer timeout fires, it hung.
-    match tokio::time::timeout(Duration::from_secs(15), build).await {
+    match compio::time::timeout(Duration::from_secs(15), build).await {
         Ok(Ok(_)) => panic!("build unexpectedly succeeded against an unreachable cluster"),
         Ok(Err(_)) => {}
         Err(_) => panic!("build hung instead of failing fast within the request timeout"),
@@ -1972,7 +2004,7 @@ async fn build_fails_fast_when_cluster_unreachable() {
 // ============================================================
 
 /// A single write larger than `batch_max_size` is rejected client-side.
-#[tokio::test]
+#[compio::test]
 async fn test_put_larger_than_max_batch_size_is_rejected() {
     let (_container, address) = start_oxia().await;
     let client = OxiaClientBuilder::new()
@@ -1993,7 +2025,7 @@ async fn test_put_larger_than_max_batch_size_is_rejected() {
 }
 
 /// Writes exceeding the batch byte limit split across batches and all land.
-#[tokio::test]
+#[compio::test]
 async fn test_batches_split_at_byte_limit() {
     let (_container, address) = start_oxia().await;
     let client = OxiaClientBuilder::new()
@@ -2018,7 +2050,7 @@ async fn test_batches_split_at_byte_limit() {
 /// With a window of one batch in flight, heavy concurrent traffic to the same
 /// shard coalesces into growing batches; everything must complete in order and
 /// nothing may be lost.
-#[tokio::test]
+#[compio::test]
 async fn test_adaptive_window_of_one_under_concurrency() {
     let (_container, address) = start_oxia().await;
     let client = OxiaClientBuilder::new()
@@ -2030,18 +2062,19 @@ async fn test_adaptive_window_of_one_under_concurrency() {
         .unwrap();
 
     // Same partition key => same shard => one dispatch window.
-    let mut tasks = tokio::task::JoinSet::new();
-    for i in 0..200 {
-        let client = client.clone();
-        tasks.spawn(async move {
-            client
-                .put(format!("window/{i:03}"), format!("v{i}").into_bytes())
-                .partition_key("window-pk")
-                .await
-        });
-    }
-    while let Some(result) = tasks.join_next().await {
-        result.unwrap().unwrap();
+    let tasks: Vec<_> = (0..200)
+        .map(|i| {
+            let client = client.clone();
+            compio::runtime::spawn(async move {
+                client
+                    .put(format!("window/{i:03}"), format!("v{i}").into_bytes())
+                    .partition_key("window-pk")
+                    .await
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap().unwrap();
     }
 
     // Sequential writes to one key through the same window preserve order:
@@ -2083,7 +2116,7 @@ async fn test_adaptive_window_of_one_under_concurrency() {
 /// stop/start. Docker re-assigns ephemeral (`-P`) host ports on restart, so
 /// the restart test must pin one — like any real deployment, where an
 /// endpoint keeps its address across restarts.
-async fn start_oxia_fixed_port() -> (ContainerAsync<GenericImage>, String) {
+async fn start_oxia_fixed_port() -> (Container<GenericImage>, String) {
     // Grab a free host port and release it just before the container binds it.
     let host_port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -2096,16 +2129,42 @@ async fn start_oxia_fixed_port() -> (ContainerAsync<GenericImage>, String) {
         .with_mapped_port(host_port, ContainerPort::Tcp(OXIA_PORT))
         .with_cmd(vec!["oxia", "standalone"])
         .start()
-        .await
         .expect("Failed to start Oxia container");
 
     let address = format!("http://127.0.0.1:{}", host_port);
     (container, address)
 }
 
+/// Stops the container, off the client's thread: the client keeps running
+/// while the blocking container API waits for the container to stop.
+async fn stop_container(container: Container<GenericImage>) -> Container<GenericImage> {
+    compio::runtime::spawn_blocking(move || {
+        container.stop().expect("stop oxia");
+        container
+    })
+    .await
+    .expect("stop joins")
+}
+
+/// Restarts the stopped container after `delay`, off the client's thread.
+fn restart_container_after(
+    container: Container<GenericImage>,
+    delay: Duration,
+) -> compio::runtime::JoinHandle<Container<GenericImage>> {
+    compio::runtime::spawn(async move {
+        compio::time::sleep(delay).await;
+        compio::runtime::spawn_blocking(move || {
+            container.start().expect("restart oxia");
+            container
+        })
+        .await
+        .expect("restart joins")
+    })
+}
+
 /// Operations issued while the server is down must ride through the outage on
 /// the client's internal retries and complete once the server is back.
-#[tokio::test]
+#[compio::test]
 async fn test_operations_survive_server_restart() {
     let (container, address) = start_oxia_fixed_port().await;
     let client = OxiaClientBuilder::new()
@@ -2117,12 +2176,8 @@ async fn test_operations_survive_server_restart() {
 
     client.put("outage/before", b"v1".to_vec()).await.unwrap();
 
-    container.stop().await.expect("stop oxia");
-    let restarter = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        container.start().await.expect("restart oxia");
-        container
-    });
+    let container = stop_container(container).await;
+    let restarter = restart_container_after(container, Duration::from_secs(3));
 
     // Issued against a stopped server: the write batcher must retry (fresh
     // stream + backoff) until the server returns.
@@ -2174,9 +2229,9 @@ async fn test_operations_survive_server_restart() {
 /// Receives notifications until a `KeyCreated` for `key` arrives, ignoring any
 /// others, or panics after `within`.
 async fn expect_key_created(rx: &mut oxia::Notifications, key: &str, within: Duration) {
-    let deadline = tokio::time::Instant::now() + within;
+    let deadline = std::time::Instant::now() + within;
     loop {
-        match tokio::time::timeout_at(deadline, rx.recv()).await {
+        match compio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(Notification::KeyCreated { key: k, .. })) if k == key => return,
             Ok(Some(_)) => continue,
             Ok(None) => panic!("notification stream closed before delivering '{key}'"),
@@ -2188,7 +2243,7 @@ async fn expect_key_created(rx: &mut oxia::Notifications, key: &str, within: Dur
 /// P1-G: a notification subscription must survive a server outage. Each
 /// per-shard listener reconnects and resumes from its last delivered offset, so
 /// a change made after the server returns is still delivered.
-#[tokio::test]
+#[compio::test]
 async fn test_notifications_resume_after_server_restart() {
     let (container, address) = start_oxia_fixed_port().await;
     let client = OxiaClientBuilder::new()
@@ -2208,12 +2263,8 @@ async fn test_notifications_resume_after_server_restart() {
     expect_key_created(&mut rx, "notif-restart/before", Duration::from_secs(10)).await;
 
     // Bounce the server underneath the subscription.
-    container.stop().await.expect("stop oxia");
-    let restarter = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        container.start().await.expect("restart oxia");
-        container
-    });
+    let container = stop_container(container).await;
+    let restarter = restart_container_after(container, Duration::from_secs(3));
 
     // A change after the server returns must still reach the subscription: the
     // listener reconnected and resumed from where it left off.
@@ -2229,7 +2280,7 @@ async fn test_notifications_resume_after_server_restart() {
 
 /// P1-G: a burst of writes already in flight when the leader restarts must all
 /// ride through the outage on the client's retries — none dropped, none stuck.
-#[tokio::test]
+#[compio::test]
 async fn test_writes_survive_restart_under_concurrent_load() {
     let (container, address) = start_oxia_fixed_port().await;
     let client = OxiaClientBuilder::new()
@@ -2240,28 +2291,25 @@ async fn test_writes_survive_restart_under_concurrent_load() {
         .unwrap();
 
     // Kick off a burst of concurrent writes...
-    let mut tasks = tokio::task::JoinSet::new();
-    for i in 0..50 {
-        let client = client.clone();
-        tasks.spawn(async move {
-            client
-                .put(format!("load/{i:02}"), format!("v{i}").into_bytes())
-                .await
-        });
-    }
+    let tasks: Vec<_> = (0..50)
+        .map(|i| {
+            let client = client.clone();
+            compio::runtime::spawn(async move {
+                client
+                    .put(format!("load/{i:02}"), format!("v{i}").into_bytes())
+                    .await
+            })
+        })
+        .collect();
 
     // ...and bounce the server while they are in flight.
-    container.stop().await.expect("stop oxia");
-    let restarter = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        container.start().await.expect("restart oxia");
-        container
-    });
+    let container = stop_container(container).await;
+    let restarter = restart_container_after(container, Duration::from_secs(3));
 
     // Every write must eventually succeed.
     let mut succeeded = 0;
-    while let Some(result) = tasks.join_next().await {
-        result.unwrap().unwrap();
+    for task in tasks {
+        task.await.unwrap().unwrap();
         succeeded += 1;
     }
     assert_eq!(succeeded, 50);
@@ -2284,11 +2332,11 @@ async fn test_writes_survive_restart_under_concurrent_load() {
 /// OpenTelemetry meter provider under the `oxia_client` meter, mirroring the Go
 /// client's instrument names and `type` attribute.
 ///
-/// Runs on a multi-thread runtime: the OpenTelemetry `PeriodicReader`'s
-/// `force_flush` blocks the caller until its background worker replies, which
-/// would deadlock a single-threaded runtime.
+/// The OpenTelemetry `PeriodicReader` exports from a task of a tokio runtime,
+/// and its `force_flush` blocks the caller until that task replies: a tokio
+/// runtime with threads of its own serves it, apart from the client's.
 #[cfg(feature = "otel")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[compio::test]
 async fn test_metrics_recorded_through_meter_provider() {
     use opentelemetry_sdk::metrics::data::Histogram;
     use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
@@ -2298,8 +2346,17 @@ async fn test_metrics_recorded_through_meter_provider() {
     let (_container, address) = start_oxia().await;
 
     let exporter = InMemoryMetricExporter::default();
-    let reader = PeriodicReader::builder(exporter.clone(), runtime::Tokio).build();
-    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+    let otel_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    // The reader starts its task when the provider is built.
+    let provider = {
+        let _otel_runtime = otel_runtime.enter();
+        let reader = PeriodicReader::builder(exporter.clone(), runtime::Tokio).build();
+        SdkMeterProvider::builder().with_reader(reader).build()
+    };
 
     let client = OxiaClientBuilder::new()
         .service_address(address)

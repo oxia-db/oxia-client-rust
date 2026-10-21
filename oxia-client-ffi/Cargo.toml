@@ -26,5 +26,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 oxia-client = { workspace = true }
-tokio = { workspace = true }
+compio = { workspace = true }
+futures = { workspace = true }
 libc = { workspace = true }

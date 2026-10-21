@@ -25,7 +25,7 @@ use crate::streams::{ListStream, Notifications, RangeScanStream, SequenceUpdates
 use crate::types::{ComparisonType, GetResult, PutResult, VERSION_ID_NOT_EXISTS};
 use bytes::Bytes;
 use futures::TryStreamExt;
-use futures::future::BoxFuture;
+use futures::future::LocalBoxFuture;
 use std::future::IntoFuture;
 
 const DEFAULT_SUBSCRIPTION_BUFFER: usize = 100;
@@ -233,7 +233,7 @@ impl PutBuilder {
 
 impl IntoFuture for PutBuilder {
     type Output = Result<PutResult, OxiaError>;
-    type IntoFuture = BoxFuture<'static, Self::Output>;
+    type IntoFuture = LocalBoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
@@ -338,7 +338,7 @@ impl GetBuilder {
 
 impl IntoFuture for GetBuilder {
     type Output = Result<GetResult, OxiaError>;
-    type IntoFuture = BoxFuture<'static, Self::Output>;
+    type IntoFuture = LocalBoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
@@ -432,7 +432,7 @@ impl DeleteBuilder {
 
 impl IntoFuture for DeleteBuilder {
     type Output = Result<(), OxiaError>;
-    type IntoFuture = BoxFuture<'static, Self::Output>;
+    type IntoFuture = LocalBoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
@@ -513,7 +513,7 @@ impl DeleteRangeBuilder {
 
 impl IntoFuture for DeleteRangeBuilder {
     type Output = Result<(), OxiaError>;
-    type IntoFuture = BoxFuture<'static, Self::Output>;
+    type IntoFuture = LocalBoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
@@ -610,7 +610,7 @@ impl ListBuilder {
     async fn execute(self) -> Result<Vec<String>, OxiaError> {
         let timeout = self.client.request_timeout();
         let stream = self.stream();
-        tokio::time::timeout(timeout, async move { stream.await?.try_collect().await })
+        compio::time::timeout(timeout, async move { stream.await?.try_collect().await })
             .await
             .map_err(|_| OxiaError::Timeout)?
     }
@@ -618,7 +618,7 @@ impl ListBuilder {
 
 impl IntoFuture for ListBuilder {
     type Output = Result<Vec<String>, OxiaError>;
-    type IntoFuture = BoxFuture<'static, Self::Output>;
+    type IntoFuture = LocalBoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
@@ -722,7 +722,7 @@ impl RangeScanBuilder {
     async fn execute(self) -> Result<Vec<GetResult>, OxiaError> {
         let timeout = self.client.request_timeout();
         let stream = self.stream();
-        tokio::time::timeout(timeout, async move { stream.await?.try_collect().await })
+        compio::time::timeout(timeout, async move { stream.await?.try_collect().await })
             .await
             .map_err(|_| OxiaError::Timeout)?
     }
@@ -730,7 +730,7 @@ impl RangeScanBuilder {
 
 impl IntoFuture for RangeScanBuilder {
     type Output = Result<Vec<GetResult>, OxiaError>;
-    type IntoFuture = BoxFuture<'static, Self::Output>;
+    type IntoFuture = LocalBoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
@@ -765,7 +765,7 @@ impl NotificationsBuilder {
 
 impl IntoFuture for NotificationsBuilder {
     type Output = Result<Notifications, OxiaError>;
-    type IntoFuture = BoxFuture<'static, Self::Output>;
+    type IntoFuture = LocalBoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.client.open_notifications(self.buffer_size).await })
@@ -803,7 +803,7 @@ impl SequenceUpdatesBuilder {
 
 impl IntoFuture for SequenceUpdatesBuilder {
     type Output = Result<SequenceUpdates, OxiaError>;
-    type IntoFuture = BoxFuture<'static, Self::Output>;
+    type IntoFuture = LocalBoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {

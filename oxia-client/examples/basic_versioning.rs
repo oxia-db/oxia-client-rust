@@ -15,7 +15,7 @@
 use oxia::OxiaClient;
 use tracing::level_filters::LevelFilter;
 
-#[tokio::main]
+#[compio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(

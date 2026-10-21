@@ -296,7 +296,7 @@ mod tests {
         shard(items.iter().map(|s| Ok(s.to_string())).collect())
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn merges_in_key_order() {
         let merged = merged(
             vec![keys(&["a", "d", "e"]), keys(&["b", "c", "f"]), keys(&[])],
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(out, vec!["a", "b", "c", "d", "e", "f"]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn merges_with_slash_order() {
         // "a" sorts before "/" in Oxia's slash-aware order.
         let merged = merged(vec![keys(&["/x"]), keys(&["a"])], KeyOrder::Legacy);
@@ -317,7 +317,7 @@ mod tests {
     /// Each shard returns its keys in the key sorting of the namespace, and
     /// the merge keeps it (vectors from the Go reference,
     /// `TestAggregateAndSortRangeScanAcrossShardsKeySorting`).
-    #[tokio::test]
+    #[compio::test]
     async fn merges_in_the_key_sorting_of_the_namespace() {
         for (order, shards, expected) in [
             (
@@ -365,7 +365,7 @@ mod tests {
     /// their secondary keys, and the merge compares the secondary keys, then
     /// the keys (vectors from the Go reference,
     /// `TestAggregateAndSortRangeScanAcrossShardsSecondaryKeys`).
-    #[tokio::test]
+    #[compio::test]
     async fn merges_by_the_secondary_keys() {
         for (case, order, shards, expected) in [
             (
@@ -425,7 +425,7 @@ mod tests {
     /// The records without a secondary key, which the servers older than
     /// oxia-db/oxia#1508 return from a range scan through an index, are
     /// ordered by their keys only, even against a record that has one.
-    #[tokio::test]
+    #[compio::test]
     async fn merges_a_record_without_a_secondary_key_by_its_key() {
         let shard = |record: GetResult| -> ShardStream<GetResult> {
             Box::pin(futures::stream::iter([Ok(record)]))
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(out, ["p1", "p2"]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn error_terminates_stream() {
         let merged = merged(
             vec![
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(err_pos, out.len() - 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn empty_merge_ends() {
         let merged = merged::<String>(vec![], KeyOrder::default());
         let out: Vec<_> = merged.collect().await;

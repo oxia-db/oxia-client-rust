@@ -17,7 +17,9 @@
 //! Serves the real gRPC service on an ephemeral local port (no Docker, no
 //! containers) and advertises itself as the leader of every shard (a single
 //! one by default), so an unmodified [`OxiaClient`](crate::OxiaClient)
-//! connects to it exactly as it would to a real cluster. Tests script server
+//! connects to it exactly as it would to a real cluster. The server is
+//! tonic's, which runs on tokio: it gets a tokio runtime and threads of its
+//! own, apart from the compio runtime of the client under test. Tests script server
 //! behavior — delayed, missing, erroneous, or absent responses; torn streams;
 //! the keys each shard returns; shard splits — and assert on what the server
 //! observed (write requests, batch sizes, connection counts) and on what the
@@ -245,12 +247,16 @@ impl State {
 pub(crate) struct MockOxia {
     pub(crate) address: String,
     state: Arc<State>,
-    server: tokio::task::JoinHandle<()>,
+    /// The runtime serving the mock, on threads of its own.
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl Drop for MockOxia {
     fn drop(&mut self) {
-        self.server.abort();
+        // Without waiting for the streams the client keeps open to end.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
@@ -277,9 +283,10 @@ impl MockOxia {
             notifications_changed: tokio::sync::watch::Sender::new(()),
             notification_requests: Mutex::new(Vec::new()),
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock listener");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking mock listener");
         let port = listener.local_addr().expect("mock local addr").port();
         let address = format!("127.0.0.1:{port}");
 
@@ -287,11 +294,17 @@ impl MockOxia {
             state: state.clone(),
             advertised: address.clone(),
         };
-        let incoming = futures::stream::unfold(listener, |listener| async move {
-            let accepted = listener.accept().await.map(|(stream, _)| stream);
-            Some((accepted, listener))
-        });
-        let server = tokio::spawn(async move {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        runtime.spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("mock listener");
+            let incoming = futures::stream::unfold(listener, |listener| async move {
+                let accepted = listener.accept().await.map(|(stream, _)| stream);
+                Some((accepted, listener))
+            });
             tonic::transport::Server::builder()
                 .add_service(OxiaClientServer::new(service))
                 .serve_with_incoming(incoming)
@@ -302,7 +315,7 @@ impl MockOxia {
         MockOxia {
             address,
             state,
-            server,
+            runtime: Some(runtime),
         }
     }
 
@@ -933,7 +946,7 @@ mod tests {
 
     /// With the in-flight window saturated, accumulating batches seal at
     /// `max_requests_per_batch`: 1 immediate dispatch, then 3 + 3.
-    #[tokio::test]
+    #[compio::test]
     async fn batches_seal_at_max_requests() {
         let mock = MockOxia::start(Behavior {
             write: WriteMode::DelayResponses(Duration::from_millis(200)),
@@ -949,20 +962,21 @@ mod tests {
             .await
             .expect("connect");
 
-        let first = tokio::spawn({
+        let first = compio::runtime::spawn({
             let client = client.clone();
             async move { client.put("count/first", "x").await }
         });
         // Let the first put dispatch alone, then queue six more behind it.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut rest = tokio::task::JoinSet::new();
-        for i in 0..6 {
-            let client = client.clone();
-            rest.spawn(async move { client.put(format!("count/{i}"), "x").await });
-        }
+        compio::time::sleep(Duration::from_millis(50)).await;
+        let rest: Vec<_> = (0..6)
+            .map(|i| {
+                let client = client.clone();
+                compio::runtime::spawn(async move { client.put(format!("count/{i}"), "x").await })
+            })
+            .collect();
         first.await.expect("join").expect("first put");
-        while let Some(result) = rest.join_next().await {
-            result.expect("join").expect("put");
+        for put in rest {
+            put.await.expect("join").expect("put");
         }
 
         assert_eq!(mock.write_batch_sizes(), vec![1, 3, 3]);
@@ -970,7 +984,7 @@ mod tests {
 
     /// With the window saturated, accumulating batches seal when the next
     /// operation would exceed `batch_max_size`.
-    #[tokio::test]
+    #[compio::test]
     async fn batches_seal_at_max_bytes() {
         let mock = MockOxia::start(Behavior {
             write: WriteMode::DelayResponses(Duration::from_millis(200)),
@@ -987,19 +1001,22 @@ mod tests {
             .await
             .expect("connect");
 
-        let first = tokio::spawn({
+        let first = compio::runtime::spawn({
             let client = client.clone();
             async move { client.put("bytes/first", vec![0u8; 100]).await }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut rest = tokio::task::JoinSet::new();
-        for i in 0..6 {
-            let client = client.clone();
-            rest.spawn(async move { client.put(format!("bytes/{i}"), vec![0u8; 100]).await });
-        }
+        compio::time::sleep(Duration::from_millis(50)).await;
+        let rest: Vec<_> = (0..6)
+            .map(|i| {
+                let client = client.clone();
+                compio::runtime::spawn(async move {
+                    client.put(format!("bytes/{i}"), vec![0u8; 100]).await
+                })
+            })
+            .collect();
         first.await.expect("join").expect("first put");
-        while let Some(result) = rest.join_next().await {
-            result.expect("join").expect("put");
+        for put in rest {
+            put.await.expect("join").expect("put");
         }
 
         let sizes = mock.write_batch_sizes();
@@ -1016,7 +1033,7 @@ mod tests {
 
     /// No more write batches than `max_write_batches_in_flight` are ever
     /// outstanding on a shard.
-    #[tokio::test]
+    #[compio::test]
     async fn write_window_is_bounded() {
         let mock = MockOxia::start(Behavior {
             write: WriteMode::Hang,
@@ -1033,16 +1050,18 @@ mod tests {
 
         // Stagger the first two puts so each dispatches as its own batch and
         // fills one window slot; the remaining four must then queue.
-        let mut puts = tokio::task::JoinSet::new();
+        let mut puts = Vec::new();
         for i in 0..6 {
             let client = client.clone();
-            puts.spawn(async move { client.put(format!("window/{i}"), "x").await });
+            puts.push(compio::runtime::spawn(async move {
+                client.put(format!("window/{i}"), "x").await
+            }));
             if i < 2 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                compio::time::sleep(Duration::from_millis(50)).await;
             }
         }
         // Give the batcher ample time to dispatch everything it is willing to.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        compio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(
             mock.write_batch_sizes().len(),
             2,
@@ -1050,14 +1069,14 @@ mod tests {
         );
 
         // The server never answers, so every operation times out.
-        while let Some(result) = puts.join_next().await {
-            assert!(matches!(result.expect("join"), Err(OxiaError::Timeout)));
+        for put in puts {
+            assert!(matches!(put.await.expect("join"), Err(OxiaError::Timeout)));
         }
     }
 
     /// A server that acknowledges a batch with missing per-operation
     /// responses produces a decode error, not a hang.
-    #[tokio::test]
+    #[compio::test]
     async fn missing_responses_fail_the_batch() {
         let mock = MockOxia::start(Behavior {
             write: WriteMode::OmitResponses,
@@ -1077,7 +1096,7 @@ mod tests {
 
     /// A stream torn after the server received a batch (fate unknown) makes
     /// the client requeue and re-send it on a fresh stream.
-    #[tokio::test]
+    #[compio::test]
     async fn torn_stream_requeues_and_retries() {
         let mock = MockOxia::start(Behavior {
             torn_write_connections: 1,
@@ -1102,7 +1121,7 @@ mod tests {
 
     /// A write the server never acknowledges fails with `Timeout` once the
     /// request timeout elapses — it does not hang.
-    #[tokio::test]
+    #[compio::test]
     async fn hung_write_times_out() {
         let mock = MockOxia::start(Behavior {
             write: WriteMode::Hang,
@@ -1118,7 +1137,7 @@ mod tests {
     }
 
     /// A read the server never answers fails with `Timeout` as well.
-    #[tokio::test]
+    #[compio::test]
     async fn hung_read_times_out() {
         let mock = MockOxia::start(Behavior {
             read: ReadMode::Hang,
@@ -1135,7 +1154,7 @@ mod tests {
 
     /// Per-operation proto statuses in write responses map to the typed
     /// errors.
-    #[tokio::test]
+    #[compio::test]
     async fn write_statuses_map_to_typed_errors() {
         let mock = MockOxia::start(Behavior {
             write: WriteMode::PutStatus(proto::Status::UnexpectedVersionId as i32),
@@ -1166,7 +1185,7 @@ mod tests {
     /// The `INVALID_ARGUMENT` status a server returns for an invalid request
     /// maps to `InvalidArgument`, not to a decode error. The put itself is
     /// valid, so that it is the server, not the client, that rejects it.
-    #[tokio::test]
+    #[compio::test]
     async fn invalid_argument_status_maps_to_invalid_argument() {
         let mock = MockOxia::start(Behavior {
             write: WriteMode::PutStatus(proto::Status::InvalidArgument as i32),
@@ -1186,7 +1205,7 @@ mod tests {
     /// A put with a `/` in a secondary index name fails with `InvalidArgument`
     /// before it is batched, since a server that predates the check would
     /// store it; a `/` in the secondary key is valid.
-    #[tokio::test]
+    #[compio::test]
     async fn slash_in_index_name_fails_before_reaching_the_server() {
         let mock = MockOxia::start(Behavior::default()).await;
         let client = connect(&mock, Duration::from_secs(5)).await;
@@ -1233,7 +1252,7 @@ mod tests {
 
     /// Per-operation proto statuses in read responses map to the typed
     /// errors, and a healthy read produces the served value.
-    #[tokio::test]
+    #[compio::test]
     async fn read_statuses_map_to_typed_errors() {
         let mock = MockOxia::start(Behavior::default()).await;
         let client = connect(&mock, Duration::from_secs(5)).await;
@@ -1251,7 +1270,7 @@ mod tests {
 
     /// A permanent gRPC error on the assignments stream fails `build()` fast
     /// instead of retrying until the deadline.
-    #[tokio::test]
+    #[compio::test]
     async fn permanent_error_fails_build_fast() {
         let mock = MockOxia::start(Behavior {
             assignments_error: Some(tonic::Code::Unauthenticated),
@@ -1276,7 +1295,7 @@ mod tests {
     /// A delete carries its partition key on the wire, so that a shard split
     /// replays it only on the child that holds the record; without one, the
     /// field stays absent.
-    #[tokio::test]
+    #[compio::test]
     async fn delete_sends_its_partition_key() {
         let mock = MockOxia::start(Behavior::default()).await;
         let client = connect(&mock, Duration::from_secs(5)).await;
@@ -1309,7 +1328,7 @@ mod tests {
     /// An explicitly empty partition key is a partition key like any other: a
     /// put or delete with one is routed by `hash("")` and carries it on the
     /// wire, rather than being treated as absent and routed by its own key.
-    #[tokio::test]
+    #[compio::test]
     async fn empty_partition_key_is_hashed_normally() {
         let mock = MockOxia::start(Behavior {
             shards: 2,
@@ -1357,7 +1376,7 @@ mod tests {
     /// when it is issued, as a put or a delete does: the writes issued after
     /// it follow it in the batch, with a higher `op_index`, so that a server
     /// with ordered writes applies it before them.
-    #[tokio::test]
+    #[compio::test]
     async fn delete_range_precedes_the_writes_issued_after_it() {
         let mock = MockOxia::start(Behavior {
             shards: 2,
@@ -1405,7 +1424,7 @@ mod tests {
     /// legacy slash-aware order. The natural and hierarchical cases are the
     /// examples of oxia-db/oxia#1388, where the legacy order picks the other
     /// answer.
-    #[tokio::test]
+    #[compio::test]
     async fn multi_shard_gets_pick_in_the_key_sorting() {
         use crate::ComparisonType::{Ceiling, Floor};
         use proto::KeySorting::{Hierarchical, Natural, Unknown};
@@ -1444,7 +1463,7 @@ mod tests {
     /// A list or a range scan without a partition key merges the keys of the
     /// shards, which each shard returns in the key sorting of the namespace,
     /// in the same order (the vectors of the Go reference's merge tests).
-    #[tokio::test]
+    #[compio::test]
     async fn list_and_range_scan_merge_in_the_key_sorting() {
         use proto::KeySorting::{Hierarchical, Natural, Unknown};
 
@@ -1493,7 +1512,7 @@ mod tests {
     /// keys, in the key sorting of the namespace (the vectors of the Go
     /// reference, `TestMultiShardIndexGetKeySorting`). In the natural cases,
     /// comparing the keys instead picks the other answer.
-    #[tokio::test]
+    #[compio::test]
     async fn multi_shard_index_gets_pick_by_the_secondary_keys() {
         use crate::ComparisonType::{Ceiling, Floor};
         use proto::KeySorting::{Hierarchical, Natural, Unknown};
@@ -1536,7 +1555,7 @@ mod tests {
     /// sorting of the namespace (the vectors of the Go reference,
     /// `TestAggregateAndSortRangeScanAcrossShardsSecondaryKeys`). Comparing
     /// the keys instead puts the records out of order in every case.
-    #[tokio::test]
+    #[compio::test]
     async fn index_range_scans_merge_by_the_secondary_keys() {
         use proto::KeySorting::{Hierarchical, Natural, Unknown};
 
@@ -1614,7 +1633,7 @@ mod tests {
     /// the end of the range, which it says in all its responses, sending one
     /// at least: an older server ignores the flag and leaves the end out.
     /// The cases are those of the Go reference (`endInclusiveTests`).
-    #[tokio::test]
+    #[compio::test]
     async fn end_inclusive_needs_every_shard_to_include_the_end() {
         for (case, end_inclusive, [shard_0, shard_1], end_inclusive_shards, expected) in [
             (
@@ -1698,7 +1717,7 @@ mod tests {
                 Instant::now() < deadline,
                 "no request reached the split shard"
             );
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            compio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -1719,7 +1738,7 @@ mod tests {
     /// owns the key, rather than retry the parent until the request timeout.
     /// A get that goes to every shard, as a floor get does, goes to the
     /// children.
-    #[tokio::test]
+    #[compio::test]
     async fn gets_reroute_across_a_split() {
         use crate::ComparisonType::{Equal, Floor};
 
@@ -1738,7 +1757,8 @@ mod tests {
             let children = mock.split_shard(0, leader_hint);
             assert_eq!(children, (1, 2));
 
-            let get = tokio::spawn(client.get("key").comparison(comparison).into_future());
+            let get =
+                compio::runtime::spawn(client.get("key").comparison(comparison).into_future());
             until_split_shard_requests(&mock, 1).await;
             mock.publish_assignments();
             let found = get.await.expect("join").expect(&case);
@@ -1757,7 +1777,7 @@ mod tests {
     /// rather than retry the shard until the request timeout, as the Go
     /// client fails with `ErrShardNotFound`; with a partition key on the
     /// shard too.
-    #[tokio::test]
+    #[compio::test]
     async fn lists_and_range_scans_of_a_split_shard_fail_with_shard_moved() {
         for leader_hint in [false, true] {
             for partition_key in [None, Some("pk")] {
@@ -1775,7 +1795,7 @@ mod tests {
                     let shard = partition_key.map_or(0, |key| half_owning(key, (0, 1)));
                     mock.split_shard(shard, leader_hint);
 
-                    let result = tokio::spawn({
+                    let result = compio::runtime::spawn({
                         let client = client.clone();
                         async move {
                             if scan {
@@ -1824,7 +1844,7 @@ mod tests {
     async fn next_keys(notifications: &mut crate::Notifications, n: usize) -> Vec<String> {
         let mut keys = Vec::with_capacity(n);
         for _ in 0..n {
-            let notification = tokio::time::timeout(Duration::from_secs(5), notifications.recv())
+            let notification = compio::time::timeout(Duration::from_secs(5), notifications.recv())
                 .await
                 .expect("a notification arrives")
                 .expect("the subscription is open");
@@ -1835,7 +1855,7 @@ mod tests {
     }
 
     async fn assert_no_more_notifications(notifications: &mut crate::Notifications) {
-        let next = tokio::time::timeout(Duration::from_millis(200), notifications.recv()).await;
+        let next = compio::time::timeout(Duration::from_millis(200), notifications.recv()).await;
         assert!(next.is_err(), "unexpected notification: {next:?}");
     }
 
@@ -1855,7 +1875,7 @@ mod tests {
     /// delivers the parent's batches that the subscription had not received,
     /// on its side of the split, then its own: every notification arrives
     /// once. A child split in turn hands the subscription over the same way.
-    #[tokio::test]
+    #[compio::test]
     async fn notifications_follow_a_split_from_the_last_batch_received() {
         for parent_stream_ends in [false, true] {
             let case = format!("parent stream ends: {parent_stream_ends}");
@@ -1920,14 +1940,14 @@ mod tests {
     /// A shard split before the subscription to it is established: the
     /// subscriptions to the children establish it in its place, from where
     /// they start, as no batch of the parent tells where to start.
-    #[tokio::test]
+    #[compio::test]
     async fn notifications_follow_a_split_before_the_subscription_is_established() {
         let mock = MockOxia::start(Behavior::default()).await;
         let client = connect(&mock, Duration::from_secs(5)).await;
         // Only the server sees the split: it rejects the subscription to the
         // parent.
         assert_eq!(mock.split_shard(0, false), (1, 2));
-        let subscription = tokio::spawn(client.notifications().into_future());
+        let subscription = compio::runtime::spawn(client.notifications().into_future());
         until_split_shard_requests(&mock, 1).await;
         mock.publish_assignments();
         let mut notifications = subscription
@@ -1945,7 +1965,7 @@ mod tests {
 
     /// A shard without a leader fails with `LeaderNotFound`; its empty leader
     /// address is not dialed.
-    #[tokio::test]
+    #[compio::test]
     async fn leaderless_shard_reports_leader_not_found() {
         let mock = MockOxia::start(Behavior {
             leaderless_for: Duration::from_secs(60),
@@ -1963,7 +1983,7 @@ mod tests {
 
     /// A write waiting for a shard leader goes out as soon as one is elected,
     /// not when its reconnect backoff ends.
-    #[tokio::test]
+    #[compio::test]
     async fn write_goes_out_once_the_shard_gets_a_leader() {
         // The reconnects back off 100, 200, 400, then 800 ms: the leader is
         // elected 1 s in, during the last wait, which ends after the request
@@ -1981,6 +2001,46 @@ mod tests {
             .expect("put once the leader is elected");
     }
 
+    /// Closing the client while operations are in flight, and while a
+    /// subscription is dropped, neither panics nor hangs: the client's state
+    /// is shared by the tasks of its thread, and `close` must not keep it
+    /// borrowed while it waits. Each operation completes, or fails with
+    /// `Closed`.
+    #[compio::test]
+    async fn close_races_in_flight_operations() {
+        let mock = MockOxia::start(Behavior {
+            write: WriteMode::DelayResponses(Duration::from_millis(100)),
+            ..Behavior::default()
+        })
+        .await;
+        let client = connect(&mock, Duration::from_secs(5)).await;
+        let notifications = client.notifications().await.expect("subscribe");
+        let ops: Vec<_> = (0..20)
+            .map(|i| {
+                let client = client.clone();
+                compio::runtime::spawn(async move {
+                    if i % 2 == 0 {
+                        client.put(format!("close/{i}"), "x").await.map(drop)
+                    } else {
+                        client.get(format!("close/{i}")).await.map(drop)
+                    }
+                })
+            })
+            .collect();
+        // Let the operations reach their batchers.
+        compio::time::sleep(Duration::from_millis(20)).await;
+
+        let (closed, ()) = futures::join!(client.close(), async move { drop(notifications) });
+        closed.expect("close");
+        for op in ops {
+            let result = op.await.expect("the operation does not panic");
+            assert!(
+                matches!(result, Ok(()) | Err(OxiaError::Closed)),
+                "got {result:?}"
+            );
+        }
+    }
+
     /// A key starting with `prefix` whose hash lies in `[min_hash, max_hash]`.
     fn key_in(prefix: &str, min_hash: u32, max_hash: u32) -> String {
         (0u32..)
@@ -1990,17 +2050,17 @@ mod tests {
     }
 
     /// Runs a write in a task of its own.
-    fn spawn_write<T: Send + 'static>(
-        write: impl Future<Output = Result<T, OxiaError>> + Send + 'static,
-    ) -> tokio::task::JoinHandle<Result<(), OxiaError>> {
-        tokio::spawn(async move { write.await.map(drop) })
+    fn spawn_write<T: 'static>(
+        write: impl Future<Output = Result<T, OxiaError>> + 'static,
+    ) -> compio::runtime::JoinHandle<Result<(), OxiaError>> {
+        compio::runtime::spawn(async move { write.await.map(drop) })
     }
 
     async fn wait_until(what: &str, condition: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !condition() {
             assert!(Instant::now() < deadline, "timed out waiting until {what}");
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            compio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -2038,7 +2098,7 @@ mod tests {
     /// one of them, unless it has a partition key. They go ahead of the
     /// writes issued once the client has the new assignments, and of those
     /// still routed to the split shard.
-    #[tokio::test]
+    #[compio::test]
     async fn split_hands_off_the_pending_writes_in_issue_order() {
         let mock = MockOxia::start(Behavior::default()).await;
         let client = connect(&mock, Duration::from_secs(10)).await;
@@ -2119,7 +2179,7 @@ mod tests {
     /// A batch still in flight on a shard when the client gets the
     /// assignments without it is handed off once the shard rejects it. Until
     /// then, the shards that replaced it hold the writes issued meanwhile.
-    #[tokio::test]
+    #[compio::test]
     async fn split_hands_off_a_batch_in_flight_once_the_shard_rejects_it() {
         let mock = MockOxia::start(Behavior {
             write: WriteMode::DelayResponses(Duration::from_millis(300)),
@@ -2159,7 +2219,7 @@ mod tests {
     /// A shard split again before it has applied the writes handed off to it
     /// hands them off in turn, in order, ahead of the writes issued once the
     /// client has the newest assignments.
-    #[tokio::test]
+    #[compio::test]
     async fn nested_split_keeps_the_write_order() {
         let mock = MockOxia::start(Behavior::default()).await;
         let client = connect(&mock, Duration::from_secs(10)).await;
@@ -2171,7 +2231,7 @@ mod tests {
         let upper = key_in("upper-", middle + 1, u32::MAX);
 
         mock.freeze_shard(0);
-        let pending = tokio::spawn({
+        let pending = compio::runtime::spawn({
             let client = client.clone();
             let (first, second, upper) = (first.clone(), second.clone(), upper.clone());
             async move {

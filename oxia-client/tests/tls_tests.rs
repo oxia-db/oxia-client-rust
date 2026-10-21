@@ -28,8 +28,8 @@ use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use std::time::{Duration, Instant};
 use testcontainers::core::ports::ContainerPort;
 use testcontainers::core::wait::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::runners::SyncRunner;
+use testcontainers::{Container, GenericImage, ImageExt};
 
 mod common;
 
@@ -77,7 +77,7 @@ fn generate_certs() -> TestCerts {
 }
 
 struct TlsCluster {
-    _container: ContainerAsync<GenericImage>,
+    _container: Container<GenericImage>,
     address: String,
 }
 
@@ -132,7 +132,6 @@ async fn start_tls_oxia(certs: &TestCerts, client_auth: bool) -> TlsCluster {
         .with_copy_to("/oxia/tls/cluster.yaml", cluster_yaml.into_bytes())
         .with_cmd(vec!["bash".to_string(), "-c".to_string(), script])
         .start()
-        .await
         .expect("Failed to start TLS Oxia cluster");
 
     TlsCluster {
@@ -158,7 +157,7 @@ async fn connect_with_retry(address: &str, tls: TlsOptions) -> OxiaClient {
                     Instant::now() < deadline,
                     "client could not connect over TLS before the deadline: {e}"
                 );
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                compio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     }
@@ -167,7 +166,7 @@ async fn connect_with_retry(address: &str, tls: TlsOptions) -> OxiaClient {
 /// TLS end to end: handshake with a custom CA, operations across shards (the
 /// re-dialed shard-assignment addresses must also go over TLS), and rejection
 /// of a client that does not trust the cluster's CA.
-#[tokio::test]
+#[compio::test]
 async fn test_tls_end_to_end() {
     let certs = generate_certs();
     let cluster = start_tls_oxia(&certs, false).await;
@@ -209,7 +208,7 @@ async fn test_tls_end_to_end() {
 
 /// Mutual TLS: the server requires a client certificate; a client presenting
 /// one works end to end, a client without one is rejected.
-#[tokio::test]
+#[compio::test]
 async fn test_tls_mutual_auth() {
     let certs = generate_certs();
     let cluster = start_tls_oxia(&certs, true).await;
