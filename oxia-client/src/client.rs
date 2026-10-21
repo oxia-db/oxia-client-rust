@@ -57,7 +57,6 @@ pub(crate) struct Inner {
     pub(crate) shard_manager: Rc<ShardManager>,
     pub(crate) session_manager: Rc<SessionManager>,
     batcher_deps: Rc<BatcherDeps>,
-    metrics: Metrics,
     notification_managers: RefCell<HashMap<u64, NotificationManager>>,
     sequence_managers: RefCell<HashMap<u64, SequenceUpdatesManager>>,
     next_subscription_id: Cell<u64>,
@@ -209,6 +208,7 @@ impl OxiaClient {
             max_write_batches_in_flight: options.max_write_batches_in_flight as usize,
             max_read_batches_in_flight: options.max_read_batches_in_flight as usize,
             request_timeout: options.request_timeout,
+            metrics,
         });
         let session_manager = Rc::new(SessionManager::new(
             options.identity.clone(),
@@ -226,7 +226,6 @@ impl OxiaClient {
                 session_manager,
                 write_manager: WriteManager::new(batcher_deps.clone()),
                 batcher_deps,
-                metrics,
                 notification_managers: RefCell::new(HashMap::new()),
                 sequence_managers: RefCell::new(HashMap::new()),
                 next_subscription_id: Cell::new(0),
@@ -650,7 +649,7 @@ impl OxiaClient {
     }
 
     pub(crate) fn metrics(&self) -> &Metrics {
-        &self.inner.metrics
+        &self.inner.batcher_deps.metrics
     }
 
     pub(crate) fn identity(&self) -> &str {

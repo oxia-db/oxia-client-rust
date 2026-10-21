@@ -64,18 +64,18 @@ pub struct OxiaClientBuilder {
     request_timeout: Option<Duration>,
     auth: Option<crate::auth::TokenAuth>,
     #[cfg(feature = "otel")]
-    meter: Option<opentelemetry::metrics::Meter>,
+    meter: Option<nanometer::Meter>,
     #[cfg(feature = "tls")]
     tls: Option<crate::tls::TlsOptions>,
 }
 
 // The `auth` token provider (an `Arc<dyn TokenProvider>`) and the `otel`
-// meter (an `Arc<dyn InstrumentProvider>`) are not structurally unwind-safe,
-// which would strip these auto traits from the builder — a spurious semver
-// break, since neither reading a token nor recording a metric across an
-// unwind boundary is unsound. Assert them back; the compile-time check in the
-// tests module proves the builder stays unwind-safe in every feature
-// configuration.
+// meter (around an `Arc<dyn InstrumentProvider>`) are not structurally
+// unwind-safe, which would strip these auto traits from the builder — a
+// spurious semver break, since neither reading a token nor recording a metric
+// across an unwind boundary is unsound. Assert them back; the compile-time
+// check in the tests module proves the builder stays unwind-safe in every
+// feature configuration.
 impl std::panic::UnwindSafe for OxiaClientBuilder {}
 impl std::panic::RefUnwindSafe for OxiaClientBuilder {}
 
@@ -181,8 +181,13 @@ impl OxiaClientBuilder {
     }
 
     /// Records client metrics through the given OpenTelemetry meter provider,
-    /// under the meter named `oxia_client`. When unset, the global meter
+    /// under the scope named `oxia_client`. When unset, the global meter
     /// provider is used. Requires the `otel` feature.
+    ///
+    /// The client's metrics are [nanometer](https://docs.rs/nanometer)
+    /// histograms, which export through a `nanometer::Producer` registered
+    /// with the app's metric reader, not through the provider: see the `otel`
+    /// feature in the crate docs.
     #[cfg(feature = "otel")]
     #[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
     pub fn meter_provider(mut self, provider: &impl opentelemetry::metrics::MeterProvider) -> Self {

@@ -13,7 +13,7 @@
 [docs-url]: https://docs.rs/oxia-client
 [ci-badge]: https://github.com/oxia-db/oxia-client-rust/actions/workflows/ci.yml/badge.svg
 [ci-url]: https://github.com/oxia-db/oxia-client-rust/actions/workflows/ci.yml
-[msrv-badge]: https://img.shields.io/badge/MSRV-1.95-blue.svg
+[msrv-badge]: https://img.shields.io/badge/MSRV-1.99-blue.svg
 [msrv-url]: https://github.com/oxia-db/oxia-client-rust
 [license-badge]: https://img.shields.io/crates/l/oxia-client.svg
 [license-url]: ./LICENSE
@@ -96,7 +96,7 @@ Oxia's main branch). It does **not** support the legacy `io.streamnative.oxia.pr
 
 | `oxia-client` | Oxia server | Rust toolchain | Runtime |
 |---|---|---|---|
-| 0.2.x | serves `io.oxia.proto.v1` (recent releases) | 1.95+ (edition 2024) | compio 0.19, single-threaded |
+| 0.2.x | serves `io.oxia.proto.v1` (recent releases) | 1.99+ (edition 2024) | compio 0.19, single-threaded |
 | 0.1.x | serves `io.oxia.proto.v1` (recent releases) | 1.85+ (edition 2024) | Tokio |
 
 ## Crates
