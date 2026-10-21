@@ -27,18 +27,15 @@ use testcontainers::core::wait::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
+mod common;
+
 const OXIA_PORT: u16 = 6648;
-const DEFAULT_OXIA_IMAGE: &str = "oxia/oxia";
-const DEFAULT_OXIA_TAG: &str = "nightly-beta";
 const SHARDS: u32 = 4;
 
 /// Starts a multi-shard standalone Oxia server (the Java IT uses
 /// `new OxiaContainer(...).withShards(10)`; see the module note on shard count).
 async fn start_oxia() -> (ContainerAsync<GenericImage>, String) {
-    let image = std::env::var("OXIA_IMAGE").unwrap_or_else(|_| DEFAULT_OXIA_IMAGE.to_string());
-    let tag = std::env::var("OXIA_TAG").unwrap_or_else(|_| DEFAULT_OXIA_TAG.to_string());
-
-    let container = GenericImage::new(image, tag)
+    let container = common::oxia_image()
         .with_exposed_port(ContainerPort::Tcp(OXIA_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Started Grpc server"))
         .with_cmd(vec![

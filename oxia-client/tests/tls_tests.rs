@@ -17,9 +17,9 @@ use testcontainers::core::wait::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
+mod common;
+
 const OXIA_PORT: u16 = 6648;
-const DEFAULT_OXIA_IMAGE: &str = "oxia/oxia";
-const DEFAULT_OXIA_TAG: &str = "nightly-beta";
 
 struct TestCerts {
     ca_pem: String,
@@ -70,9 +70,6 @@ struct TlsCluster {
 /// Starts the one-container TLS cluster. With `client_auth`, the server also
 /// requires and verifies a client certificate (mutual TLS).
 async fn start_tls_oxia(certs: &TestCerts, client_auth: bool) -> TlsCluster {
-    let image = std::env::var("OXIA_IMAGE").unwrap_or_else(|_| DEFAULT_OXIA_IMAGE.to_string());
-    let tag = std::env::var("OXIA_TAG").unwrap_or_else(|_| DEFAULT_OXIA_TAG.to_string());
-
     // The advertised public address must be reachable from the host, so pin
     // the host port up front and bake it into the cluster config.
     let host_port = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -106,7 +103,7 @@ async fn start_tls_oxia(certs: &TestCerts, client_auth: bool) -> TlsCluster {
          wait"
     );
 
-    let container = GenericImage::new(image, tag)
+    let container = common::oxia_image()
         .with_wait_for(WaitFor::message_on_stdout("Started Grpc server"))
         .with_mapped_port(host_port, ContainerPort::Tcp(OXIA_PORT))
         .with_copy_to("/oxia/tls/ca.crt", certs.ca_pem.clone().into_bytes())
