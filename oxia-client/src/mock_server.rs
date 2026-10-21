@@ -138,6 +138,8 @@ struct State {
     /// Operations per received `WriteRequest` (puts + deletes + delete-ranges).
     write_batch_sizes: Mutex<Vec<usize>>,
     write_connections: AtomicU32,
+    /// Gets per received `ReadRequest`, in order.
+    read_batch_sizes: Mutex<Vec<usize>>,
     /// Keeps assignment streams open for the lifetime of the mock, with the
     /// namespace that each one asked for.
     assignment_senders: Mutex<Vec<(String, AssignmentSender)>>,
@@ -278,6 +280,7 @@ impl MockOxia {
             write_requests: Mutex::new(Vec::new()),
             write_batch_sizes: Mutex::new(Vec::new()),
             write_connections: AtomicU32::new(0),
+            read_batch_sizes: Mutex::new(Vec::new()),
             assignment_senders: Mutex::new(Vec::new()),
             notifications: Mutex::new(HashMap::new()),
             notifications_changed: tokio::sync::watch::Sender::new(()),
@@ -424,6 +427,15 @@ impl MockOxia {
 
     pub(crate) fn write_connections(&self) -> u32 {
         self.state.write_connections.load(Ordering::SeqCst)
+    }
+
+    /// Gets per `ReadRequest` the server has received, in order.
+    pub(crate) fn read_batch_sizes(&self) -> Vec<usize> {
+        self.state
+            .read_batch_sizes
+            .lock()
+            .expect("sizes lock")
+            .clone()
     }
 
     /// Publishes a notification batch on `shard`, at the offset after its
@@ -743,6 +755,11 @@ impl OxiaService for Service {
     async fn read(&self, request: Request<proto::ReadRequest>) -> Rpc<Self::ReadStream> {
         let mode = self.state.behavior.lock().expect("behavior lock").read;
         let request = request.into_inner();
+        self.state
+            .read_batch_sizes
+            .lock()
+            .expect("sizes lock")
+            .push(request.gets.len());
         self.reject_split_shard(request.shard)?;
         let gets = request.gets;
         match mode {
@@ -1067,8 +1084,8 @@ mod tests {
         assert_eq!(batches, [vec!["a", "b"], vec!["large"], vec!["c", "d"]]);
     }
 
-    /// No more write batches than `max_write_batches_in_flight` are ever
-    /// outstanding on a shard.
+    /// While `max_write_batches_in_flight` batches are outstanding on a shard,
+    /// the open batch waits for one of them to complete.
     #[compio::test]
     async fn write_window_is_bounded() {
         let mock = MockOxia::start(Behavior {
@@ -1085,7 +1102,8 @@ mod tests {
             .expect("connect");
 
         // Stagger the first two puts so each dispatches as its own batch and
-        // fills one window slot; the remaining four must then queue.
+        // fills one window slot; the remaining four must then wait in the
+        // open batch.
         let mut puts = Vec::new();
         for i in 0..6 {
             let client = client.clone();
@@ -1101,13 +1119,100 @@ mod tests {
         assert_eq!(
             mock.write_batch_sizes().len(),
             2,
-            "only the window's worth of batches may be dispatched"
+            "the open batch must wait for a free slot"
         );
 
         // The server never answers, so every operation times out.
         for put in puts {
             assert!(matches!(put.await.expect("join"), Err(OxiaError::Timeout)));
         }
+    }
+
+    /// While the window is exhausted, a batch sealed at
+    /// `max_requests_per_batch` still goes out at once: only the open batch
+    /// waits for a free slot.
+    #[compio::test]
+    async fn sealed_batches_go_out_while_the_window_is_exhausted() {
+        let mock = MockOxia::start(Behavior {
+            write: WriteMode::Hang,
+            ..Behavior::default()
+        })
+        .await;
+        let client = OxiaClientBuilder::new()
+            .service_address(mock.address.clone())
+            // Longer than the test: a stream that timed out would free the
+            // slot of the first put.
+            .request_timeout(Duration::from_secs(30))
+            .max_write_batches_in_flight(1)
+            .max_requests_per_batch(3)
+            .build()
+            .await
+            .expect("connect");
+
+        // The server never answers the first put, which fills the window.
+        // The puts are held until the end: dropping a handle cancels the task.
+        let mut puts = vec![spawn_write(client.put("sealed/first", "x").into_future())];
+        wait_until("the first put is in flight", || {
+            mock.write_batch_sizes() == [1]
+        })
+        .await;
+        // Six puts fill two batches, and a seventh opens a third.
+        puts.extend(
+            (0..7).map(|i| spawn_write(client.put(format!("sealed/{i}"), "x").into_future())),
+        );
+        wait_until("the sealed batches are in flight", || {
+            mock.write_batch_sizes() == [1, 3, 3]
+        })
+        .await;
+        compio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            mock.write_batch_sizes(),
+            [1, 3, 3],
+            "the open batch must wait for a free slot"
+        );
+    }
+
+    /// The same holds for reads: while the read window is exhausted, a batch
+    /// sealed at `max_requests_per_batch` still goes out at once.
+    #[compio::test]
+    async fn sealed_read_batches_go_out_while_the_window_is_exhausted() {
+        let mock = MockOxia::start(Behavior {
+            read: ReadMode::Hang,
+            ..Behavior::default()
+        })
+        .await;
+        let client = OxiaClientBuilder::new()
+            .service_address(mock.address.clone())
+            .request_timeout(Duration::from_secs(30))
+            .max_read_batches_in_flight(1)
+            .max_requests_per_batch(3)
+            .build()
+            .await
+            .expect("connect");
+
+        let spawn_get = |key: String| {
+            let client = client.clone();
+            compio::runtime::spawn(async move { client.get(key).await.map(drop) })
+        };
+        // The server never answers the first get, which fills the window.
+        // The gets are held until the end: dropping a handle cancels the task.
+        let mut gets = vec![spawn_get("sealed/first".to_string())];
+        wait_until("the first get is in flight", || {
+            mock.read_batch_sizes() == [1]
+        })
+        .await;
+        // Six gets fill two batches, and a seventh opens a third.
+        gets.extend((0..7).map(|i| spawn_get(format!("sealed/{i}"))));
+        wait_until("the sealed batches are in flight", || {
+            mock.read_batch_sizes() == [1, 3, 3]
+        })
+        .await;
+        compio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            mock.read_batch_sizes(),
+            [1, 3, 3],
+            "the open batch must wait for a free slot"
+        );
     }
 
     /// A server that acknowledges a batch with missing per-operation

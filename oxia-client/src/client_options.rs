@@ -28,9 +28,11 @@ pub struct OxiaClientOptions {
     pub batch_max_size: u32,
     /// Maximum number of requests per batch (default: 1000).
     pub max_requests_per_batch: u32,
-    /// Maximum write batches in flight per shard (default: 4).
+    /// Write batches in flight per shard before the open batch waits
+    /// (default: 4).
     pub max_write_batches_in_flight: u32,
-    /// Maximum concurrent read batches per shard (default: 4).
+    /// Read batches in flight per shard before the open batch waits
+    /// (default: 4).
     pub max_read_batches_in_flight: u32,
     /// Session timeout for ephemeral records (default: 15s).
     pub session_timeout: Duration,
