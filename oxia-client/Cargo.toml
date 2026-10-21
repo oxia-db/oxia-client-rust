@@ -16,7 +16,7 @@
 name = "oxia-client"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.99"
 
 description = "Native Rust client SDK for Oxia, a distributed key-value store. Provides an idiomatic, asynchronous API on a single-threaded compio runtime."
 license = "Apache-2.0"
@@ -54,7 +54,7 @@ rustls-native-certs = { version = "0.8", optional = true }
 
 [features]
 # OpenTelemetry metrics (scope `oxia_client`) through nanometer; off by default
-# for a zero-cost build. nanometer needs Rust 1.99.
+# for a zero-cost build.
 otel = ["dep:opentelemetry", "dep:nanometer"]
 # TLS connections (rustls with the ring provider; OS trust roots by default).
 tls = ["compio/rustls", "compio/ring", "dep:rustls-native-certs"]

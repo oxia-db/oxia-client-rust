@@ -181,12 +181,12 @@
 //!
 //! - **`otel`** *(off by default)* — records client metrics through
 //!   [OpenTelemetry](https://opentelemetry.io/) 0.33, with
-//!   [nanometer](https://docs.rs/nanometer) handles (which need Rust 1.99).
-//!   With the feature enabled, the latency and value sizes of operations and
-//!   batches are reported under the `oxia_client` scope; attach a meter
-//!   provider with [`OxiaClientBuilder`]'s `meter_provider` method, or let the
-//!   client fall back to the global provider. Without it, metrics recording
-//!   compiles to a zero-cost no-op.
+//!   [nanometer](https://docs.rs/nanometer) handles. With the feature
+//!   enabled, the latency and value sizes of operations and batches are
+//!   reported under the `oxia_client` scope; attach a meter provider with
+//!   [`OxiaClientBuilder`]'s `meter_provider` method, or let the client fall
+//!   back to the global provider. Without it, metrics recording compiles to a
+//!   zero-cost no-op.
 //!
 //!   The metrics are histograms, which nanometer exports through its
 //!   `Producer`: the app registers `nanometer::Producer::new()` with its
