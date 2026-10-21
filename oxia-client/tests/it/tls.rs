@@ -21,7 +21,6 @@
 //! config advertises the host-mapped public port so the shard-assignment
 //! addresses the client re-dials are reachable (and covered by the server
 //! certificate's `localhost` SAN).
-#![cfg(feature = "tls")]
 
 use oxia::{OxiaClient, OxiaClientBuilder, TlsOptions};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
@@ -31,7 +30,7 @@ use testcontainers::core::wait::WaitFor;
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 
-mod common;
+use crate::common;
 
 const OXIA_PORT: u16 = 6648;
 

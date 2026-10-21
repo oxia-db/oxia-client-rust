@@ -89,10 +89,10 @@ jobs:
       # paths are never exercised above. Run the feature-gated tests explicitly
       # (the image is already pulled).
       - name: Run metrics test (otel feature)
-        run: cargo test -p oxia-client --features otel --test integration_tests test_metrics_recorded_through_meter_provider
+        run: cargo test -p oxia-client --features otel --test it integration::test_metrics_recorded_through_meter_provider
 
       - name: Run TLS tests (tls feature)
-        run: cargo test -p oxia-client --features tls --test tls_tests
+        run: cargo test -p oxia-client --features tls --test it tls::
 
   semver:
     name: Semver checks

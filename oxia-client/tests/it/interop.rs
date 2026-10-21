@@ -28,7 +28,7 @@ use testcontainers::core::{CmdWaitFor, ExecCommand};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 
-mod common;
+use crate::common;
 
 const OXIA_PORT: u16 = 6648;
 const SHARDS: u32 = 10;
