@@ -33,7 +33,7 @@ use testcontainers::core::wait::WaitFor;
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 
-mod common;
+use crate::common;
 
 struct Cluster {
     /// Shared with the container commands, which run off the clients' thread.

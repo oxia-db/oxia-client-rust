@@ -50,8 +50,8 @@ CI runs `fmt`, `clippy -D warnings`, `build`, the full test suite, and
 1. Fork the repository and create a feature branch off `main`.
 2. Keep changes focused and match the surrounding style. `cargo fmt` and
    `cargo clippy --all-targets -- -D warnings` must be clean.
-3. Add tests for new behavior (unit tests, or integration tests under
-   `oxia-client/tests/` for server-observable behavior).
+3. Add tests for new behavior (unit tests, or integration tests in a module of
+   `oxia-client/tests/it/` for server-observable behavior).
 4. **Sign off your commits.** This project requires a
    [Developer Certificate of Origin](https://developercertificate.org/) sign-off — commit with
    `git commit -s` (adds a `Signed-off-by` trailer). The DCO check will fail otherwise.

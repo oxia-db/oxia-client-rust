@@ -19,7 +19,7 @@ use testcontainers::core::wait::WaitFor;
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 
-mod common;
+use crate::common;
 
 const OXIA_PORT: u16 = 6648;
 
@@ -2220,7 +2220,7 @@ async fn test_operations_survive_server_restart() {
 //   - Shard split/merge under load: the standalone exposes only the public
 //     service (port 6648); it runs no coordinator/admin service, so the
 //     `OxiaAdmin.SplitShard` RPC is unreachable and no live split can be
-//     triggered. `cluster_tests.rs` drives live splits against a multi-node
+//     triggered. `cluster.rs` drives live splits against a multi-node
 //     cluster instead. No server reports a split shard: the batchers fail an
 //     operation whose shard has left the assignments with `ShardMoved`, and
 //     the operation is re-routed — re-hashed and resubmitted, or, for a
