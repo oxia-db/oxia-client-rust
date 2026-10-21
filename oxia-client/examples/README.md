@@ -21,3 +21,4 @@ cargo run --example basic_kv
 | [graceful_shutdown](graceful_shutdown.rs) | Stop producers → drain in-flight ops → `close()` |
 | [security_auth](security_auth.rs) | Bearer-token authentication (static + rotating provider) |
 | [security_tls](security_tls.rs) | TLS: system roots, custom CA, mutual TLS — `cargo run --features tls --example security_tls` |
+| [alloc_count](alloc_count.rs) | Heap allocations per put and get, and (`ALLOC_TRACE=1`) where they come from — `cargo run --release --example alloc_count` |

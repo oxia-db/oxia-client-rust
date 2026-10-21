@@ -35,3 +35,4 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 hdrhistogram = { workspace = true }
 rand = { workspace = true }
+mimalloc = { workspace = true }

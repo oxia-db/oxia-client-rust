@@ -50,6 +50,7 @@ futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 hdrhistogram = "7"
 rand = "0.9"
+mimalloc = "0.1"
 # nanometer pins the API crate to =0.33.1.
 opentelemetry = "0.33"
 nanometer = "0.1"

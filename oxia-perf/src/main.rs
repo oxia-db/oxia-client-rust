@@ -32,6 +32,11 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+/// mimalloc rather than the system allocator: the client allocates on every
+/// operation.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// How often interval stats are printed.
 const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
