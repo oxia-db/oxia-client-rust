@@ -134,10 +134,14 @@ pub(crate) async fn connect(address: &str, options: &DialOptions) -> Result<Prov
     let channel = compio::time::timeout(options.connect_timeout, dial)
         .await
         .map_err(|_| disconnected("timed out connecting".to_string()))??;
+    // tonic decodes at most 4 MiB by default, while a record can be much
+    // larger, and the server fills a read response until it holds 2 MiB of
+    // values: take whatever it sends.
     let client = OxiaClientClient::with_origin(
         InterceptedService::new(channel.clone(), AuthInterceptor::new(options.auth.clone())),
         origin,
-    );
+    )
+    .max_decoding_message_size(usize::MAX);
     Ok(Provider { client, channel })
 }
 
