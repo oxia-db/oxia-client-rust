@@ -19,8 +19,7 @@ use testcontainers::core::wait::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-const DEFAULT_OXIA_IMAGE: &str = "oxia/oxia";
-const DEFAULT_OXIA_TAG: &str = "main";
+mod common;
 
 struct Cluster {
     container: ContainerAsync<GenericImage>,
@@ -32,9 +31,6 @@ struct Cluster {
 /// ports 6648, 6658, … — each mapped to a pinned host port and advertised as
 /// such) plus a coordinator with `initial_shards` shards spread across them.
 async fn start_cluster(servers: usize, initial_shards: u32) -> Cluster {
-    let image = std::env::var("OXIA_IMAGE").unwrap_or_else(|_| DEFAULT_OXIA_IMAGE.to_string());
-    let tag = std::env::var("OXIA_TAG").unwrap_or_else(|_| DEFAULT_OXIA_TAG.to_string());
-
     // The advertised public addresses must be reachable from the host, so pin
     // one host port per server up front and bake them into the cluster config.
     let host_ports: Vec<u16> = (0..servers)
@@ -75,7 +71,7 @@ async fn start_cluster(servers: usize, initial_shards: u32) -> Cluster {
          wait"
     );
 
-    let mut request = GenericImage::new(image, tag)
+    let mut request = common::oxia_image()
         .with_wait_for(WaitFor::message_on_stdout("Started Grpc server"))
         .with_copy_to("/oxia/conf/cluster.yaml", cluster_yaml.into_bytes())
         .with_cmd(vec!["bash".to_string(), "-c".to_string(), script]);

@@ -45,7 +45,7 @@ jobs:
       # the same image race in the Docker client ("bytes remaining on stream").
       # Pull it once up front so the tests find it already present.
       - name: Pre-pull Oxia test image
-        run: docker pull oxia/oxia:main
+        run: docker pull oxia/oxia:nightly-beta
 
       - name: Run tests
         run: cargo test --workspace
