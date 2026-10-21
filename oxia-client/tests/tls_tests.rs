@@ -19,7 +19,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const OXIA_PORT: u16 = 6648;
 const DEFAULT_OXIA_IMAGE: &str = "oxia/oxia";
-const DEFAULT_OXIA_TAG: &str = "main";
+const DEFAULT_OXIA_TAG: &str = "nightly-beta";
 
 struct TestCerts {
     ca_pem: String,

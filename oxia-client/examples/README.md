@@ -3,7 +3,7 @@
 Every example runs against a local Oxia at `localhost:6648` (unless noted):
 
 ```shell
-docker run -p 6648:6648 oxia/oxia:main oxia standalone
+docker run -p 6648:6648 oxia/oxia:nightly-beta oxia standalone
 cargo run --example basic_kv
 ```
 

@@ -11,7 +11,8 @@ see the Oxia [Code of Conduct](https://github.com/oxia-db/oxia/blob/main/CODE_OF
 - **CMake** — required by a native build dependency. This repo pins it with
   [mise](https://mise.jdx.dev): run `mise install` in the repo root, or install CMake yourself.
 - **Docker** — the integration and interop tests start a real Oxia server in a container
-  (`oxia/oxia:main`). Docker must be running to execute them.
+  (`oxia/oxia:nightly-beta`, built daily from Oxia's main branch). Docker must be running to
+  execute them.
 
 No `protoc` is required: the gRPC code is generated at build time from the `.proto`
 sources with the pure-Rust [`protox`](https://crates.io/crates/protox) compiler.
@@ -26,11 +27,12 @@ cargo test --workspace --lib --doc                       # fast unit + doc tests
 cargo test --workspace                                   # everything, incl. Docker-backed tests
 ```
 
-The Docker-backed tests pull `oxia/oxia:main`. On a cold machine, pre-pull it to avoid a
-first-run delay and a concurrent-pull race:
+The Docker-backed tests pull `oxia/oxia:nightly-beta`. On a cold machine, pre-pull it to
+avoid a first-run delay and a concurrent-pull race. The tests never re-pull an image that is
+already present, so pull it again to pick up the latest daily build:
 
 ```shell
-docker pull oxia/oxia:main
+docker pull oxia/oxia:nightly-beta
 ```
 
 Build the API docs locally with:

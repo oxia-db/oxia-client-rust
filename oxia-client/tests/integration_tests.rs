@@ -7,7 +7,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const OXIA_PORT: u16 = 6648;
 const DEFAULT_OXIA_IMAGE: &str = "oxia/oxia";
-const DEFAULT_OXIA_TAG: &str = "main";
+const DEFAULT_OXIA_TAG: &str = "nightly-beta";
 
 async fn start_oxia() -> (ContainerAsync<GenericImage>, String) {
     start_oxia_with(&[]).await
@@ -434,11 +434,7 @@ async fn test_get_higher() {
 /// of the namespace, which the server reports with the shard assignments. The
 /// keys are the example of oxia-db/oxia#1388: with 4 shards, the legacy
 /// slash-aware merge disagrees with the server's order in both sortings.
-///
-/// Run it against `oxia/oxia:nightly-beta`, built daily from oxia main:
-/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
 #[tokio::test]
-#[ignore = "needs a server that reports the key sorting (oxia-db/oxia#1388), which oxia/oxia:main predates"]
 async fn test_multi_shard_reads_merge_in_the_key_sorting() {
     for (key_sorting, floor_of, floor, ordered) in [
         (
@@ -564,11 +560,7 @@ async fn test_multiple_puts_batch() {
 /// issued (the requests' `op_index`), so the last put wins. A server without
 /// ordered writes applies every put before any delete, leaving the key
 /// deleted.
-///
-/// Run it against `oxia/oxia:nightly-beta`, built daily from oxia main:
-/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
 #[tokio::test]
-#[ignore = "needs an Oxia server with ordered writes (oxia-db/oxia#1312), which oxia/oxia:main predates"]
 async fn test_batched_writes_apply_in_issue_order() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -596,11 +588,7 @@ async fn test_batched_writes_apply_in_issue_order() {
 /// without waiting, share a write batch. The server applies them in the order
 /// they were issued, so the put survives the delete range. A server without
 /// ordered writes applies the put first, and the delete range deletes it.
-///
-/// Run it against `oxia/oxia:nightly-beta`, built daily from oxia main:
-/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
 #[tokio::test]
-#[ignore = "needs an Oxia server with ordered writes (oxia-db/oxia#1312), which oxia/oxia:main predates"]
 async fn test_put_issued_after_a_delete_range_survives_it() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -897,12 +885,7 @@ async fn test_secondary_index() {
 /// reference (`TestSyncClientImpl_RangeScanUseIndexKeySorting`): with 4 shards,
 /// they land on all of them, and their secondary keys sort in the opposite
 /// order of their keys.
-///
-/// Run it against a server with oxia-db/oxia#1508, such as
-/// `oxia/oxia:nightly-beta`:
-/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
 #[tokio::test]
-#[ignore = "needs a server that sends the secondary keys of a range scan (oxia-db/oxia#1508), which oxia/oxia:main predates"]
 async fn test_index_range_scan_merges_by_the_secondary_keys() {
     let records = [
         ("p1", "h"),
@@ -984,12 +967,7 @@ async fn test_end_inclusive_includes_the_end_or_fails() {
 /// whose secondary key is that key. The records are the example of
 /// oxia-db/oxia#1608, where `["k-1", "k-1~")` also matches `k-12`, `k-1:a`
 /// and `k-1_b`.
-///
-/// Run it against a server with oxia-db/oxia#1608, such as an
-/// `oxia/oxia:nightly-beta` built after it:
-/// `OXIA_TAG=nightly-beta cargo test --test integration_tests -- --ignored`.
 #[tokio::test]
-#[ignore = "needs FEATURE_RANGE_END_INCLUSIVE (oxia-db/oxia#1608), which oxia/oxia:main predates"]
 async fn test_list_and_range_scan_end_inclusive() {
     let (_container, address) = start_oxia_with(&["--shards", "4"]).await;
     let client = new_client(&address).await;

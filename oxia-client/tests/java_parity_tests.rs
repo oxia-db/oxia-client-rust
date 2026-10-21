@@ -29,7 +29,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const OXIA_PORT: u16 = 6648;
 const DEFAULT_OXIA_IMAGE: &str = "oxia/oxia";
-const DEFAULT_OXIA_TAG: &str = "main";
+const DEFAULT_OXIA_TAG: &str = "nightly-beta";
 const SHARDS: u32 = 4;
 
 /// Starts a multi-shard standalone Oxia server (the Java IT uses

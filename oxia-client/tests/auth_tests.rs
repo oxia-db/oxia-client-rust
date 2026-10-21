@@ -19,7 +19,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const OXIA_PORT: u16 = 6648;
 const DEFAULT_OXIA_IMAGE: &str = "oxia/oxia";
-const DEFAULT_OXIA_TAG: &str = "main";
+const DEFAULT_OXIA_TAG: &str = "nightly-beta";
 
 const ISSUER: &str = "https://oxia-test-issuer";
 const AUDIENCE: &str = "oxia-test";

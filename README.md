@@ -87,8 +87,8 @@ and [Java](https://oxia-db.github.io/docs/clients/java) clients:
 ## Compatibility
 
 The client speaks Oxia's `io.oxia.proto.v1` gRPC protocol and requires a server that serves
-it (current Oxia releases; CI runs against the `oxia/oxia:main` image). It does **not** support
-the legacy `io.streamnative.oxia.proto` service.
+it (current Oxia releases; CI runs against the `oxia/oxia:nightly-beta` image, built daily from
+Oxia's main branch). It does **not** support the legacy `io.streamnative.oxia.proto` service.
 
 | `oxia-client` | Oxia server | Rust toolchain |
 |---|---|---|

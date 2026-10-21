@@ -20,7 +20,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const DEFAULT_OXIA_IMAGE: &str = "oxia/oxia";
-const DEFAULT_OXIA_TAG: &str = "main";
+const DEFAULT_OXIA_TAG: &str = "nightly-beta";
 
 struct Cluster {
     container: ContainerAsync<GenericImage>,
