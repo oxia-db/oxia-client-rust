@@ -21,6 +21,27 @@ on:
     branches: [main]
 
 jobs:
+  license:
+    name: License headers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Every tracked file must open with the Apache-2.0 header, except the
+      # license itself, Cargo's generated lockfile, docs, test keys and
+      # .gitignore.
+      - name: Check license headers
+        run: |
+          missing=0
+          while IFS= read -r f; do
+            if ! head -n 20 "$f" | grep -q 'Licensed under the Apache License, Version 2.0'; then
+              echo "::error file=$f::missing the Apache-2.0 license header"
+              missing=1
+            fi
+          done < <(git ls-files -- . ':!:LICENSE' ':!:Cargo.lock' ':!:*.md' ':!:*.pem' ':!:.gitignore')
+          exit $missing
+
   check:
     name: Check & Test
     runs-on: ubuntu-latest
