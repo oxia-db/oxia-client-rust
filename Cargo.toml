@@ -66,6 +66,17 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem
 opentelemetry = { git = "https://github.com/merlimat/opentelemetry-rust", branch = "metric-producer-0.33.1" }
 opentelemetry_sdk = { git = "https://github.com/merlimat/opentelemetry-rust", branch = "metric-producer-0.33.1" }
 
+# Keep debug builds small: line tables only for workspace crates (enough for
+# backtraces with file:line).
+[profile.dev]
+debug = "line-tables-only"
+
+# No debuginfo for dependencies, so optimizing them loses nothing when
+# debugging; it shrinks every test and example binary that links them.
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+
 # Optimize release builds (notably the oxia-perf benchmark binary): whole-program
 # LTO and a single codegen unit trade compile time for a faster, smaller binary.
 [profile.release]
