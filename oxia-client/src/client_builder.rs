@@ -105,21 +105,25 @@ impl OxiaClientBuilder {
         self
     }
 
-    /// The maximum number of write batches in flight per shard (default: 4).
+    /// How many write batches may be in flight per shard before operations
+    /// accumulate in the open batch (default: 4).
     ///
     /// Batching is rate-adaptive: while fewer batches are outstanding on a
     /// shard's write stream, operations are dispatched almost immediately;
     /// once the window is exhausted, the open batch accumulates operations, so
-    /// batch size automatically tracks the server's service rate. Must be at
-    /// least 1.
+    /// batch size automatically tracks the server's service rate. A batch
+    /// that reaches [`batch_max_size`](Self::batch_max_size) or
+    /// [`max_requests_per_batch`](Self::max_requests_per_batch) goes out at
+    /// once, whatever the window. Must be at least 1.
     pub fn max_write_batches_in_flight(mut self, max: u32) -> Self {
         self.max_write_batches_in_flight = Some(max);
         self
     }
 
-    /// The maximum number of concurrent read batches per shard (default: 4).
-    /// Works like [`max_write_batches_in_flight`](Self::max_write_batches_in_flight),
-    /// bounding the read RPCs outstanding per shard. Must be at least 1.
+    /// How many read batches may be in flight per shard before gets
+    /// accumulate in the open batch (default: 4). Works like
+    /// [`max_write_batches_in_flight`](Self::max_write_batches_in_flight), for
+    /// the read RPCs of a shard. Must be at least 1.
     pub fn max_read_batches_in_flight(mut self, max: u32) -> Self {
         self.max_read_batches_in_flight = Some(max);
         self

@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Rate-adaptive batching with a bounded per-shard in-flight window.
+//! Rate-adaptive batching with a per-shard in-flight window.
 //!
-//! This ports the reference Java client's dispatch-window design: at most
-//! `max_*_batches_in_flight` batches may be outstanding per shard. While the
-//! window has capacity, operations are dispatched almost immediately (a batch
-//! forms only from operations arriving in the same scheduler tick), so a fast
-//! server sees small batches and minimal latency. When the window is
-//! exhausted, the open batch keeps accumulating instead of being flushed, so
-//! batch size automatically tracks the server's service rate — a saturated
-//! server receives ever larger batches up to the byte/count limits, and full
-//! batches queue in FIFO order awaiting a free slot. A write larger than the
-//! byte limit goes out in a batch of its own, as in the Java client.
+//! This ports the reference Java client's dispatch-window design: while fewer
+//! than `max_*_batches_in_flight` batches are outstanding on a shard,
+//! operations are dispatched almost immediately (a batch forms only from
+//! operations arriving in the same scheduler tick), so a fast server sees
+//! small batches and minimal latency. When the window is exhausted, the open
+//! batch keeps accumulating instead of being flushed, so batch size
+//! automatically tracks the server's service rate — a saturated server
+//! receives ever larger batches up to the byte/count limits. A batch sealed
+//! at a limit takes no more operations, so it goes out at once: the window
+//! only decides when the open batch is flushed. (The Java client queues a
+//! sealed batch until a slot frees.) A write larger than the byte limit goes
+//! out in a batch of its own, as in the Java client.
 //!
 //! There is no batcher task, timer, or linger: batching is driven entirely by
 //! operation arrival and batch completion. The only spawned work is
@@ -131,7 +133,9 @@ impl WriteOp {
 }
 
 /// The open/ready bookkeeping every window shares. `open` is `Some` only while
-/// non-empty; `ready` holds sealed batches awaiting a free window slot.
+/// non-empty; `ready` holds sealed batches that cannot go out yet: a write
+/// batcher's, while its shard reconnects or waits for the writes of a split
+/// shard.
 struct Queues<B> {
     open: Option<B>,
     ready: VecDeque<B>,
@@ -151,8 +155,8 @@ impl<B> Default for Queues<B> {
 }
 
 impl<B> Queues<B> {
-    /// The next batch to dispatch once a slot frees: sealed batches first (they
-    /// are older), then the open one.
+    /// The next batch in issue order: sealed batches first (they are older),
+    /// then the open one.
     fn take_next(&mut self) -> Option<B> {
         self.ready.pop_front().or_else(|| self.open.take())
     }
@@ -568,11 +572,7 @@ impl WriteBatcher {
                 let mut open = st.queues.open.take().unwrap_or_default();
                 // Seal the open batch when this operation would overflow it.
                 if !open.is_empty() && open.bytes + size > self.deps.max_batch_size {
-                    if self.can_dispatch_own(&st) {
-                        self.dispatch_locked(&mut st, open);
-                    } else {
-                        st.queues.ready.push_back(open);
-                    }
+                    st.queues.ready.push_back(open);
                     open = WriteBody::default();
                 }
                 open.push(op, size);
@@ -581,22 +581,23 @@ impl WriteBatcher {
                 if open.count >= self.deps.max_requests_per_batch
                     || open.bytes > self.deps.max_batch_size
                 {
-                    if self.can_dispatch_own(&st) {
-                        self.dispatch_locked(&mut st, open);
-                    } else {
-                        st.queues.ready.push_back(open);
-                    }
+                    st.queues.ready.push_back(open);
                 } else {
                     st.queues.open = Some(open);
-                    // Adaptive dispatch: with window capacity available, flush
-                    // the open batch after one scheduler yield (coalescing
-                    // whatever arrives in the meantime). With the window
-                    // exhausted (or a reconnect backoff pending), do nothing —
-                    // a completion or the reconnect will pick it up.
-                    if self.can_dispatch_own(&st) && !st.queues.flush_scheduled {
-                        st.queues.flush_scheduled = true;
-                        spawn_flusher = true;
-                    }
+                }
+                // A sealed batch goes out at once, whatever the window.
+                self.send_sealed(&mut st);
+                // Adaptive dispatch: with window capacity available, flush
+                // the open batch after one scheduler yield (coalescing
+                // whatever arrives in the meantime). With the window
+                // exhausted (or a reconnect backoff pending), do nothing — a
+                // completion or the reconnect will pick it up.
+                if st.queues.open.is_some()
+                    && self.can_flush_open(&st)
+                    && !st.queues.flush_scheduled
+                {
+                    st.queues.flush_scheduled = true;
+                    spawn_flusher = true;
                 }
                 None
             }
@@ -622,45 +623,59 @@ impl WriteBatcher {
         self.fill_capacity(&mut st);
     }
 
-    /// Whether a batch can go out: none can once the shard is retired.
-    fn can_dispatch(&self, st: &WriteState) -> bool {
-        st.retired.is_none()
-            && !st.reconnecting
+    /// Whether a batch can go out: none can while the shard reconnects, nor
+    /// once it is retired.
+    fn can_send(&self, st: &WriteState) -> bool {
+        st.retired.is_none() && !st.reconnecting
+    }
+
+    /// Whether the open batch can go out: after every batch older than it,
+    /// and while the window has capacity.
+    fn can_flush_open(&self, st: &WriteState) -> bool {
+        self.can_send(st)
+            && st.held == 0
+            && st.retry.is_empty()
+            && st.handed_off.is_empty()
+            && st.queues.ready.is_empty()
             && st.pending.len() < self.deps.max_write_batches_in_flight
     }
 
-    /// Whether a batch of the writes in `queues` can go out: not before the
-    /// writes handed off to the shard, which are older.
-    fn can_dispatch_own(&self, st: &WriteState) -> bool {
-        st.held == 0 && st.handed_off.is_empty() && self.can_dispatch(st)
+    /// Sends every queued batch but the open one, whatever the window:
+    /// retries first (they are the oldest), then those handed off by the
+    /// shards this one replaced, then the sealed batches, once those shards
+    /// have handed off all their writes. Retries whose deadline has passed
+    /// fail here instead of being re-sent. Must be called with the state
+    /// borrowed.
+    fn send_sealed(self: &Rc<Self>, st: &mut WriteState) {
+        if !self.can_send(st) {
+            return;
+        }
+        while let Some(inflight) = st.retry.pop_front() {
+            if inflight.first_dispatch.elapsed() >= self.deps.request_timeout {
+                inflight.callbacks.fail(&OxiaError::Timeout);
+            } else {
+                self.send_locked(st, inflight);
+            }
+        }
+        while let Some(body) = st.handed_off.pop_front() {
+            self.dispatch_locked(st, body);
+        }
+        if st.held == 0 {
+            while let Some(body) = st.queues.ready.pop_front() {
+                self.dispatch_locked(st, body);
+            }
+        }
     }
 
-    /// Dispatches queued batches — retries first (they are the oldest), then
-    /// those handed off by the shards this one replaced, then sealed batches,
-    /// then the open one — while the window has capacity. Retries whose
-    /// deadline has passed fail here instead of being re-sent. Must be called
-    /// with the state borrowed.
+    /// Sends the sealed batches, then the open one if the window has
+    /// capacity: while it is exhausted, the open batch keeps accumulating.
+    /// Must be called with the state borrowed.
     fn fill_capacity(self: &Rc<Self>, st: &mut WriteState) {
-        while self.can_dispatch(st) {
-            if let Some(inflight) = st.retry.pop_front() {
-                if inflight.first_dispatch.elapsed() >= self.deps.request_timeout {
-                    inflight.callbacks.fail(&OxiaError::Timeout);
-                    continue;
-                }
-                self.send_locked(st, inflight);
-                continue;
-            }
-            if let Some(body) = st.handed_off.pop_front() {
-                self.dispatch_locked(st, body);
-                continue;
-            }
-            if st.held > 0 {
-                break;
-            }
-            match st.queues.take_next() {
-                Some(body) => self.dispatch_locked(st, body),
-                None => break,
-            }
+        self.send_sealed(st);
+        if self.can_flush_open(st)
+            && let Some(body) = st.queues.open.take()
+        {
+            self.dispatch_locked(st, body);
         }
     }
 
@@ -1279,7 +1294,9 @@ struct ReadState {
 
 /// Batches get operations for one shard. Reads have no byte accounting (the
 /// requests are small) and no ordering constraint: each batch is an
-/// independent `Read` RPC, up to `max_read_batches_in_flight` concurrently.
+/// independent `Read` RPC. As for writes, a batch sealed at
+/// `max_requests_per_batch` goes out at once, and the open one while fewer
+/// than `max_read_batches_in_flight` are in flight.
 pub(crate) struct ReadBatcher {
     shard: i64,
     deps: Rc<BatcherDeps>,
@@ -1311,11 +1328,8 @@ impl ReadBatcher {
                 let mut open = st.queues.open.take().unwrap_or_default();
                 open.gets.push(get);
                 if open.gets.len() >= self.deps.max_requests_per_batch {
-                    if st.in_flight < self.deps.max_read_batches_in_flight {
-                        self.dispatch_locked(&mut st, open);
-                    } else {
-                        st.queues.ready.push_back(open);
-                    }
+                    // A sealed batch goes out at once, whatever the window.
+                    self.dispatch_locked(&mut st, open);
                 } else {
                     st.queues.open = Some(open);
                     if st.in_flight < self.deps.max_read_batches_in_flight
@@ -1348,12 +1362,12 @@ impl ReadBatcher {
         self.fill_capacity(&mut st);
     }
 
+    /// Dispatches the open batch if the window has capacity.
     fn fill_capacity(self: &Rc<Self>, st: &mut ReadState) {
-        while st.in_flight < self.deps.max_read_batches_in_flight {
-            match st.queues.take_next() {
-                Some(body) => self.dispatch_locked(st, body),
-                None => break,
-            }
+        if st.in_flight < self.deps.max_read_batches_in_flight
+            && let Some(body) = st.queues.open.take()
+        {
+            self.dispatch_locked(st, body);
         }
     }
 
