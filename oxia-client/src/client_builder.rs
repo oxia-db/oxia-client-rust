@@ -125,7 +125,9 @@ impl OxiaClientBuilder {
         self
     }
 
-    /// The maximum byte size of a batch (default: 128KiB).
+    /// The maximum byte size of a batch (default: 128KiB), counting the keys
+    /// and values of its writes. A write larger than this goes out in a
+    /// batch of its own.
     pub fn batch_max_size(mut self, batch_max_size: u32) -> Self {
         self.batch_max_size = Some(batch_max_size);
         self

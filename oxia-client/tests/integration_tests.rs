@@ -1227,18 +1227,12 @@ async fn test_get_without_value() {
 #[compio::test]
 async fn test_large_value() {
     let (_container, address) = start_oxia().await;
-    // A 1MiB value exceeds the default 128KiB batch_max_size (which would
-    // reject it with RequestTooLarge); raise the limit for this client.
-    let client = OxiaClientBuilder::new()
-        .service_address(address.clone())
-        .batch_max_size(2 * 1024 * 1024)
-        .request_timeout(Duration::from_secs(10))
-        .build()
-        .await
-        .unwrap();
+    let client = new_client(&address).await;
 
-    // 1MB value
-    let large_value: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
+    // Larger than the default 128KiB batch_max_size, which the put goes past
+    // in a batch of its own, and than the 4MiB that tonic decodes by default,
+    // which the reads go past.
+    let large_value: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 256) as u8).collect();
 
     client
         .put("large/key".to_string(), large_value.clone())
@@ -1246,7 +1240,10 @@ async fn test_large_value() {
         .unwrap();
 
     let result = client.get("large/key".to_string()).await.unwrap();
-    assert_eq!(result.value.as_deref(), Some(large_value).as_deref());
+    assert_eq!(result.value.as_deref(), Some(large_value.as_slice()));
+    let records = client.range_scan("large/", "large/~").await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].value.as_deref(), Some(large_value.as_slice()));
 
     client
         .delete_range("large/".to_string(), "large/~".to_string())
@@ -2003,9 +2000,11 @@ async fn build_fails_fast_when_cluster_unreachable() {
 // Adaptive Batching Tests (P1-9 / P1-10)
 // ============================================================
 
-/// A single write larger than `batch_max_size` is rejected client-side.
+/// A write larger than `batch_max_size` goes out in a batch of its own, in
+/// the order it was issued: after the writes issued before it, and ahead of
+/// those issued after it.
 #[compio::test]
-async fn test_put_larger_than_max_batch_size_is_rejected() {
+async fn test_put_larger_than_max_batch_size() {
     let (_container, address) = start_oxia().await;
     let client = OxiaClientBuilder::new()
         .service_address(address)
@@ -2014,13 +2013,22 @@ async fn test_put_larger_than_max_batch_size_is_rejected() {
         .await
         .unwrap();
 
-    let result = client.put("too/large", vec![0u8; 4096]).await;
-    assert!(matches!(result, Err(OxiaError::RequestTooLarge)));
+    // `biased` polls the puts in order, and each one joins the open batch on
+    // its first poll.
+    let (before, large, after) = tokio::join!(
+        biased;
+        client.put("too/large", b"before".to_vec()),
+        client.put("too/large", vec![0u8; 4096]),
+        client.put("too/large", b"after".to_vec()),
+    );
+    let modifications: Vec<i64> = [before, large, after]
+        .into_iter()
+        .map(|put| put.unwrap().version.modifications_count)
+        .collect();
+    assert_eq!(modifications, [0, 1, 2]);
 
-    // The client is still fully usable afterwards.
-    client.put("too/small", b"ok".to_vec()).await.unwrap();
-    let got = client.get("too/small").await.unwrap();
-    assert_eq!(got.value.as_deref(), Some(b"ok".as_ref()));
+    let got = client.get("too/large").await.unwrap();
+    assert_eq!(got.value.as_deref(), Some(b"after".as_ref()));
     client.close().await.unwrap();
 }
 

@@ -262,8 +262,6 @@ impl OxiaClient {
     /// - [`OxiaError::SessionExpired`] when an
     ///   [`ephemeral`](PutBuilder::ephemeral) put races a session expiry
     ///   (retrying creates a fresh session);
-    /// - [`OxiaError::RequestTooLarge`] when key + value exceed the maximum
-    ///   batch size ([`batch_max_size`](crate::OxiaClientBuilder::batch_max_size));
     /// - [`OxiaError::Timeout`] when the request timeout elapses;
     /// - [`OxiaError::Closed`] after [`close`](OxiaClient::close);
     /// - transient routing/transport errors

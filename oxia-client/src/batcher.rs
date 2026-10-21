@@ -22,7 +22,8 @@
 //! exhausted, the open batch keeps accumulating instead of being flushed, so
 //! batch size automatically tracks the server's service rate — a saturated
 //! server receives ever larger batches up to the byte/count limits, and full
-//! batches queue in FIFO order awaiting a free slot.
+//! batches queue in FIFO order awaiting a free slot. A write larger than the
+//! byte limit goes out in a batch of its own, as in the Java client.
 //!
 //! There is no batcher task, timer, or linger: batching is driven entirely by
 //! operation arrival and batch completion. The only spawned work is
@@ -254,7 +255,9 @@ impl WriteBody {
         self.count == 0
     }
 
-    /// Whether an op of `size` fits next to the ops already in the batch.
+    /// Whether an op of `size` fits next to the ops already in the batch. An
+    /// empty batch takes any op, even one larger than `max_bytes`, and then
+    /// no other.
     fn fits(&self, size: usize, max_requests: usize, max_bytes: usize) -> bool {
         self.is_empty() || (self.count < max_requests && self.bytes + size <= max_bytes)
     }
@@ -542,10 +545,6 @@ impl WriteBatcher {
     /// operation's callback.
     pub(crate) fn add(self: &Rc<Self>, op: WriteOp) {
         let size = op.size();
-        if size > self.deps.max_batch_size {
-            op.fail(OxiaError::RequestTooLarge);
-            return;
-        }
         let mut spawn_flusher = false;
         let rejected = {
             let mut st = self.state.borrow_mut();
@@ -577,7 +576,11 @@ impl WriteBatcher {
                     open = WriteBody::default();
                 }
                 open.push(op, size);
-                if open.count >= self.deps.max_requests_per_batch {
+                // Seal the batch once full. An operation larger than the byte
+                // limit is alone in its batch, which takes no more.
+                if open.count >= self.deps.max_requests_per_batch
+                    || open.bytes > self.deps.max_batch_size
+                {
                     if self.can_dispatch_own(&st) {
                         self.dispatch_locked(&mut st, open);
                     } else {
@@ -1637,17 +1640,53 @@ mod tests {
         })
     }
 
+    /// The keys of the puts of a batch, in order.
+    fn put_keys(body: &WriteBody) -> Vec<&str> {
+        body.puts
+            .iter()
+            .map(|put| put.request.key.as_str())
+            .collect()
+    }
+
+    /// A write larger than the byte limit seals the open batch, and goes in a
+    /// batch of its own, sealed at once: the writes after it start a new one.
     #[compio::test]
-    async fn oversized_write_is_rejected_before_batching() {
+    async fn oversized_write_goes_in_a_batch_of_its_own() {
         let batcher = Rc::new(WriteBatcher::new(0, test_deps(16), Weak::new()));
-        let (op, rx) = put_op("key", &[0u8; 64]);
-        batcher.add(op);
-        let err = rx.await.expect("callback must fire").unwrap_err();
-        assert!(matches!(err, OxiaError::RequestTooLarge));
-        // Nothing was queued or dispatched.
+        // Hold the batches back, to look at them.
+        batcher.state.borrow_mut().reconnecting = true;
+        let (before, _rx_before) = put_op("before", b"1");
+        let (oversized, _rx_oversized) = put_op("oversized", &[0u8; 64]);
+        let (after, _rx_after) = put_op("after", b"2");
+        for op in [before, oversized, after] {
+            batcher.add(op);
+        }
         let st = batcher.state.borrow();
-        assert!(st.queues.is_drained());
-        assert!(st.pending.is_empty());
+        let sealed: Vec<_> = st.queues.ready.iter().map(put_keys).collect();
+        assert_eq!(sealed, [["before"], ["oversized"]]);
+        assert_eq!(st.queues.open.as_ref().map(put_keys), Some(vec!["after"]));
+    }
+
+    /// The writes that a split shard hands off are batched the same way.
+    #[compio::test]
+    async fn oversized_write_is_handed_off_in_a_batch_of_its_own() {
+        let batcher = Rc::new(WriteBatcher::new(0, test_deps(16), Weak::new()));
+        batcher.state.borrow_mut().reconnecting = true;
+        let (ops, _rxs): (Vec<_>, Vec<_>) = [
+            put_op("before", b"1"),
+            put_op("oversized", &[0u8; 64]),
+            put_op("after", b"2"),
+            put_op("next", b"3"),
+        ]
+        .into_iter()
+        .unzip();
+        batcher.hand_off(ops);
+        let st = batcher.state.borrow();
+        let batches: Vec<_> = st.handed_off.iter().map(put_keys).collect();
+        assert_eq!(
+            batches,
+            [vec!["before"], vec!["oversized"], vec!["after", "next"]]
+        );
     }
 
     #[compio::test]

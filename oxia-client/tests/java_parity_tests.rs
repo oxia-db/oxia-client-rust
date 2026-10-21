@@ -30,8 +30,7 @@
 //!
 //! Scenarios dominated by features this SDK does not expose are intentionally
 //! not ported: `OxiaClientIT.test` (asserts the `oxia.client.ops` metric count
-//! and `session_id`/`client_identifier` on `GetResult`), `testMaximumSize`
-//! (server frame-size limit vs. this client's `batch_max_size`), and
+//! and `session_id`/`client_identifier` on `GetResult`) and
 //! `testRangeScanCloseStopsIteration` (Java sync-iterator mechanics).
 
 use oxia::{ComparisonType, Notification, OxiaClient, OxiaClientBuilder, OxiaError};
@@ -759,6 +758,36 @@ async fn test_get_sequence_updates() {
     }
     assert_eq!(last.as_deref(), Some(r4.key.as_str()));
     assert!(r3.key < r4.key, "sequence keys must advance monotonically");
+
+    client.close().await.unwrap();
+}
+
+/// Port of `OxiaClientIT.testMaximumSize`: a 50MiB value goes through, in a
+/// batch of its own, and one of the server's maximum message size (256MiB)
+/// fails with the server's status (Java: `OxiaStatusException`).
+#[compio::test]
+async fn test_maximum_size() {
+    let (_container, address) = start_oxia().await;
+    let client = new_client(&address).await;
+
+    let payload = vec![0u8; 50 * 1024 * 1024];
+    client.put("max-size/50m", payload.clone()).await.unwrap();
+    let got = client.get("max-size/50m").await.unwrap();
+    assert_eq!(got.value.as_deref(), Some(payload.as_slice()));
+
+    let result = client
+        .put("max-size/256m", vec![0u8; 256 * 1024 * 1024])
+        .await;
+    assert!(
+        matches!(
+            &result,
+            Err(OxiaError::Grpc {
+                code: tonic::Code::ResourceExhausted,
+                ..
+            })
+        ),
+        "got {result:?}"
+    );
 
     client.close().await.unwrap();
 }
