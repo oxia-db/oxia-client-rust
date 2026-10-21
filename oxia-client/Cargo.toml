@@ -49,11 +49,13 @@ futures = { workspace = true }
 tracing = { workspace = true }
 tonic-types = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
+nanometer = { workspace = true, optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 
 [features]
-# OpenTelemetry metrics (meter `oxia_client`); off by default for a zero-cost build.
-otel = ["dep:opentelemetry"]
+# OpenTelemetry metrics (scope `oxia_client`) through nanometer; off by default
+# for a zero-cost build. nanometer needs Rust 1.99.
+otel = ["dep:opentelemetry", "dep:nanometer"]
 # TLS connections (rustls with the ring provider; OS trust roots by default).
 tls = ["compio/rustls", "compio/ring", "dep:rustls-native-certs"]
 
@@ -74,7 +76,12 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
 tonic = { workspace = true, features = ["transport", "router"] }
 jsonwebtoken = "9"
 serde = { version = "1", features = ["derive"] }
-opentelemetry_sdk = { workspace = true, features = ["metrics", "testing", "rt-tokio"] }
+# The otel metrics test exports nanometer's histograms through its `Producer`,
+# which needs the SDK's `experimental_metrics_producer`: only in the patched SDK
+# (see [patch.crates-io] in the root Cargo.toml). Without a version, publishing
+# strips this dependency, so the crates.io SDK never has to have the feature.
+nanometer = { workspace = true, features = ["sdk"] }
+opentelemetry_sdk = { git = "https://github.com/merlimat/opentelemetry-rust", branch = "metric-producer-0.33.1", features = ["metrics", "testing", "experimental_metrics_producer"] }
 rcgen = { workspace = true }
 testcontainers = { version = "0.23", features = ["blocking"] }
 testcontainers-modules = "0.11"

@@ -20,6 +20,7 @@
 use crate::batcher::WriteOp;
 use crate::client::{OxiaClient, check_status};
 use crate::errors::OxiaError;
+use crate::metrics::OpType;
 use crate::proto;
 use crate::streams::{ListStream, Notifications, RangeScanStream, SequenceUpdates};
 use crate::types::{ComparisonType, GetResult, PutResult, VERSION_ID_NOT_EXISTS};
@@ -224,9 +225,12 @@ impl PutBuilder {
             })
         }
         .await;
-        client
-            .metrics()
-            .record_op("put", start.elapsed(), Some(value_size), op_result.is_ok());
+        client.metrics().record_op(
+            OpType::Put,
+            start.elapsed(),
+            Some(value_size),
+            op_result.is_ok(),
+        );
         op_result
     }
 }
@@ -331,7 +335,7 @@ impl GetBuilder {
             .and_then(|r| r.value.as_ref().map(|v| v.len()));
         client
             .metrics()
-            .record_op("get", start.elapsed(), value_size, op_result.is_ok());
+            .record_op(OpType::Get, start.elapsed(), value_size, op_result.is_ok());
         op_result
     }
 }
@@ -425,7 +429,7 @@ impl DeleteBuilder {
         .await;
         client
             .metrics()
-            .record_op("delete", start.elapsed(), None, op_result.is_ok());
+            .record_op(OpType::Delete, start.elapsed(), None, op_result.is_ok());
         op_result
     }
 }
@@ -504,9 +508,12 @@ impl DeleteRangeBuilder {
             }
         }
         .await;
-        client
-            .metrics()
-            .record_op("delete_range", start.elapsed(), None, op_result.is_ok());
+        client.metrics().record_op(
+            OpType::DeleteRange,
+            start.elapsed(),
+            None,
+            op_result.is_ok(),
+        );
         op_result
     }
 }
