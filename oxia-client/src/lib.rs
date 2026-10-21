@@ -180,11 +180,20 @@
 //! # Cargo features
 //!
 //! - **`otel`** *(off by default)* — records client metrics through
-//!   [OpenTelemetry](https://opentelemetry.io/). With the feature enabled,
-//!   per-operation latency and value sizes are reported under the `oxia_client`
-//!   meter; attach a meter provider with [`OxiaClientBuilder`]'s
-//!   `meter_provider` method, or let the client fall back to the global
-//!   provider. Without it, metrics recording compiles to a zero-cost no-op.
+//!   [OpenTelemetry](https://opentelemetry.io/) 0.33, with
+//!   [nanometer](https://docs.rs/nanometer) handles. With the feature
+//!   enabled, the latency and value sizes of operations and batches are
+//!   reported under the `oxia_client` scope; attach a meter provider with
+//!   [`OxiaClientBuilder`]'s `meter_provider` method, or let the client fall
+//!   back to the global provider. Without it, metrics recording compiles to a
+//!   zero-cost no-op.
+//!
+//!   The metrics are histograms, which nanometer exports through its
+//!   `Producer`: the app registers `nanometer::Producer::new()` with its
+//!   metric reader, once, with nanometer's `sdk` feature. Until an OTel SDK
+//!   release has `MetricProducer`, that takes an SDK with it re-added; see
+//!   nanometer's README, "Exporting histograms". The first client built in a
+//!   process calibrates nanometer's clock, which takes 10 to 200 ms.
 //! - **`tls`** *(off by default)* — TLS connections via
 //!   [rustls](https://github.com/rustls/rustls). Enabled by an `https://` (or
 //!   `tls://`) service address, which verifies the server against the system

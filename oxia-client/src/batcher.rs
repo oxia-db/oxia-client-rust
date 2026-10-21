@@ -46,6 +46,7 @@
 
 use crate::address::ensure_protocol;
 use crate::errors::OxiaError;
+use crate::metrics::{BatchStats, BatchType, Metrics};
 use crate::operations::{Pending, PendingDelete, PendingDeleteRange, PendingGet, PendingPut};
 use crate::proto;
 use crate::provider_manager::ProviderManager;
@@ -78,6 +79,7 @@ pub(crate) struct BatcherDeps {
     pub(crate) max_write_batches_in_flight: usize,
     pub(crate) max_read_batches_in_flight: usize,
     pub(crate) request_timeout: Duration,
+    pub(crate) metrics: Metrics,
 }
 
 /// A write operation queued for batching.
@@ -215,7 +217,6 @@ fn complete_all<Resp>(
 // ---------------------------------------------------------------------------
 
 /// An accumulating write batch: wire requests plus their callbacks.
-#[derive(Default)]
 struct WriteBody {
     puts: Vec<PendingPut>,
     deletes: Vec<PendingDelete>,
@@ -223,6 +224,20 @@ struct WriteBody {
     delete_ranges: Vec<(PendingDeleteRange, Option<String>)>,
     count: usize,
     bytes: usize,
+    created: Instant,
+}
+
+impl Default for WriteBody {
+    fn default() -> Self {
+        WriteBody {
+            puts: Vec::new(),
+            deletes: Vec::new(),
+            delete_ranges: Vec::new(),
+            count: 0,
+            bytes: 0,
+            created: Instant::now(),
+        }
+    }
 }
 
 impl WriteBody {
@@ -268,6 +283,12 @@ impl WriteBody {
     /// Splits into the wire request (requests moved, not cloned) and the
     /// callback set kept for completion.
     fn into_request(self, shard: i64) -> (proto::WriteRequest, WriteCallbacks) {
+        let stats = BatchStats {
+            created: self.created,
+            sent: None,
+            value_size: self.puts.iter().map(|p| p.request.value.len()).sum(),
+            requests: self.count,
+        };
         let (put_reqs, put_cbs): (Vec<_>, Vec<_>) = self
             .puts
             .into_iter()
@@ -294,6 +315,7 @@ impl WriteBody {
                 puts: put_cbs,
                 deletes: delete_cbs,
                 delete_ranges: dr_cbs,
+                stats,
             },
         )
     }
@@ -308,17 +330,20 @@ struct WriteCallbacks {
     deletes: Vec<oneshot::Sender<Result<proto::DeleteResponse, OxiaError>>>,
     /// With the partition key each delete range was routed with.
     delete_ranges: Vec<(DeleteRangeCallback, Option<String>)>,
+    stats: BatchStats,
 }
 
 impl WriteCallbacks {
-    fn complete(self, response: proto::WriteResponse) {
+    fn complete(self, response: proto::WriteResponse, metrics: &Metrics) {
+        metrics.record_batch(BatchType::Write, &self.stats, true);
         complete_all(self.puts, response.puts, "put");
         complete_all(self.deletes, response.deletes, "delete");
         let delete_ranges = self.delete_ranges.into_iter().map(|(callback, _)| callback);
         complete_all(delete_ranges, response.delete_ranges, "delete_range");
     }
 
-    fn fail(self, err: &OxiaError) {
+    fn fail(self, err: &OxiaError, metrics: &Metrics) {
+        metrics.record_batch(BatchType::Write, &self.stats, false);
         fail_all(self.puts, err);
         fail_all(self.deletes, err);
         fail_all(
@@ -641,7 +666,9 @@ impl WriteBatcher {
         while self.can_dispatch(st) {
             if let Some(inflight) = st.retry.pop_front() {
                 if inflight.first_dispatch.elapsed() >= self.deps.request_timeout {
-                    inflight.callbacks.fail(&OxiaError::Timeout);
+                    inflight
+                        .callbacks
+                        .fail(&OxiaError::Timeout, &self.deps.metrics);
                     continue;
                 }
                 self.send_locked(st, inflight);
@@ -665,13 +692,15 @@ impl WriteBatcher {
     /// the stream send happen in one borrow of the state, so response FIFO
     /// order and server-side apply order both equal dispatch order.
     fn dispatch_locked(self: &Rc<Self>, st: &mut WriteState, body: WriteBody) {
-        let (request, callbacks) = body.into_request(self.shard);
+        let (request, mut callbacks) = body.into_request(self.shard);
+        let now = Instant::now();
+        callbacks.stats.sent = Some(now);
         self.send_locked(
             st,
             InFlightWrite {
                 request,
                 callbacks,
-                first_dispatch: Instant::now(),
+                first_dispatch: now,
             },
         );
     }
@@ -786,7 +815,9 @@ impl WriteBatcher {
         let mut ops = Vec::new();
         for inflight in st.retry.drain(..) {
             if inflight.first_dispatch.elapsed() >= self.deps.request_timeout {
-                inflight.callbacks.fail(&OxiaError::Timeout);
+                inflight
+                    .callbacks
+                    .fail(&OxiaError::Timeout, &self.deps.metrics);
             } else {
                 ops.extend(ops_in_issue_order(inflight.request, inflight.callbacks));
             }
@@ -881,14 +912,14 @@ impl WriteBatcher {
                 self.drain_retired(&mut st);
                 let drained = st.queues.closed && self.is_drained(&st);
                 drop(st);
-                callbacks.complete(response);
+                callbacks.complete(response, &self.deps.metrics);
                 if drained {
                     self.drained.notify_waiters();
                 }
                 return;
             }
             drop(st);
-            callbacks.complete(response);
+            callbacks.complete(response, &self.deps.metrics);
         }
     }
 
@@ -1034,10 +1065,10 @@ impl WriteBatcher {
             (expired, failed, drained)
         };
         for callbacks in expired {
-            callbacks.fail(&OxiaError::Timeout);
+            callbacks.fail(&OxiaError::Timeout, &self.deps.metrics);
         }
         for callbacks in failed {
-            callbacks.fail(&error);
+            callbacks.fail(&error, &self.deps.metrics);
         }
         if drained {
             self.drained.notify_waiters();
@@ -1106,7 +1137,7 @@ impl WriteBatcher {
                     leftovers
                 };
                 for callbacks in leftovers {
-                    callbacks.fail(&OxiaError::Closed);
+                    callbacks.fail(&OxiaError::Closed, &self.deps.metrics);
                 }
                 break;
             }
@@ -1264,9 +1295,18 @@ enum PumpInit {
 // Read batching
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
 struct ReadBody {
     gets: Vec<PendingGet>,
+    created: Instant,
+}
+
+impl Default for ReadBody {
+    fn default() -> Self {
+        ReadBody {
+            gets: Vec::new(),
+            created: Instant::now(),
+        }
+    }
 }
 
 struct ReadState {
@@ -1376,18 +1416,32 @@ impl ReadBatcher {
     /// leader hints until the request timeout. Responses are collected before
     /// any callback completes, so a retried attempt never double-completes.
     async fn send_batch(&self, body: ReadBody) {
+        let sent = Instant::now();
+        let mut stats = BatchStats {
+            created: body.created,
+            sent: Some(sent),
+            value_size: 0,
+            requests: body.gets.len(),
+        };
         let (requests, callbacks): (Vec<_>, Vec<_>) = body
             .gets
             .into_iter()
             .map(|p| (p.request, p.callback))
             .unzip();
 
-        let deadline = Instant::now() + self.deps.request_timeout;
+        let deadline = sent + self.deps.request_timeout;
         let mut hint: Option<LeaderHint> = None;
         let mut attempt: u32 = 0;
         loop {
             match self.attempt_read(&requests, hint.as_ref()).await {
                 Ok(responses) => {
+                    stats.value_size = responses
+                        .iter()
+                        .map(|r| r.value.as_ref().map_or(0, |v| v.len()))
+                        .sum();
+                    self.deps
+                        .metrics
+                        .record_batch(BatchType::Read, &stats, true);
                     complete_all(callbacks, responses, "get");
                     return;
                 }
@@ -1401,6 +1455,9 @@ impl ReadBatcher {
                         || matches!(decoded.error, OxiaError::ShardMoved)
                         || Instant::now() + delay >= deadline
                     {
+                        self.deps
+                            .metrics
+                            .record_batch(BatchType::Read, &stats, false);
                         fail_all(callbacks, &decoded.error);
                         return;
                     }
@@ -1634,6 +1691,9 @@ mod tests {
             max_write_batches_in_flight: 4,
             max_read_batches_in_flight: 4,
             request_timeout: Duration::from_secs(1),
+            // A unit struct without the `otel` feature.
+            #[allow(clippy::default_constructed_unit_structs)]
+            metrics: Metrics::default(),
         })
     }
 

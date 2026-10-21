@@ -2328,35 +2328,47 @@ async fn test_writes_survive_restart_under_concurrent_load() {
 // Metrics (otel feature)
 // ============================================================
 
-/// With the `otel` feature enabled, operations report through the configured
-/// OpenTelemetry meter provider under the `oxia_client` meter, mirroring the Go
-/// client's instrument names and `type` attribute.
+/// With the `otel` feature enabled, operations and batches report under the
+/// `oxia_client` scope, mirroring the Go client's instrument names and `type`
+/// attribute.
 ///
-/// The OpenTelemetry `PeriodicReader` exports from a task of a tokio runtime,
-/// and its `force_flush` blocks the caller until that task replies: a tokio
-/// runtime with threads of its own serves it, apart from the client's.
+/// The client's metrics are nanometer histograms, which leave through
+/// nanometer's `Producer` on the app's reader. nanometer's registry is
+/// process-wide, so the other tests of this binary may add to these metrics:
+/// the assertions only check what this test's operations must have recorded.
 #[cfg(feature = "otel")]
 #[compio::test]
 async fn test_metrics_recorded_through_meter_provider() {
-    use opentelemetry_sdk::metrics::data::Histogram;
-    use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-    use opentelemetry_sdk::runtime;
-    use opentelemetry_sdk::testing::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, Histogram, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    /// The `type` of each successful series with observations, sorted.
+    fn succeeded<T: Copy>(histogram: &Histogram<T>) -> Vec<String> {
+        let mut types: Vec<String> = histogram
+            .data_points()
+            .filter(|dp| dp.count() > 0)
+            .filter(|dp| {
+                dp.attributes()
+                    .any(|kv| kv.key.as_str() == "result" && kv.value.as_str() == "success")
+            })
+            .filter_map(|dp| {
+                dp.attributes()
+                    .find(|kv| kv.key.as_str() == "type")
+                    .map(|kv| kv.value.as_str().into_owned())
+            })
+            .collect();
+        types.sort();
+        types.dedup();
+        types
+    }
 
     let (_container, address) = start_oxia().await;
 
     let exporter = InMemoryMetricExporter::default();
-    let otel_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .unwrap();
-    // The reader starts its task when the provider is built.
-    let provider = {
-        let _otel_runtime = otel_runtime.enter();
-        let reader = PeriodicReader::builder(exporter.clone(), runtime::Tokio).build();
-        SdkMeterProvider::builder().with_reader(reader).build()
-    };
+    let reader = PeriodicReader::builder(exporter.clone())
+        .with_producer(nanometer::Producer::new())
+        .build();
+    let provider = SdkMeterProvider::builder().with_reader(reader).build();
 
     let client = OxiaClientBuilder::new()
         .service_address(address)
@@ -2378,45 +2390,37 @@ async fn test_metrics_recorded_through_meter_provider() {
 
     provider.force_flush().unwrap();
 
+    // The histograms are cumulative: the last export has every observation.
     let resource_metrics = exporter.get_finished_metrics().unwrap();
     let oxia_scope = resource_metrics
         .iter()
-        .flat_map(|rm| &rm.scope_metrics)
-        .find(|sm| sm.scope.name() == "oxia_client")
-        .expect("the oxia_client meter scope must be present");
+        .rev()
+        .flat_map(|rm| rm.scope_metrics())
+        .find(|sm| sm.scope().name() == "oxia_client")
+        .expect("the oxia_client scope must be present");
+    let data = |name: &str| {
+        oxia_scope
+            .metrics()
+            .find(|m| m.name() == name)
+            .unwrap_or_else(|| panic!("expected an {name} instrument"))
+            .data()
+    };
+    let latencies = |name: &str| match data(name) {
+        AggregatedMetrics::F64(MetricData::Histogram(histogram)) => succeeded(histogram),
+        other => panic!("{name} must be an f64 histogram, got {other:?}"),
+    };
+    let sizes = |name: &str| match data(name) {
+        AggregatedMetrics::U64(MetricData::Histogram(histogram)) => succeeded(histogram),
+        other => panic!("{name} must be a u64 histogram, got {other:?}"),
+    };
 
-    let names: Vec<&str> = oxia_scope.metrics.iter().map(|m| m.name.as_ref()).collect();
-    assert!(
-        names.contains(&"oxia_client_op"),
-        "expected an oxia_client_op instrument, got {names:?}"
+    assert_eq!(
+        latencies("oxia_client_op"),
+        ["delete", "delete_range", "get", "put"]
     );
-    assert!(
-        names.contains(&"oxia_client_op_value"),
-        "expected an oxia_client_op_value instrument, got {names:?}"
-    );
-
-    // The op-latency histogram must carry a `type` attribute for every op run.
-    let op = oxia_scope
-        .metrics
-        .iter()
-        .find(|m| m.name == "oxia_client_op")
-        .unwrap();
-    let histogram = op
-        .data
-        .as_any()
-        .downcast_ref::<Histogram<f64>>()
-        .expect("oxia_client_op is an f64 histogram");
-    let mut types: Vec<String> = histogram
-        .data_points
-        .iter()
-        .filter_map(|dp| {
-            dp.attributes
-                .iter()
-                .find(|kv| kv.key.as_str() == "type")
-                .map(|kv| kv.value.as_str().into_owned())
-        })
-        .collect();
-    types.sort();
-    types.dedup();
-    assert_eq!(types, ["delete", "delete_range", "get", "put"]);
+    assert_eq!(sizes("oxia_client_op_value"), ["get", "put"]);
+    assert_eq!(latencies("oxia_client_batch_total"), ["read", "write"]);
+    assert_eq!(latencies("oxia_client_batch_exec"), ["read", "write"]);
+    assert_eq!(sizes("oxia_client_batch_value"), ["read", "write"]);
+    assert_eq!(sizes("oxia_client_batch_request"), ["read", "write"]);
 }

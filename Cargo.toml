@@ -50,9 +50,20 @@ futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 hdrhistogram = "7"
 rand = "0.9"
-opentelemetry = "0.27"
-opentelemetry_sdk = "0.27"
+# nanometer pins the API crate to =0.33.1.
+opentelemetry = "0.33"
+nanometer = "0.1"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+
+# OTel 0.33.1 with `MetricProducer` re-added, which nanometer's histogram
+# export needs, until it is upstream
+# (https://github.com/open-telemetry/opentelemetry-rust/issues/2505). The
+# `otel` metrics test needs it; patching only the SDK would pull in a second
+# copy of the API crate from the same repository. Patches apply to this
+# workspace's builds only, not to the published crate.
+[patch.crates-io]
+opentelemetry = { git = "https://github.com/merlimat/opentelemetry-rust", branch = "metric-producer-0.33.1" }
+opentelemetry_sdk = { git = "https://github.com/merlimat/opentelemetry-rust", branch = "metric-producer-0.33.1" }
 
 # Optimize release builds (notably the oxia-perf benchmark binary): whole-program
 # LTO and a single codegen unit trade compile time for a faster, smaller binary.
