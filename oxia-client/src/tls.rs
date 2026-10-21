@@ -15,7 +15,16 @@
 //! TLS configuration for connecting to a TLS-enabled Oxia cluster. Enabled
 //! with the `tls` Cargo feature.
 
-use tonic::transport::{Certificate, ClientTlsConfig, Identity};
+use crate::errors::OxiaError;
+use compio::tls::TlsConnector;
+use compio::tls::rustls::crypto::{self, CryptoProvider};
+use compio::tls::rustls::pki_types::pem::PemObject;
+use compio::tls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use compio::tls::rustls::{ClientConfig, RootCertStore};
+use std::sync::Arc;
+
+/// The ALPN protocol id of HTTP/2, which the server must negotiate.
+const ALPN_H2: &[u8] = b"h2";
 
 /// TLS settings for the client's connections, passed to
 /// [`OxiaClientBuilder::tls`](crate::OxiaClientBuilder::tls).
@@ -85,20 +94,96 @@ impl TlsOptions {
         self
     }
 
-    /// Builds the tonic TLS configuration applied to every connection.
-    pub(crate) fn to_client_tls_config(&self) -> ClientTlsConfig {
-        let mut config = ClientTlsConfig::new();
-        config = match &self.ca_pem {
-            Some(pem) => config.ca_certificate(Certificate::from_pem(pem)),
-            None => config.with_native_roots(),
+    /// Builds the TLS configuration applied to every connection, as tonic's
+    /// own TLS transport did: the process-default crypto provider if one is
+    /// installed, else ring; HTTP/2 negotiated through ALPN.
+    pub(crate) fn to_tls_config(&self) -> Result<TlsConfig, OxiaError> {
+        let provider = CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crypto::ring::default_provider()));
+        let builder = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|err| invalid_tls("protocol versions", err))?;
+        let mut roots = RootCertStore::empty();
+        match &self.ca_pem {
+            Some(pem) => {
+                let certs = CertificateDer::pem_slice_iter(pem)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|err| invalid_tls("CA certificate", err))?;
+                roots.add_parsable_certificates(certs);
+            }
+            None => {
+                let native = rustls_native_certs::load_native_certs();
+                if !native.errors.is_empty() {
+                    tracing::debug!(
+                        "errors occurred when loading native certs: {:?}",
+                        native.errors
+                    );
+                }
+                if native.certs.is_empty() {
+                    return Err(OxiaError::InvalidArgument(
+                        "no native root CA certificates found".to_string(),
+                    ));
+                }
+                roots.add_parsable_certificates(native.certs);
+            }
+        }
+        let builder = builder.with_root_certificates(roots);
+        let mut config = match &self.identity_pem {
+            Some((cert, key)) => {
+                let chain = CertificateDer::pem_slice_iter(cert)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|err| invalid_tls("client certificate", err))?;
+                let key = PrivateKeyDer::from_pem_slice(key)
+                    .map_err(|err| invalid_tls("client private key", err))?;
+                builder
+                    .with_client_auth_cert(chain, key)
+                    .map_err(|err| invalid_tls("client identity", err))?
+            }
+            None => builder.with_no_client_auth(),
         };
-        if let Some((cert, key)) = &self.identity_pem {
-            config = config.identity(Identity::from_pem(cert, key));
-        }
+        config.alpn_protocols.push(ALPN_H2.to_vec());
         if let Some(domain) = &self.domain_name {
-            config = config.domain_name(domain);
+            ServerName::try_from(domain.as_str()).map_err(|err| invalid_tls("domain name", err))?;
         }
-        config
+        Ok(TlsConfig {
+            connector: TlsConnector::from(Arc::new(config)),
+            domain_name: self.domain_name.clone(),
+        })
+    }
+}
+
+fn invalid_tls(what: &str, err: impl std::fmt::Display) -> OxiaError {
+    OxiaError::InvalidArgument(format!("invalid TLS {what}: {err}"))
+}
+
+/// The TLS settings of every connection, built from [`TlsOptions`].
+#[derive(Clone)]
+pub(crate) struct TlsConfig {
+    connector: TlsConnector,
+    domain_name: Option<String>,
+}
+
+impl TlsConfig {
+    /// Runs the TLS handshake on `stream`, a connection to `host`, verifying
+    /// the server certificate against `host`, or the configured domain name,
+    /// and requiring the server to negotiate HTTP/2.
+    pub(crate) async fn connect(
+        &self,
+        host: &str,
+        stream: compio::net::TcpStream,
+    ) -> Result<cyper_core::HyperStream<compio::net::TcpStream>, String> {
+        let domain = self.domain_name.as_deref().unwrap_or(host);
+        let stream = self
+            .connector
+            .connect(domain, stream)
+            .await
+            .map_err(|err| format!("TLS handshake failed: {err}"))?;
+        let stream = cyper_core::HyperStream::new_tls(stream);
+        if stream.negotiated_alpn().as_deref() != Some(ALPN_H2) {
+            return Err("HTTP/2 was not negotiated".to_string());
+        }
+        Ok(stream)
     }
 }
 

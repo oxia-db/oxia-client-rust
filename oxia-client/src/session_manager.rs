@@ -18,13 +18,13 @@ use crate::provider_manager::ProviderManager;
 use crate::retry::{RetryError, retry_until_cancelled};
 use crate::server_error::decode_status;
 use crate::shard_manager::ShardManager;
-use dashmap::DashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use compio::runtime::JoinHandle;
+use compio::time::interval;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
-use tokio::sync::{Mutex, OnceCell};
-use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::interval;
+use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tracing::{info, warn};
@@ -32,18 +32,18 @@ use tracing::{info, warn};
 struct Inner {
     shard_id: i64,
     id: i64,
-    shard_manager: Arc<ShardManager>,
-    provider_manager: Arc<ProviderManager>,
+    shard_manager: Rc<ShardManager>,
+    provider_manager: Rc<ProviderManager>,
 }
 
 struct Session {
     context: CancellationToken,
-    handle: Mutex<Option<JoinHandle<()>>>,
+    handle: RefCell<Option<JoinHandle<()>>>,
     /// Set to `false` by the keep-alive task once the server reports the session
     /// no longer exists, so [`SessionManager::get_session_id`] re-creates it.
-    alive: Arc<AtomicBool>,
+    alive: Rc<Cell<bool>>,
     request_timeout: Duration,
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
 }
 
 impl Session {
@@ -52,12 +52,12 @@ impl Session {
         session_id: i64,
         keep_alive_interval: Duration,
         request_timeout: Duration,
-        shard_manager: Arc<ShardManager>,
-        provider_manager: Arc<ProviderManager>,
+        shard_manager: Rc<ShardManager>,
+        provider_manager: Rc<ProviderManager>,
     ) -> Self {
         let context = CancellationToken::new();
-        let alive = Arc::new(AtomicBool::new(true));
-        let handle = Mutex::new(Some(tokio::spawn(start_keep_alive(
+        let alive = Rc::new(Cell::new(true));
+        let handle = RefCell::new(Some(compio::runtime::spawn(start_keep_alive(
             context.clone(),
             shard_manager.clone(),
             provider_manager.clone(),
@@ -72,7 +72,7 @@ impl Session {
             context,
             alive,
             request_timeout,
-            inner: Arc::new(Inner {
+            inner: Rc::new(Inner {
                 id: session_id,
                 shard_id,
                 shard_manager,
@@ -89,7 +89,7 @@ impl Session {
     /// Whether the session is still believed valid. Turns `false` once the
     /// keep-alive observes that the server has expired it.
     fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire)
+        self.alive.get()
     }
 }
 
@@ -102,13 +102,13 @@ impl Drop for Session {
 #[allow(clippy::too_many_arguments)]
 async fn start_keep_alive(
     context: CancellationToken,
-    shard_manager: Arc<ShardManager>,
-    provider_manager: Arc<ProviderManager>,
+    shard_manager: Rc<ShardManager>,
+    provider_manager: Rc<ProviderManager>,
     shard_id: i64,
     session_id: i64,
     keep_alive_interval: Duration,
     request_timeout: Duration,
-    alive: Arc<AtomicBool>,
+    alive: Rc<Cell<bool>>,
 ) {
     let op_defer = || {
         let local_shard_manager = shard_manager.clone();
@@ -143,7 +143,7 @@ async fn start_keep_alive(
                                     if matches!(decoded.error, OxiaError::SessionExpired) {
                                         info!("Session {session_id} on shard {shard_id} expired; it will be re-created on next use.");
                                         // Mark dead so get_session_id re-creates it, then stop.
-                                        local_alive.store(false, Ordering::Release);
+                                        local_alive.set(false);
                                         return Err(RetryError::fatal(OxiaError::SessionExpired));
                                     }
                                     return Err(RetryError::transient(decoded.error));
@@ -181,8 +181,8 @@ impl Session {
         }
 
         self.context.cancel();
-        let mut guard = self.handle.lock().await;
-        if let Some(handle) = guard.take() {
+        let handle = self.handle.borrow_mut().take();
+        if let Some(handle) = handle {
             handle
                 .await
                 .map_err(|err| OxiaError::Disconnected(err.to_string()))?
@@ -196,9 +196,9 @@ pub(crate) struct SessionManager {
     session_timeout: Duration,
     session_keep_alive: Duration,
     request_timeout: Duration,
-    sessions: DashMap<i64, OnceCell<Session>>,
-    shard_manager: Arc<ShardManager>,
-    provider_manager: Arc<ProviderManager>,
+    sessions: RefCell<HashMap<i64, Rc<OnceCell<Session>>>>,
+    shard_manager: Rc<ShardManager>,
+    provider_manager: Rc<ProviderManager>,
 }
 
 impl SessionManager {
@@ -207,28 +207,35 @@ impl SessionManager {
         session_timeout: Duration,
         session_keep_alive: Duration,
         request_timeout: Duration,
-        shard_manager: Arc<ShardManager>,
-        provider_manager: Arc<ProviderManager>,
+        shard_manager: Rc<ShardManager>,
+        provider_manager: Rc<ProviderManager>,
     ) -> Self {
         SessionManager {
             identity,
             session_timeout,
             session_keep_alive,
             request_timeout,
-            sessions: DashMap::new(),
+            sessions: RefCell::new(HashMap::new()),
             shard_manager,
             provider_manager,
         }
     }
 
     pub(crate) async fn get_session_id(&self, shard_id: i64) -> Result<i64, OxiaError> {
-        let mut session_cell = self.sessions.entry(shard_id).or_default();
-        // If a previously created session has expired (its keep-alive saw
-        // SESSION_NOT_FOUND), discard it so a fresh one is created below — the
-        // caller then transparently gets a working session.
-        if session_cell.get().is_some_and(|s| !s.is_alive()) {
-            *session_cell = OnceCell::new();
-        }
+        // Take the cell out of the map: the map must not stay borrowed while
+        // the session is created. The callers that need the session of a
+        // shard while it is being created wait for the same one.
+        let session_cell = {
+            let mut sessions = self.sessions.borrow_mut();
+            let session_cell = sessions.entry(shard_id).or_default();
+            // If a previously created session has expired (its keep-alive saw
+            // SESSION_NOT_FOUND), discard it so a fresh one is created below —
+            // the caller then transparently gets a working session.
+            if session_cell.get().is_some_and(|s| !s.is_alive()) {
+                *session_cell = Rc::default();
+            }
+            session_cell.clone()
+        };
         let session = session_cell
             .get_or_try_init(|| async {
                 match self.shard_manager.get_leader(shard_id) {
@@ -265,19 +272,18 @@ impl SessionManager {
     }
 
     pub(crate) async fn close(&self) -> Result<(), OxiaError> {
-        let shards: Vec<i64> = self.sessions.iter().map(|entry| *entry.key()).collect();
-        let mut joiner = JoinSet::new();
-        for shard in shards {
-            if let Some((_, session_cell)) = self.sessions.remove(&shard) {
-                if let Some(session) = session_cell.into_inner() {
-                    joiner.spawn(session.shutdown());
-                }
-            }
-        }
-        while let Some(result) = joiner.join_next().await {
-            result.map_err(|err| {
-                OxiaError::Disconnected(format!("Session task failed to join: {}", err))
-            })??;
+        let session_cells: Vec<Rc<OnceCell<Session>>> = self
+            .sessions
+            .borrow_mut()
+            .drain()
+            .map(|(_, session_cell)| session_cell)
+            .collect();
+        // A cell still shared is a session being created: its creator keeps it.
+        let sessions = session_cells
+            .into_iter()
+            .filter_map(|session_cell| Rc::into_inner(session_cell)?.into_inner());
+        for result in futures::future::join_all(sessions.map(Session::shutdown)).await {
+            result?;
         }
         Ok(())
     }

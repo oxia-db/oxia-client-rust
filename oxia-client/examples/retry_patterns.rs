@@ -49,7 +49,7 @@ where
             Ok(value) => return Ok(value),
             Err(e) if e.is_retryable() && attempt < max_attempts => {
                 warn!("attempt {attempt} failed ({e}), retrying in {backoff:?}");
-                tokio::time::sleep(backoff).await;
+                compio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(5));
                 attempt += 1;
             }
@@ -92,7 +92,7 @@ async fn increment_counter(client: &OxiaClient, key: &str) -> Result<PutResult, 
     }
 }
 
-#[tokio::main]
+#[compio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -118,12 +118,17 @@ async fn main() {
 
     // Pattern 3: exactly-once increments via CAS, racing three tasks.
     client.delete("retry/counter").await.ok();
-    let mut tasks = tokio::task::JoinSet::new();
-    for _ in 0..3 {
-        let client = client.clone();
-        tasks.spawn(async move { increment_counter(&client, "retry/counter").await.unwrap() });
+    let tasks: Vec<_> = (0..3)
+        .map(|_| {
+            let client = client.clone();
+            compio::runtime::spawn(async move {
+                increment_counter(&client, "retry/counter").await.unwrap()
+            })
+        })
+        .collect();
+    for task in tasks {
+        let _ = task.await;
     }
-    while tasks.join_next().await.is_some() {}
     let counter = client.get("retry/counter").await.unwrap();
     info!(
         "counter after 3 concurrent CAS increments: {:?}",

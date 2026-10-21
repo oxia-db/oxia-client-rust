@@ -13,27 +13,29 @@
 [docs-url]: https://docs.rs/oxia-client
 [ci-badge]: https://github.com/oxia-db/oxia-client-rust/actions/workflows/ci.yml/badge.svg
 [ci-url]: https://github.com/oxia-db/oxia-client-rust/actions/workflows/ci.yml
-[msrv-badge]: https://img.shields.io/badge/MSRV-1.85-blue.svg
+[msrv-badge]: https://img.shields.io/badge/MSRV-1.95-blue.svg
 [msrv-url]: https://github.com/oxia-db/oxia-client-rust
 [license-badge]: https://img.shields.io/crates/l/oxia-client.svg
 [license-url]: ./LICENSE
 
 The native Rust client SDK for [Oxia](https://github.com/oxia-db/oxia), a distributed
-key-value and metadata store. Built on the [Tokio](https://tokio.rs) asynchronous runtime,
-it offers an idiomatic, comprehensive API — plus an optional C FFI for use from other
-languages.
+key-value and metadata store. Built for a thread-per-core design on the
+[compio](https://github.com/compio-rs/compio) runtime (io_uring on Linux), each client lives on
+a single thread; it offers an idiomatic, comprehensive API — plus an optional C FFI for use from
+other languages.
 
 ## Quickstart
 
 ```toml
 [dependencies]
-oxia-client = "0.1"
+oxia-client = "0.2"
+compio = { version = "0.19", features = ["macros"] }
 ```
 
 ```rust
 use oxia::{ComparisonType, OxiaClient};
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> Result<(), oxia::OxiaError> {
     let client = OxiaClient::connect("localhost:6648").await?;
 
@@ -54,8 +56,10 @@ let floor = client.get("config/z").comparison(ComparisonType::Floor).await?;
 let keys = client.list("users/", "users/~").await?;
 ```
 
-See the [API documentation](https://docs.rs/oxia-client) for the full guide, and the
-runnable [examples](./oxia-client/examples).
+The client and the futures it returns are not `Send`: run one client per thread, each in its
+own compio runtime, to use more cores. See the [API documentation](https://docs.rs/oxia-client)
+for the full guide, including how to run the client, and the runnable
+[examples](./oxia-client/examples).
 
 ## Features
 
@@ -90,9 +94,10 @@ The client speaks Oxia's `io.oxia.proto.v1` gRPC protocol and requires a server 
 it (current Oxia releases; CI runs against the `oxia/oxia:nightly-beta` image, built daily from
 Oxia's main branch). It does **not** support the legacy `io.streamnative.oxia.proto` service.
 
-| `oxia-client` | Oxia server | Rust toolchain |
-|---|---|---|
-| 0.1.x | serves `io.oxia.proto.v1` (recent releases) | 1.85+ (edition 2024) |
+| `oxia-client` | Oxia server | Rust toolchain | Runtime |
+|---|---|---|---|
+| 0.2.x | serves `io.oxia.proto.v1` (recent releases) | 1.95+ (edition 2024) | compio 0.19, single-threaded |
+| 0.1.x | serves `io.oxia.proto.v1` (recent releases) | 1.85+ (edition 2024) | Tokio |
 
 ## Crates
 

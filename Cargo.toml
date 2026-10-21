@@ -21,16 +21,24 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-tonic = "0.13"
+# The gRPC codegen and codecs only: the transport is hyper's HTTP/2 client on
+# compio (tonic's own transport runs on tokio).
+tonic = { version = "0.13", default-features = false, features = ["codegen", "prost"] }
 tonic-types = "0.13"
 prost = "0.13"
-tokio = { version = "1.47.0", features = ["rt-multi-thread", "macros"] }
+# The client runs on compio, never on a tokio runtime: only tokio's
+# runtime-agnostic primitives (channels, Notify, watch, OnceCell, select!).
+tokio = { version = "1.47.0", default-features = false, features = ["sync", "macros"] }
+compio = { version = "0.19.2", default-features = false, features = ["runtime", "time", "net", "io", "io-uring", "polling"] }
+cyper-core = "0.9.0"
+hyper = { version = "1.7", features = ["client", "http2"] }
+http = "1"
+http-body-util = "0.1"
+h2 = "0.4"
 thiserror = "2.0.12"
-dashmap = "6.1.0"
 xxhash-rust = { version = "0.8.5", features = ["xxh3"] }
 uuid = { version = "1.7", features = ["v4"] }
 tokio-util = "0.7"
-arc-swap = "1.7"
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

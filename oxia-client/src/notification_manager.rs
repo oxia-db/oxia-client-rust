@@ -38,20 +38,19 @@ use crate::provider_manager::ProviderManager;
 use crate::retry::{RetryError, retry_until_cancelled};
 use crate::shard_manager::{ShardManager, ShardRange};
 use crate::types::Notification;
+use compio::runtime::JoinHandle;
 use futures::FutureExt;
-use futures::future::{BoxFuture, join_all};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Mutex;
+use futures::future::{LocalBoxFuture, join_all};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use tokio::sync::mpsc::Sender;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
 pub(crate) struct NotificationManager {
     context: CancellationToken,
-    handles: Mutex<Vec<JoinHandle<()>>>,
+    handles: RefCell<Vec<JoinHandle<()>>>,
 }
 
 impl Drop for NotificationManager {
@@ -69,13 +68,13 @@ impl NotificationManager {
     /// have established theirs.
     pub(crate) fn new(
         shards: Vec<ShardRange>,
-        shard_manager: Arc<ShardManager>,
-        provider_manager: Arc<ProviderManager>,
+        shard_manager: Rc<ShardManager>,
+        provider_manager: Rc<ProviderManager>,
         sender: Sender<Notification>,
         init_tx: tokio::sync::mpsc::Sender<Result<(), OxiaError>>,
     ) -> Self {
         let context = CancellationToken::new();
-        let subscription = Arc::new(Subscription {
+        let subscription = Rc::new(Subscription {
             shard_manager,
             provider_manager,
             sender,
@@ -84,19 +83,20 @@ impl NotificationManager {
         let handles = shards
             .into_iter()
             .map(|range| {
-                let init = Arc::new(ShardInit::new(init_tx.clone()));
-                tokio::spawn(listen(subscription.clone(), range, None, Some(init)))
+                let init = Rc::new(ShardInit::new(init_tx.clone()));
+                compio::runtime::spawn(listen(subscription.clone(), range, None, Some(init)))
             })
             .collect();
         NotificationManager {
             context,
-            handles: Mutex::new(handles),
+            handles: RefCell::new(handles),
         }
     }
 
     pub(crate) async fn shutdown(self) -> Result<(), OxiaError> {
         self.context.cancel();
-        for handle in self.handles.lock().await.drain(..) {
+        let handles: Vec<JoinHandle<()>> = self.handles.borrow_mut().drain(..).collect();
+        for handle in handles {
             handle
                 .await
                 .map_err(|err| OxiaError::Disconnected(err.to_string()))?;
@@ -107,8 +107,8 @@ impl NotificationManager {
 
 /// What the listeners of one subscription share.
 struct Subscription {
-    shard_manager: Arc<ShardManager>,
-    provider_manager: Arc<ProviderManager>,
+    shard_manager: Rc<ShardManager>,
+    provider_manager: Rc<ProviderManager>,
     sender: Sender<Notification>,
     context: CancellationToken,
 }
@@ -132,21 +132,23 @@ impl Subscription {
 /// shards that replaced it have received theirs.
 struct ShardInit {
     /// The listeners that have yet to receive their first batch.
-    pending: AtomicUsize,
+    pending: Cell<usize>,
     tx: tokio::sync::mpsc::Sender<Result<(), OxiaError>>,
 }
 
 impl ShardInit {
     fn new(tx: tokio::sync::mpsc::Sender<Result<(), OxiaError>>) -> Self {
         ShardInit {
-            pending: AtomicUsize::new(1),
+            pending: Cell::new(1),
             tx,
         }
     }
 
     /// One of the listeners received its first batch.
     async fn established(&self) {
-        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let pending = self.pending.get() - 1;
+        self.pending.set(pending);
+        if pending == 0 {
             let _ = self.tx.send(Ok(())).await;
         }
     }
@@ -163,7 +165,7 @@ struct ListenerState {
     /// The wait for the subscription to be established, until the listener
     /// receives its first batch: a reconnect must not signal it again, or the
     /// init wait could over-count and return before a slower shard is live.
-    init: Option<Arc<ShardInit>>,
+    init: Option<Rc<ShardInit>>,
     /// The shards that replaced the listener's shard, once it found it split.
     successors: Option<Vec<ShardRange>>,
 }
@@ -173,13 +175,13 @@ struct ListenerState {
 /// the subscription stops. Once the shard is split, listens to the shards that
 /// replaced it instead, after the last batch received from it.
 fn listen(
-    subscription: Arc<Subscription>,
+    subscription: Rc<Subscription>,
     range: ShardRange,
     last_offset: Option<i64>,
-    init: Option<Arc<ShardInit>>,
-) -> BoxFuture<'static, ()> {
+    init: Option<Rc<ShardInit>>,
+) -> LocalBoxFuture<'static, ()> {
     async move {
-        let state = Arc::new(std::sync::Mutex::new(ListenerState {
+        let state = Rc::new(RefCell::new(ListenerState {
             last_offset,
             init,
             successors: None,
@@ -190,7 +192,7 @@ fn listen(
         .await;
 
         let (successors, last_offset, init) = {
-            let mut state = state.lock().expect("notification listener poisoned");
+            let mut state = state.borrow_mut();
             (
                 state.successors.take(),
                 state.last_offset,
@@ -213,8 +215,7 @@ fn listen(
         if let Some(init) = &init {
             // The listeners of the successors establish the subscription in
             // place of this one.
-            init.pending
-                .fetch_add(successors.len() - 1, Ordering::AcqRel);
+            init.pending.set(init.pending.get() + successors.len() - 1);
         }
         join_all(
             successors.into_iter().map(|successor| {
@@ -223,16 +224,16 @@ fn listen(
         )
         .await;
     }
-    .boxed()
+    .boxed_local()
 }
 
 /// One attempt of a listener: streams the notifications of the shard of
 /// `range` until the subscription stops, the stream fails, or the shard turns
 /// out split, which it records in `state` for the listener to follow.
 async fn stream_notifications(
-    subscription: Arc<Subscription>,
+    subscription: Rc<Subscription>,
     range: ShardRange,
-    state: Arc<std::sync::Mutex<ListenerState>>,
+    state: Rc<RefCell<ListenerState>>,
 ) -> Result<(), RetryError> {
     let shard_id = range.shard;
     // Taken before the shard is looked up: a split from then on ends the
@@ -241,10 +242,7 @@ async fn stream_notifications(
     let mut changes = subscription.shard_manager.subscribe_changes();
     let split = || match subscription.successors(&range) {
         Some(successors) => {
-            state
-                .lock()
-                .expect("notification listener poisoned")
-                .successors = Some(successors);
+            state.borrow_mut().successors = Some(successors);
             true
         }
         None => false,
@@ -265,10 +263,7 @@ async fn stream_notifications(
             .await
             .map_err(RetryError::transient)?,
     };
-    let start_offset_exclusive = state
-        .lock()
-        .expect("notification listener poisoned")
-        .last_offset;
+    let start_offset_exclusive = state.borrow().last_offset;
     let mut streaming = match provider
         .get_notifications(NotificationsRequest {
             shard: shard_id,
@@ -285,11 +280,7 @@ async fn stream_notifications(
             if err.is_retryable() {
                 return Err(RetryError::transient(err));
             }
-            let init = state
-                .lock()
-                .expect("notification listener poisoned")
-                .init
-                .take();
+            let init = state.borrow_mut().init.take();
             if let Some(init) = init {
                 let _ = init.tx.send(Err(err.clone())).await;
             }
@@ -317,7 +308,7 @@ async fn stream_notifications(
                     let batch = notification
                         .map_err(|err| RetryError::transient(OxiaError::from(err)))?;
                     let init = {
-                        let mut state = state.lock().expect("notification listener poisoned");
+                        let mut state = state.borrow_mut();
                         state.last_offset = Some(batch.offset);
                         state.init.take()
                     };

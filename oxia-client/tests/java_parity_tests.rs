@@ -38,8 +38,8 @@ use oxia::{ComparisonType, Notification, OxiaClient, OxiaClientBuilder, OxiaErro
 use std::time::Duration;
 use testcontainers::core::ports::ContainerPort;
 use testcontainers::core::wait::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::runners::SyncRunner;
+use testcontainers::{Container, GenericImage, ImageExt};
 
 mod common;
 
@@ -48,7 +48,7 @@ const SHARDS: u32 = 4;
 
 /// Starts a multi-shard standalone Oxia server (the Java IT uses
 /// `new OxiaContainer(...).withShards(10)`; see the module note on shard count).
-async fn start_oxia() -> (ContainerAsync<GenericImage>, String) {
+async fn start_oxia() -> (Container<GenericImage>, String) {
     let container = common::oxia_image()
         .with_exposed_port(ContainerPort::Tcp(OXIA_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Started Grpc server"))
@@ -59,12 +59,10 @@ async fn start_oxia() -> (ContainerAsync<GenericImage>, String) {
             SHARDS.to_string(),
         ])
         .start()
-        .await
         .expect("Failed to start Oxia container");
 
     let host_port = container
         .get_host_port_ipv4(OXIA_PORT)
-        .await
         .expect("Failed to get host port");
     (container, format!("http://127.0.0.1:{}", host_port))
 }
@@ -94,7 +92,7 @@ fn kv(key: &str, value: &str) -> Option<(String, Vec<u8>)> {
 
 /// Port of `OxiaClientIT.testGetFloorCeiling`: an exhaustive comparison matrix
 /// over present keys (a, c, d, e, g) and absent ones (b, f).
-#[tokio::test]
+#[compio::test]
 async fn test_get_floor_ceiling() {
     use ComparisonType::{Ceiling, Equal, Floor, Higher, Lower};
     let (_container, address) = start_oxia().await;
@@ -151,7 +149,7 @@ async fn test_get_floor_ceiling() {
 
 /// Port of `OxiaClientIT.testPartitionKey`: a partition key pins every op to one
 /// shard, and the wrong partition key resolves nothing.
-#[tokio::test]
+#[compio::test]
 async fn test_partition_key() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -275,7 +273,7 @@ async fn test_partition_key() {
 /// takes `u64`, so negatives cannot be expressed. Java throws
 /// `IllegalArgumentException` synchronously; this client returns
 /// `Err(InvalidArgument)` when the builder is awaited.
-#[tokio::test]
+#[compio::test]
 async fn test_sequential_keys() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -373,7 +371,7 @@ async fn test_sequential_keys() {
 
 /// Port of `OxiaClientIT.testRangeScan`: a range scan returns the keys in range,
 /// and re-scanning yields the same results.
-#[tokio::test]
+#[compio::test]
 async fn test_range_scan() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -408,7 +406,7 @@ async fn test_range_scan() {
 }
 
 /// Port of `OxiaClientIT.testRangeScanWithPartitionKey`.
-#[tokio::test]
+#[compio::test]
 async fn test_range_scan_with_partition_key() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -450,7 +448,7 @@ async fn test_range_scan_with_partition_key() {
 /// Port of `OxiaClientIT.testSequenceBatching`: a burst of sequential puts, in
 /// submission order, yields contiguous keys `idx-000..01 … idx-000..050`, each
 /// carrying the value submitted with it.
-#[tokio::test]
+#[compio::test]
 async fn test_sequence_batching() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -483,7 +481,7 @@ async fn test_sequence_batching() {
 
 /// Port of `OxiaClientIT.testSecondaryIndex`: list/range-scan over a secondary
 /// index return primary keys ordered by index value, and deletes update it.
-#[tokio::test]
+#[compio::test]
 async fn test_secondary_index() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -530,7 +528,7 @@ async fn test_secondary_index() {
 
 /// Port of `OxiaClientIT.testGetIncludeValue`: excluding the value returns no
 /// value (Java: empty `byte[]`; Rust: `None`) while still resolving the record.
-#[tokio::test]
+#[compio::test]
 async fn test_get_include_value() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -590,7 +588,7 @@ async fn test_get_include_value() {
 
 /// Port of `OxiaClientIT.testSecondaryIndexGet`: `get(...).use_index(...)`
 /// resolves an index value to its primary record, honoring the comparison type.
-#[tokio::test]
+#[compio::test]
 async fn test_secondary_index_get() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -706,7 +704,7 @@ async fn test_secondary_index_get() {
 /// The Java case that a missing partition key throws `IllegalArgumentException`
 /// is not portable — `sequence_updates` takes the partition key as a required
 /// argument, so it cannot be called without one.
-#[tokio::test]
+#[compio::test]
 async fn test_get_sequence_updates() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -722,7 +720,7 @@ async fn test_get_sequence_updates() {
     let mut updates1 = client.sequence_updates(key, "x").await.unwrap();
     // No update before the first put.
     assert!(
-        tokio::time::timeout(Duration::from_secs(1), updates1.recv())
+        compio::time::timeout(Duration::from_secs(1), updates1.recv())
             .await
             .is_err(),
         "no sequence update expected before the first put"
@@ -730,7 +728,7 @@ async fn test_get_sequence_updates() {
 
     let r1 = put_seq().await.unwrap();
     assert_eq!(r1.key, format!("{key}-{:020}", 1));
-    let got = tokio::time::timeout(Duration::from_secs(5), updates1.recv())
+    let got = compio::time::timeout(Duration::from_secs(5), updates1.recv())
         .await
         .expect("update not delivered")
         .expect("stream closed");
@@ -742,7 +740,7 @@ async fn test_get_sequence_updates() {
 
     // A fresh subscriber immediately receives the current latest, then advances.
     let mut updates2 = client.sequence_updates(key, "x").await.unwrap();
-    let latest = tokio::time::timeout(Duration::from_secs(5), updates2.recv())
+    let latest = compio::time::timeout(Duration::from_secs(5), updates2.recv())
         .await
         .expect("current latest not delivered")
         .expect("stream closed");
@@ -751,10 +749,10 @@ async fn test_get_sequence_updates() {
     let r3 = put_seq().await.unwrap();
     let r4 = put_seq().await.unwrap();
     // Advances may coalesce; read until the stream reaches the last key.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut last = None;
     while last.as_deref() != Some(r4.key.as_str()) {
-        match tokio::time::timeout_at(deadline, updates2.recv()).await {
+        match compio::time::timeout_at(deadline, updates2.recv()).await {
             Ok(Some(k)) => last = Some(k),
             _ => break,
         }
@@ -772,7 +770,7 @@ async fn test_get_sequence_updates() {
 /// Unlike the Java test, no warm-up is needed: `notifications()` only returns
 /// once every shard's subscription is live (this SDK's P1-13 behavior), so no
 /// change can be missed.
-#[tokio::test]
+#[compio::test]
 async fn test_delete_range_notification() {
     let (_container, address) = start_oxia().await;
     let client = new_client(&address).await;
@@ -791,10 +789,10 @@ async fn test_delete_range_notification() {
     // A broadcast delete_range produces one KeyRangeDeleted per shard, each with
     // the requested bounds (the 10 creations above arrive first and are skipped).
     let expected = SHARDS as usize;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut range_deletes = 0;
     while range_deletes < expected {
-        match tokio::time::timeout_at(deadline, rx.recv()).await {
+        match compio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(Notification::KeyRangeDeleted {
                 key,
                 key_range_last,
@@ -814,7 +812,7 @@ async fn test_delete_range_notification() {
 
 /// Port of `OxiaClientFailFastIT.testWrongNamespace`: building a client for a
 /// namespace the server does not serve fails fast (Java: `NamespaceNotFoundException`).
-#[tokio::test]
+#[compio::test]
 async fn test_wrong_namespace() {
     let (_container, address) = start_oxia().await;
 
@@ -824,7 +822,7 @@ async fn test_wrong_namespace() {
         .request_timeout(Duration::from_secs(5))
         .build();
 
-    match tokio::time::timeout(Duration::from_secs(15), build).await {
+    match compio::time::timeout(Duration::from_secs(15), build).await {
         Ok(Ok(_)) => panic!("build unexpectedly succeeded for a nonexistent namespace"),
         Ok(Err(_)) => {} // failed fast with the namespace error
         Err(_) => panic!("build hung instead of failing fast on a bad namespace"),

@@ -17,21 +17,27 @@
 //!
 //! It drives a configurable mix of reads and writes at a target rate against a
 //! set of keys, and reports throughput and latency percentiles every 10s (plus
-//! an aggregate summary on exit).
+//! an aggregate summary on exit). The client, like the load, runs on one
+//! thread.
 
 use clap::Parser;
+use futures::future::{Either, select};
 use hdrhistogram::Histogram;
 use oxia::{Bytes, OxiaClient, OxiaError};
 use rand::RngCore;
+use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// How often interval stats are printed.
 const REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How late a tick of the traffic generators may be and still catch up on
+/// the schedule, as for tokio's interval.
+const MISSED_TICK_TOLERANCE: Duration = Duration::from_millis(5);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -77,7 +83,7 @@ struct Args {
     request_timeout: f64,
 }
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -112,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut generators = Vec::new();
     let write_rate = args.rate * (100.0 - args.read_percentage) / 100.0;
     if write_rate > 0.0 {
-        generators.push(tokio::spawn(write_traffic(
+        generators.push(compio::runtime::spawn(write_traffic(
             client.clone(),
             keys.clone(),
             stats.clone(),
@@ -123,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let read_rate = args.rate * args.read_percentage / 100.0;
     if read_rate > 0.0 {
-        generators.push(tokio::spawn(read_traffic(
+        generators.push(compio::runtime::spawn(read_traffic(
             client.clone(),
             keys.clone(),
             stats.clone(),
@@ -132,22 +138,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let start = Instant::now();
-    let mut ticker = tokio::time::interval(REPORT_INTERVAL);
+    let mut ticker = compio::time::interval(REPORT_INTERVAL);
     ticker.tick().await; // discard the immediate first tick
+    let mut ctrl_c = pin!(compio::signal::ctrl_c());
     loop {
-        tokio::select! {
-            _ = ticker.tick() => stats.report_interval(),
-            _ = tokio::signal::ctrl_c() => {
+        match select(pin!(ticker.tick()), ctrl_c.as_mut()).await {
+            Either::Left(_) => stats.report_interval(),
+            Either::Right(_) => {
                 println!("\nInterrupted, shutting down…");
                 break;
             }
         }
     }
 
-    // Stop generating load before tearing the client down.
-    for generator in &generators {
-        generator.abort();
-    }
+    // Stop generating load before tearing the client down: dropping their
+    // handles cancels the generators.
+    drop(generators);
     stats.report_summary(start.elapsed());
     client.close().await?;
     Ok(())
@@ -162,8 +168,7 @@ async fn write_traffic(
     random_payload: bool,
 ) {
     let fixed: Bytes = Bytes::from(vec![0u8; value_size]);
-    let mut ticker = tokio::time::interval(Duration::from_secs_f64(1.0 / rate));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut ticker = Ticker::new(Duration::from_secs_f64(1.0 / rate));
     loop {
         ticker.tick().await;
         let key = keys[rand::random_range(0..keys.len())].clone();
@@ -176,7 +181,7 @@ async fn write_traffic(
         };
         let client = client.clone();
         let stats = stats.clone();
-        tokio::spawn(async move {
+        compio::runtime::spawn(async move {
             let start = Instant::now();
             match client.put(key.clone(), value).await {
                 Ok(_) => stats.record_write(elapsed_micros(start)),
@@ -187,19 +192,19 @@ async fn write_traffic(
                     stats.record_failure();
                 }
             }
-        });
+        })
+        .detach();
     }
 }
 
 async fn read_traffic(client: OxiaClient, keys: Arc<Vec<String>>, stats: Arc<Stats>, rate: f64) {
-    let mut ticker = tokio::time::interval(Duration::from_secs_f64(1.0 / rate));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut ticker = Ticker::new(Duration::from_secs_f64(1.0 / rate));
     loop {
         ticker.tick().await;
         let key = keys[rand::random_range(0..keys.len())].clone();
         let client = client.clone();
         let stats = stats.clone();
-        tokio::spawn(async move {
+        compio::runtime::spawn(async move {
             let start = Instant::now();
             match client.get(key.clone()).await {
                 // A miss is a normal outcome for a read, not a failure.
@@ -211,7 +216,37 @@ async fn read_traffic(client: OxiaClient, keys: Arc<Vec<String>>, stats: Arc<Sta
                     stats.record_failure();
                 }
             }
-        });
+        })
+        .detach();
+    }
+}
+
+/// Ticks at a fixed period, as tokio's interval with
+/// `MissedTickBehavior::Delay` does: a tick late by less than
+/// [`MISSED_TICK_TOLERANCE`] catches up on the schedule, so rates above the
+/// timer resolution are reached; after a later one, the next tick comes a
+/// full period later rather than in a burst.
+struct Ticker {
+    period: Duration,
+    deadline: Instant,
+}
+
+impl Ticker {
+    fn new(period: Duration) -> Self {
+        Ticker {
+            period,
+            deadline: Instant::now(),
+        }
+    }
+
+    async fn tick(&mut self) {
+        compio::time::sleep_until(self.deadline).await;
+        let now = Instant::now();
+        self.deadline = if now > self.deadline + MISSED_TICK_TOLERANCE {
+            now + self.period
+        } else {
+            self.deadline + self.period
+        };
     }
 }
 

@@ -248,10 +248,19 @@ impl OxiaClientBuilder {
 
     /// Connects to the cluster and returns the client.
     ///
+    /// Must run inside a compio runtime, on the thread the client will be
+    /// used on (see [Runtime](crate#runtime)); elsewhere it fails with
+    /// [`OxiaError::InvalidArgument`].
+    ///
     /// Fails fast — within the request timeout — when the cluster is
     /// unreachable, the namespace does not exist, or the first shard
     /// assignments cannot be obtained.
     pub async fn build(self) -> Result<OxiaClient, OxiaError> {
+        if compio::runtime::Runtime::try_current().is_none() {
+            return Err(OxiaError::InvalidArgument(
+                "the client must be built inside a compio runtime".to_string(),
+            ));
+        }
         #[cfg(feature = "otel")]
         let metrics = crate::metrics::Metrics::new(self.meter.clone());
         #[cfg(not(feature = "otel"))]
@@ -284,6 +293,15 @@ mod tests {
     const _: fn() = || {
         fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
         assert_unwind_safe::<OxiaClientBuilder>();
+    };
+
+    // The client is single-threaded, but its configuration is not: a builder
+    // can be cloned into one thread per client, and errors can be sent
+    // anywhere. Compile-time only.
+    const _: fn() = || {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<OxiaClientBuilder>();
+        assert_send_sync::<OxiaError>();
     };
 
     #[test]

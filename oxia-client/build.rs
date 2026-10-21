@@ -23,6 +23,9 @@ fn main() {
         // Server stubs are used only by the in-process mock server that the
         // hermetic unit tests run against (src/mock_server.rs, cfg(test)).
         .build_server(true)
+        // No `connect` constructor over tonic's own transport, which runs on
+        // tokio: the client dials through `transport.rs` instead.
+        .build_transport(false)
         // Generate `bytes::Bytes` for all proto `bytes` fields (record values):
         // decoding borrows the receive buffer and cloning is refcounted, so
         // values move through the client without byte copies.

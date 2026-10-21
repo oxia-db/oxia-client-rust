@@ -23,13 +23,16 @@
 //!
 //! Runs until Ctrl-C (or stops by itself after 10 seconds).
 
+use futures::future::{Either, select};
 use oxia::{OxiaClient, OxiaError};
+use std::cell::Cell;
+use std::pin::pin;
+use std::rc::Rc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 
-#[tokio::main]
+#[compio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -41,17 +44,18 @@ async fn main() {
         .init();
 
     let client = OxiaClient::connect("localhost:6648").await.unwrap();
-    let shutdown = CancellationToken::new();
+    // The producers run on the client's thread: a plain flag signals them.
+    let shutdown = Rc::new(Cell::new(false));
 
     // A few producers writing continuously. Each checks the shutdown signal
     // between operations and treats `Closed` as a normal way to stop.
-    let mut producers = tokio::task::JoinSet::new();
+    let mut producers = Vec::new();
     for worker in 0..4 {
         let client = client.clone();
         let shutdown = shutdown.clone();
-        producers.spawn(async move {
+        producers.push(compio::runtime::spawn(async move {
             let mut written = 0u64;
-            while !shutdown.is_cancelled() {
+            while !shutdown.get() {
                 let key = format!("shutdown/w{worker}/{written}");
                 match client.put(key, "payload").await {
                     Ok(_) => written += 1,
@@ -60,26 +64,28 @@ async fn main() {
                     Err(OxiaError::Closed) => break,
                     Err(e) => panic!("write failed: {e}"),
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                compio::time::sleep(Duration::from_millis(50)).await;
             }
             written
-        });
+        }));
     }
     info!("Producers running — Ctrl-C to shut down");
 
     // Wait for Ctrl-C (or a timer, so the example ends on its own).
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => info!("Ctrl-C received"),
-        _ = tokio::time::sleep(Duration::from_secs(10)) => info!("Demo timer elapsed"),
+    let ctrl_c = pin!(compio::signal::ctrl_c());
+    let timer = pin!(compio::time::sleep(Duration::from_secs(10)));
+    match select(ctrl_c, timer).await {
+        Either::Left(_) => info!("Ctrl-C received"),
+        Either::Right(_) => info!("Demo timer elapsed"),
     }
 
     // 1. Stop issuing new operations.
-    shutdown.cancel();
+    shutdown.set(true);
 
     // 2. Let every in-flight operation finish.
     let mut total = 0u64;
-    while let Some(written) = producers.join_next().await {
-        total += written.unwrap();
+    for producer in producers {
+        total += producer.await.unwrap();
     }
     info!("Producers drained: {total} writes completed");
 

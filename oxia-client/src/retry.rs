@@ -59,17 +59,17 @@ where
     A: FnMut() -> Fut,
     Fut: Future<Output = Result<T, OxiaError>>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
     let mut n = 0u32;
     loop {
         match attempt().await {
             Err(err) if is_retryable(&err) => {
                 let delay = retry_delay(n);
                 n += 1;
-                if tokio::time::Instant::now() + delay >= deadline {
+                if Instant::now() + delay >= deadline {
                     return Err(err);
                 }
-                tokio::time::sleep(delay).await;
+                compio::time::sleep(delay).await;
             }
             other => return other,
         }
@@ -149,7 +149,7 @@ where
                 warn!("Background task '{what}' failed, retrying in {delay:?}: {err}");
                 tokio::select! {
                     _ = token.cancelled() => return,
-                    _ = tokio::time::sleep(delay) => {}
+                    _ = compio::time::sleep(delay) => {}
                 }
             }
         }
@@ -175,7 +175,7 @@ mod tests {
         assert_eq!(b.next_delay(), Duration::from_millis(100));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn stops_on_cancellation_during_delay() {
         let token = CancellationToken::new();
         token.cancel();
@@ -187,7 +187,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn retry_until_returns_ok_without_retrying() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let calls = AtomicU32::new(0);
@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn retry_until_returns_non_retryable_immediately() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let calls = AtomicU32::new(0);
@@ -221,12 +221,12 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
     async fn retry_until_retries_then_succeeds() {
         use std::sync::atomic::{AtomicU32, Ordering};
         // Fail with a retryable error twice (e.g. shard still moving), then
-        // succeed once the new assignment lands. Paused time makes the backoff
-        // sleeps instant.
+        // succeed once the new assignment lands, after 100ms + 200ms of
+        // backoff.
         let calls = AtomicU32::new(0);
         let out: Result<u32, OxiaError> = retry_until(
             Duration::from_secs(60),
@@ -245,10 +245,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
     async fn retry_until_gives_up_at_deadline_with_last_error() {
         let out: Result<(), OxiaError> = retry_until(
-            Duration::from_secs(1),
+            Duration::from_millis(300),
             |e| e.is_retryable(),
             || async { Err(OxiaError::ShardMoved) },
         )
@@ -256,7 +256,7 @@ mod tests {
         assert!(matches!(out, Err(OxiaError::ShardMoved)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn stops_on_fatal() {
         let token = CancellationToken::new();
         retry_until_cancelled(&token, "test", || async {

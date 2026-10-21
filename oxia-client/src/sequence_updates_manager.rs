@@ -17,10 +17,10 @@ use crate::proto::GetSequenceUpdatesRequest;
 use crate::provider_manager::ProviderManager;
 use crate::retry::{RetryError, retry_until_cancelled};
 use crate::shard_manager::ShardManager;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use compio::runtime::JoinHandle;
+use std::cell::RefCell;
+use std::rc::Rc;
 use tokio::sync::mpsc::Sender;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::codegen::tokio_stream::StreamExt;
@@ -28,7 +28,7 @@ use tracing::info;
 
 pub struct SequenceUpdatesManager {
     context: CancellationToken,
-    handle: Mutex<Option<JoinHandle<()>>>,
+    handle: RefCell<Option<JoinHandle<()>>>,
 }
 
 impl Drop for SequenceUpdatesManager {
@@ -41,12 +41,12 @@ impl SequenceUpdatesManager {
     pub fn new(
         key: String,
         partition_key: String,
-        shard_manager: Arc<ShardManager>,
-        provider_manager: Arc<ProviderManager>,
+        shard_manager: Rc<ShardManager>,
+        provider_manager: Rc<ProviderManager>,
         sender: Sender<String>,
     ) -> Self {
         let context = CancellationToken::new();
-        let handle = tokio::spawn(start_listener(
+        let handle = compio::runtime::spawn(start_listener(
             context.clone(),
             key.clone(),
             partition_key.clone(),
@@ -56,13 +56,14 @@ impl SequenceUpdatesManager {
         ));
         SequenceUpdatesManager {
             context,
-            handle: Mutex::new(Some(handle)),
+            handle: RefCell::new(Some(handle)),
         }
     }
 
     pub async fn shutdown(self) -> Result<(), OxiaError> {
         self.context.cancel();
-        if let Some(handle) = self.handle.lock().await.take() {
+        let handle = self.handle.borrow_mut().take();
+        if let Some(handle) = handle {
             handle
                 .await
                 .map_err(|err| OxiaError::Disconnected(err.to_string()))?;
@@ -76,8 +77,8 @@ async fn start_listener(
     context: CancellationToken,
     key: String,
     partition_key: String,
-    shard_manager: Arc<ShardManager>,
-    provider_manager: Arc<ProviderManager>,
+    shard_manager: Rc<ShardManager>,
+    provider_manager: Rc<ProviderManager>,
     sender: Sender<String>,
 ) {
     let defer = || {

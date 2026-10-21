@@ -6,8 +6,8 @@ see the Oxia [Code of Conduct](https://github.com/oxia-db/oxia/blob/main/CODE_OF
 
 ## Prerequisites
 
-- **Rust 1.85+** (edition 2024) — install via [rustup](https://rustup.rs). 1.85 is the MSRV;
-  please don't use features that raise it.
+- **Rust 1.95+** (edition 2024) — install via [rustup](https://rustup.rs). 1.95 is the MSRV
+  (the floor of the compio runtime); please don't use features that raise it.
 - **CMake** — required by a native build dependency. This repo pins it with
   [mise](https://mise.jdx.dev): run `mise install` in the repo root, or install CMake yourself.
 - **Docker** — the integration and interop tests start a real Oxia server in a container
