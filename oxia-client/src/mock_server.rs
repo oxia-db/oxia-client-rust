@@ -1031,6 +1031,42 @@ mod tests {
         );
     }
 
+    /// A write larger than `batch_max_size` goes out in a batch of its own,
+    /// after the writes issued before it and ahead of those issued after it.
+    #[compio::test]
+    async fn oversized_write_goes_out_alone_in_issue_order() {
+        let mock = MockOxia::start(Behavior::default()).await;
+        let client = OxiaClientBuilder::new()
+            .service_address(mock.address.clone())
+            .request_timeout(Duration::from_secs(10))
+            .batch_max_size(100)
+            .build()
+            .await
+            .expect("connect");
+
+        // `biased` polls the puts in order, and each one joins the open
+        // batch on its first poll: the small ones would share a batch with
+        // the large one if it took them.
+        let (a, b, large, c, d) = tokio::join!(
+            biased;
+            client.put("a", "x"),
+            client.put("b", "x"),
+            client.put("large", vec![0u8; 1000]),
+            client.put("c", "x"),
+            client.put("d", "x"),
+        );
+        for put in [a, b, large, c, d] {
+            put.expect("put");
+        }
+
+        let batches: Vec<Vec<String>> = mock
+            .write_requests()
+            .into_iter()
+            .map(|request| request.puts.into_iter().map(|put| put.key).collect())
+            .collect();
+        assert_eq!(batches, [vec!["a", "b"], vec!["large"], vec!["c", "d"]]);
+    }
+
     /// No more write batches than `max_write_batches_in_flight` are ever
     /// outstanding on a shard.
     #[compio::test]

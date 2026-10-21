@@ -18,9 +18,8 @@ use thiserror::Error;
 ///
 /// The variants fall into three groups:
 /// - **Semantic results** callers commonly match on ([`KeyNotFound`],
-///   [`UnexpectedVersionId`], [`SessionExpired`], [`RequestTooLarge`],
-///   [`InvalidArgument`], [`EndInclusiveUnsupported`]). These are never
-///   retryable.
+///   [`UnexpectedVersionId`], [`SessionExpired`], [`InvalidArgument`],
+///   [`EndInclusiveUnsupported`]). These are never retryable.
 /// - **Transient failures** that the client's background loops (and, in a later
 ///   phase, its operation-level retries) may retry: [`LeaderNotFound`],
 ///   [`NoShardForKey`], [`Disconnected`], and some [`Grpc`] codes. See
@@ -31,7 +30,6 @@ use thiserror::Error;
 /// [`KeyNotFound`]: OxiaError::KeyNotFound
 /// [`UnexpectedVersionId`]: OxiaError::UnexpectedVersionId
 /// [`SessionExpired`]: OxiaError::SessionExpired
-/// [`RequestTooLarge`]: OxiaError::RequestTooLarge
 /// [`InvalidArgument`]: OxiaError::InvalidArgument
 /// [`EndInclusiveUnsupported`]: OxiaError::EndInclusiveUnsupported
 /// [`LeaderNotFound`]: OxiaError::LeaderNotFound
@@ -57,8 +55,10 @@ pub enum OxiaError {
     #[error("session no longer exists")]
     SessionExpired,
 
-    /// A single request, or a batch that cannot be split further, exceeds the
-    /// server's maximum message size.
+    /// No longer returned, and kept for compatibility: a write larger than
+    /// [`batch_max_size`](crate::OxiaClientBuilder::batch_max_size) goes out
+    /// in a batch of its own, and one too large for the server fails with
+    /// the server's [`Grpc`](OxiaError::Grpc) status.
     #[error("request is too large")]
     RequestTooLarge,
 
