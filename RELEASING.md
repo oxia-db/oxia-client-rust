@@ -5,9 +5,11 @@
 with [release-plz](https://release-plz.dev).
 
 **Release notes live in GitHub Releases** — this repository intentionally keeps no in-repo
-`CHANGELOG.md`. release-plz generates the release notes from the commit history, so land changes
-with [Conventional Commits](https://www.conventionalcommits.org) messages (`feat:` for a minor
-bump, `fix:` for a patch, `feat!:` / `BREAKING CHANGE:` for a major).
+`CHANGELOG.md`, and the notes are written by hand (see step 3 below). release-plz picks the next
+version from the commit history, so land changes with
+[Conventional Commits](https://www.conventionalcommits.org) messages. While the crate is at 0.x, a
+breaking change (`feat!:` / `BREAKING CHANGE:`) bumps the minor version and any other change the
+patch; from 1.0, `feat:` bumps the minor, `fix:` the patch, and a breaking change the major.
 
 ## How it works
 
@@ -16,13 +18,21 @@ The [`Release-plz`](./.github/workflows/release-plz.yml) workflow runs on every 
 1. **Release PR.** release-plz keeps a PR open that bumps `oxia-client`'s version according to the
    conventional commits merged since the last release. Review it like any other PR.
 2. **Publish.** Merging the release PR makes the workflow `cargo publish` `oxia-client`, push a
-   `vX.Y.Z` tag, and create a GitHub Release with generated notes.
-3. **(Optional) Curate.** Edit the generated GitHub Release to add highlights or migration notes.
+   `vX.Y.Z` tag, and create a GitHub Release. The workflow publishes on any push to `main` whose
+   `oxia-client` version is not on crates.io yet, so a version bumped by hand is released by the
+   next merge, with no release PR.
+3. **Write the release notes.** With `changelog_update = false`, release-plz creates the GitHub
+   Release with an empty body, named `vX.Y.Z`. Edit it to add the notes (highlights, breaking
+   changes, migration notes) and the `oxia-client X.Y.Z` title of the earlier releases:
 
-Only `oxia-client` is released. The `oxia-client-ffi` shim and the `oxia-perf` tool are internal
-(`publish = false`, and `release = false` in [`release-plz.toml`](./release-plz.toml)), so
-release-plz never publishes, tags, or creates a GitHub Release for them — though it may bump the
-FFI's version to keep it in step with `oxia-client`.
+   ```shell
+   gh release edit vX.Y.Z --title "oxia-client X.Y.Z" --notes-file notes.md
+   ```
+
+Only `oxia-client` is released. The `oxia-client-ffi` shim and the `oxia-perf` tool are internal:
+both have `release = false` in [`release-plz.toml`](./release-plz.toml), so release-plz never
+bumps, publishes, tags, or creates a GitHub Release for them (`oxia-perf` also has
+`publish = false`).
 
 ## Required setup (one-time)
 
