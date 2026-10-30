@@ -14,9 +14,9 @@
 
 # Release automation for oxia-client (see RELEASING.md).
 #
-# Release notes are published as GitHub Releases generated from the commit
-# history; this repository intentionally keeps no in-repo CHANGELOG.md, so the
-# changelog file is never written.
+# Release notes are written by hand in GitHub Releases; this repository
+# intentionally keeps no in-repo CHANGELOG.md, so the changelog file is never
+# written, and release-plz creates each GitHub Release with an empty body.
 [workspace]
 changelog_update = false
 git_release_enable = true
