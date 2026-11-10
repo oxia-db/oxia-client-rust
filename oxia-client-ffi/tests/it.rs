@@ -116,10 +116,16 @@ unsafe fn take_message(message: *mut c_char) -> String {
 /// An open client against the shared server, with a short request timeout so
 /// a mistake fails fast.
 fn client() -> *mut oxia_client {
+    client_with_memory_cap(0)
+}
+
+/// As `client`, with the client's byte cap set: `0` asks for the default.
+fn client_with_memory_cap(max_in_flight_bytes: u64) -> *mut oxia_client {
     let address = address().as_bytes();
     let mut options: oxia_client_options = zeroed();
     options.service_address = slice_of(address);
     options.request_timeout_ms = 10_000;
+    options.max_in_flight_bytes = max_in_flight_bytes;
     let mut client: *mut oxia_client = ptr::null_mut();
     let mut message: *mut c_char = ptr::null_mut();
     let code = unsafe { oxia_client_new(&options, &mut client, &mut message) };
@@ -908,6 +914,207 @@ fn a_null_callback_is_rejected_before_anything_is_submitted() {
         unsafe { oxia_client_put_async(client, &options, None, ptr::null_mut(), &mut message) };
     assert_eq!(code, oxia_error_code::OXIA_ERR_INVALID_ARGUMENT);
     assert!(unsafe { take_message(message) }.contains("callback"));
+    unsafe { oxia_client_free(client) };
+}
+
+// ===========================================================================
+// The backpressure the byte cap applies
+// ===========================================================================
+
+/// The cap these tests run under, and a value far larger than it, so that a
+/// single operation fills the budget on its own.
+const TINY_CAP: u64 = 1024;
+const BIG_VALUE: usize = 4096;
+
+/// A recorder whose callback does not return until the test lets it.
+///
+/// The bytes a submission is charged are returned when its callback has run,
+/// so parking inside one holds the budget for as long as the test needs —
+/// which is what makes the refusal below deterministic rather than a race
+/// against the server answering.
+#[derive(Default)]
+struct Gate {
+    recorder: Recorder,
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl Gate {
+    fn wait_until_open(&self) {
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            let (next, timeout) = self
+                .opened
+                .wait_timeout(open, Duration::from_secs(30))
+                .unwrap();
+            open = next;
+            assert!(!timeout.timed_out(), "the gate was never opened");
+        }
+    }
+
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+unsafe impl Sync for Gate {}
+
+extern "C" fn on_put_then_wait(
+    code: oxia_error_code,
+    message: *const c_char,
+    result: *const oxia_put_result,
+    ctx: *mut c_void,
+) {
+    let gate = unsafe { &*(ctx as *const Gate) };
+    let key = if result.is_null() {
+        None
+    } else {
+        unsafe { owned((*result).key) }
+    };
+    gate.recorder
+        .record(code, key, unsafe { message_of(message) });
+    gate.wait_until_open();
+}
+
+/// Submits a put of `BIG_VALUE` bytes without waiting for it.
+unsafe fn put_async(
+    client: *const oxia_client,
+    key: &[u8],
+    callback: oxia_put_callback,
+    ctx: *mut c_void,
+    message: *mut *mut c_char,
+) -> oxia_error_code {
+    let value = vec![b'x'; BIG_VALUE];
+    let mut options: oxia_put_options = zeroed();
+    options.key = slice_of(key);
+    options.value = slice_of(&value);
+    oxia_client_put_async(client, &options, Some(callback), ctx, message)
+}
+
+#[test]
+fn an_async_submit_past_the_byte_cap_is_refused_and_a_retry_later_succeeds() {
+    let client = client_with_memory_cap(TINY_CAP);
+    let gate = Gate::default();
+    let ctx = &gate as *const Gate as *mut c_void;
+
+    // The first put fills the budget on its own, and its callback parks
+    // there, so the budget stays full.
+    assert_eq!(
+        unsafe {
+            put_async(
+                client,
+                b"backpressure/held",
+                on_put_then_wait,
+                ctx,
+                ptr::null_mut(),
+            )
+        },
+        oxia_error_code::OXIA_OK
+    );
+    let seen = gate.recorder.wait_for(1);
+    assert_eq!(seen[0].0, oxia_error_code::OXIA_OK);
+
+    // The next one does not fit, and says so rather than queuing.
+    let mut message: *mut c_char = ptr::null_mut();
+    let code = unsafe {
+        put_async(
+            client,
+            b"backpressure/refused",
+            on_put_then_wait,
+            ctx,
+            &mut message,
+        )
+    };
+    assert_eq!(code, oxia_error_code::OXIA_ERR_QUEUE_FULL);
+    let text = unsafe { take_message(message) };
+    assert!(text.contains("max_in_flight_bytes"), "{text}");
+    assert!(
+        oxia_error_is_retryable(oxia_error_code::OXIA_ERR_QUEUE_FULL),
+        "a full queue is worth retrying"
+    );
+
+    // A refusal is not an acceptance: nothing calls back for it. The one
+    // callback that has run is the first put's, still parked in the gate.
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        gate.recorder.seen.lock().unwrap().len(),
+        1,
+        "a refused submission must not call back"
+    );
+
+    // Letting the first callback return frees its bytes, and the retry fits.
+    gate.release();
+    let mut retried = oxia_error_code::OXIA_ERR_QUEUE_FULL;
+    for _ in 0..50 {
+        retried = unsafe {
+            put_async(
+                client,
+                b"backpressure/refused",
+                on_put_then_wait,
+                ctx,
+                ptr::null_mut(),
+            )
+        };
+        if retried == oxia_error_code::OXIA_OK {
+            break;
+        }
+        // The bytes are returned on the dispatcher thread, so the room may
+        // take a moment to appear.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        retried,
+        oxia_error_code::OXIA_OK,
+        "the room the first callback freed should take the retry"
+    );
+    let seen = gate.recorder.wait_for(2);
+    assert_eq!(seen.len(), 2, "exactly the two accepted puts called back");
+    assert_eq!(seen[1].0, oxia_error_code::OXIA_OK);
+    assert_eq!(
+        seen[1].1.as_deref(),
+        Some(b"backpressure/refused".as_ref()),
+        "the retry is the one that was refused"
+    );
+
+    unsafe { oxia_client_free(client) };
+}
+
+#[test]
+fn the_blocking_form_waits_for_room_instead_of_being_refused() {
+    let client = client_with_memory_cap(TINY_CAP);
+    let value = vec![b'x'; BIG_VALUE];
+
+    // Each of these is larger than the whole budget, which the client admits
+    // when nothing else is in flight — so they take longer, they do not fail.
+    for index in 0..8 {
+        let key = format!("backpressure/blocking/{index}").into_bytes();
+        put(client, &key, &value);
+    }
+
+    // The same from several threads at once, where they really do queue
+    // behind one another.
+    let shared = client as usize;
+    let threads: Vec<_> = (0..4)
+        .map(|index| {
+            std::thread::spawn(move || {
+                let client = shared as *const oxia_client;
+                let value = vec![b'x'; BIG_VALUE];
+                let key = format!("backpressure/blocking/parallel/{index}").into_bytes();
+                put(client, &key, &value);
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("a blocking put failed");
+    }
+
+    let result = get(client, b"backpressure/blocking/parallel/3").expect("the record is there");
+    assert_eq!(
+        unsafe { owned((*result).value) }.map(|bytes| bytes.len()),
+        Some(BIG_VALUE)
+    );
+    unsafe { oxia_get_result_free(result) };
     unsafe { oxia_client_free(client) };
 }
 

@@ -29,10 +29,10 @@ use std::ptr;
 
 use oxia::{ComparisonType, GetResult, OxiaClient as NativeOxiaClient, OxiaError, PutResult};
 
-use crate::error::{fail, guard, invalid, oxia_error_code};
+use crate::error::{fail, guard, invalid, oxia_error_code, write_message};
 use crate::mem::{optional_str, oxia_slice, required_array, required_bytes, required_str};
 use crate::results::{oxia_get_result, oxia_key_list, oxia_put_result, oxia_record_list};
-use crate::runtime::oxia_client;
+use crate::runtime::{Rejected, oxia_client};
 
 // ===========================================================================
 // Callback plumbing
@@ -320,6 +320,13 @@ impl PutRequest {
         })
     }
 
+    /// The bytes this operation holds, charged against the client's
+    /// submission budget. Counts the key and the value, as the client's own
+    /// `max_in_flight_bytes` limiter does, so the two mean the same thing.
+    fn size(&self) -> usize {
+        self.key.len() + self.value.len()
+    }
+
     async fn execute(self, client: NativeOxiaClient) -> Result<PutResult, OxiaError> {
         let mut put = client.put(self.key, self.value);
         if let Some(version_id) = self.expected_version_id {
@@ -365,6 +372,11 @@ impl GetRequest {
         })
     }
 
+    /// As `PutRequest::size`: a get holds only its key.
+    fn size(&self) -> usize {
+        self.key.len()
+    }
+
     async fn execute(self, client: NativeOxiaClient) -> Result<GetResult, OxiaError> {
         let mut get = client.get(self.key).comparison(self.comparison);
         if !self.include_value {
@@ -397,6 +409,11 @@ impl DeleteRequest {
             partition_key: optional_str(options.partition_key, "partition_key")?
                 .map(str::to_string),
         })
+    }
+
+    /// As `PutRequest::size`: a delete holds only its key.
+    fn size(&self) -> usize {
+        self.key.len()
     }
 
     async fn execute(self, client: NativeOxiaClient) -> Result<(), OxiaError> {
@@ -432,6 +449,11 @@ impl DeleteRangeRequest {
         })
     }
 
+    /// As `PutRequest::size`: a delete range holds its two bounds.
+    fn size(&self) -> usize {
+        self.min_key_inclusive.len() + self.max_key_exclusive.len()
+    }
+
     async fn execute(self, client: NativeOxiaClient) -> Result<(), OxiaError> {
         let mut delete = client.delete_range(self.min_key_inclusive, self.max_key_exclusive);
         if let Some(partition_key) = self.partition_key {
@@ -464,6 +486,11 @@ impl RangeRequest {
             end_inclusive: options.end_inclusive,
             include_internal_keys: options.include_internal_keys,
         })
+    }
+
+    /// As `PutRequest::size`: a range holds its two bounds.
+    pub(crate) fn size(&self) -> usize {
+        self.min_key_inclusive.len() + self.max_key_exclusive.len()
     }
 
     fn list_builder(self, client: NativeOxiaClient) -> oxia::ListBuilder {
@@ -563,6 +590,30 @@ unsafe fn async_preamble<'a, F>(
     Ok((client, callback))
 }
 
+/// Turns a refused submission into the code and the message to return.
+///
+/// Both refusals mean the same thing to a caller: the operation was not
+/// accepted, so its callback will not run.
+///
+/// # Safety
+///
+/// `error_message` must be `NULL` or point at a writable `char *`.
+unsafe fn refused(rejected: Rejected, error_message: *mut *mut c_char) -> oxia_error_code {
+    match rejected {
+        Rejected::Closed => fail(error_message, &OxiaError::Closed),
+        Rejected::QueueFull(held, limit) => {
+            write_message(
+                error_message,
+                &format!(
+                    "the client holds {held} bytes for the operations it has accepted, which is \
+                     its max_in_flight_bytes limit of {limit}: retry once a callback has run"
+                ),
+            );
+            oxia_error_code::OXIA_ERR_QUEUE_FULL
+        }
+    }
+}
+
 // ===========================================================================
 // put
 // ===========================================================================
@@ -643,9 +694,10 @@ pub unsafe extern "C" fn oxia_client_put_async(
             oxia_put_result::new,
             oxia_put_result::free,
         );
-        match client.submit(move |native| request.execute(native), deliver) {
+        let size = request.size();
+        match client.submit(size, move |native| request.execute(native), deliver) {
             Ok(()) => oxia_error_code::OXIA_OK,
-            Err(error) => fail(error_message, &error),
+            Err(rejected) => refused(rejected, error_message),
         }
     })
 }
@@ -722,9 +774,10 @@ pub unsafe extern "C" fn oxia_client_get_async(
             oxia_get_result::new,
             oxia_get_result::free,
         );
-        match client.submit(move |native| request.execute(native), deliver) {
+        let size = request.size();
+        match client.submit(size, move |native| request.execute(native), deliver) {
             Ok(()) => oxia_error_code::OXIA_OK,
-            Err(error) => fail(error_message, &error),
+            Err(rejected) => refused(rejected, error_message),
         }
     })
 }
@@ -789,9 +842,10 @@ pub unsafe extern "C" fn oxia_client_delete_async(
             Err(text) => return invalid(error_message, text),
         };
         let deliver = on_status(Callback { function, ctx });
-        match client.submit(move |native| request.execute(native), deliver) {
+        let size = request.size();
+        match client.submit(size, move |native| request.execute(native), deliver) {
             Ok(()) => oxia_error_code::OXIA_OK,
-            Err(error) => fail(error_message, &error),
+            Err(rejected) => refused(rejected, error_message),
         }
     })
 }
@@ -847,9 +901,10 @@ pub unsafe extern "C" fn oxia_client_delete_range_async(
             Err(text) => return invalid(error_message, text),
         };
         let deliver = on_status(Callback { function, ctx });
-        match client.submit(move |native| request.execute(native), deliver) {
+        let size = request.size();
+        match client.submit(size, move |native| request.execute(native), deliver) {
             Ok(()) => oxia_error_code::OXIA_OK,
-            Err(error) => fail(error_message, &error),
+            Err(rejected) => refused(rejected, error_message),
         }
     })
 }
@@ -931,9 +986,10 @@ pub unsafe extern "C" fn oxia_client_list_async(
             |keys: &Vec<String>| oxia_key_list::new(keys),
             oxia_key_list::free,
         );
-        match client.submit(move |native| request.list(native), deliver) {
+        let size = request.size();
+        match client.submit(size, move |native| request.list(native), deliver) {
             Ok(()) => oxia_error_code::OXIA_OK,
-            Err(error) => fail(error_message, &error),
+            Err(rejected) => refused(rejected, error_message),
         }
     })
 }
@@ -1003,9 +1059,10 @@ pub unsafe extern "C" fn oxia_client_range_scan_async(
             |records: &Vec<GetResult>| oxia_record_list::new(records),
             oxia_record_list::free,
         );
-        match client.submit(move |native| request.range_scan(native), deliver) {
+        let size = request.size();
+        match client.submit(size, move |native| request.range_scan(native), deliver) {
             Ok(()) => oxia_error_code::OXIA_OK,
-            Err(error) => fail(error_message, &error),
+            Err(rejected) => refused(rejected, error_message),
         }
     })
 }
