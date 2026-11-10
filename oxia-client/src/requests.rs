@@ -88,8 +88,9 @@ impl PutBuilder {
     /// there are deltas, the missing deltas are 0 on the servers with
     /// `FEATURE_SEQUENCE_KEY_VALIDATION`.
     ///
-    /// Requires [`partition_key`](PutBuilder::partition_key); every delta must
-    /// be greater than zero; and it cannot be combined with
+    /// Requires [`partition_key`](PutBuilder::partition_key); the first delta
+    /// must be greater than zero, while the following ones may be 0 to leave
+    /// their sequence where it is; and it cannot be combined with
     /// [`expected_version_id`](PutBuilder::expected_version_id). Awaiting a put
     /// that violates any of these fails with [`OxiaError::InvalidArgument`].
     pub fn sequence_key_deltas(mut self, deltas: impl IntoIterator<Item = u64>) -> Self {
@@ -138,10 +139,12 @@ impl PutBuilder {
                 index.index_name
             )));
         }
-        // Validate sequence-key puts up front (matching the Java client's
-        // `PutOperation`): sequential keys require a partition key, are
-        // incompatible with an expected version, and every delta must be
-        // positive. Negative deltas are already impossible (`u64`).
+        // Validate sequence-key puts up front (matching the Go client's
+        // `newPutOptions` and the Java client's `PutOperation`): sequential
+        // keys require a partition key, are incompatible with an expected
+        // version, and their first delta must be positive. The deltas after
+        // it may be 0, which leaves their sequence where it is — as does a
+        // missing delta. Negative deltas are already impossible (`u64`).
         if !self.sequence_key_deltas.is_empty() {
             if self.partition_key.is_none() {
                 return Err(OxiaError::InvalidArgument(
@@ -153,9 +156,9 @@ impl PutBuilder {
                     "sequence_key_deltas cannot be combined with expected_version_id".to_string(),
                 ));
             }
-            if self.sequence_key_deltas.contains(&0) {
+            if self.sequence_key_deltas[0] == 0 {
                 return Err(OxiaError::InvalidArgument(
-                    "every sequence delta must be greater than zero".to_string(),
+                    "the first sequence delta must be greater than zero".to_string(),
                 ));
             }
         }
