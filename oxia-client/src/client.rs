@@ -250,8 +250,8 @@ impl OxiaClient {
     /// Awaiting the builder returns:
     /// - [`OxiaError::InvalidArgument`] when
     ///   [`sequence_key_deltas`](PutBuilder::sequence_key_deltas) is used
-    ///   without a partition key, with a zero delta, or together with an
-    ///   expected version, when a
+    ///   without a partition key, with a zero first delta, or together with
+    ///   an expected version, when a
     ///   [`secondary_index`](PutBuilder::secondary_index) name contains `/`,
     ///   or when the server rejects the put as invalid;
     /// - [`OxiaError::UnexpectedVersionId`] when a

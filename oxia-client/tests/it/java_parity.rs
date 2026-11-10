@@ -329,6 +329,17 @@ async fn test_sequential_keys() {
         .unwrap();
     assert_eq!(r3.key, format!("sk_a-{:020}-{:020}", 5, 6));
 
+    // Beyond the first, a 0 delta leaves its sequence where it is: the Go
+    // client documents deltas as ">= 0 and the first one strictly > 0", and
+    // this client must not reject the ones the reference clients accept.
+    let r4 = client
+        .put("sk_a", b"3".to_vec())
+        .partition_key("x")
+        .sequence_key_deltas(vec![1, 0])
+        .await
+        .unwrap();
+    assert_eq!(r4.key, format!("sk_a-{:020}-{:020}", 6, 6));
+
     // The base key itself is never stored.
     assert!(matches!(
         client.get("sk_a").partition_key("x").await,
