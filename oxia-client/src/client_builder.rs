@@ -29,7 +29,7 @@ use std::time::Duration;
 /// | [`identity`](OxiaClientBuilder::identity) | random UUID |
 /// | [`batch_max_size`](OxiaClientBuilder::batch_max_size) | 128 KiB |
 /// | [`max_requests_per_batch`](OxiaClientBuilder::max_requests_per_batch) | 1000 |
-/// | [`max_in_flight_bytes`](OxiaClientBuilder::max_in_flight_bytes) | 64 MiB |
+/// | [`max_in_flight_bytes`](OxiaClientBuilder::max_in_flight_bytes) | 64 MiB ([`DEFAULT_MAX_IN_FLIGHT_BYTES`](crate::DEFAULT_MAX_IN_FLIGHT_BYTES)) |
 /// | [`max_write_batches_in_flight`](OxiaClientBuilder::max_write_batches_in_flight) | 4 |
 /// | [`max_read_batches_in_flight`](OxiaClientBuilder::max_read_batches_in_flight) | 4 |
 /// | [`session_timeout`](OxiaClientBuilder::session_timeout) | 15 s |

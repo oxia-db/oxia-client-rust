@@ -24,8 +24,13 @@
 //! language's runtime may well do — would stall every other operation; one
 //! that made a blocking Oxia call from it would deadlock. On the dispatcher
 //! both are merely slow.
+//!
+//! Submitting is bounded by [`QueueBudget`]: a submission that cannot be
+//! charged against the budget is refused instead of being queued. See that
+//! type for why the client's own `max_in_flight_bytes` limiter cannot do
+//! this job on its own.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as sync_mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -94,6 +99,102 @@ impl LiveStreams {
 /// The closure that hands an operation's outcome to a caller's callback.
 type Deliver<T> = Box<dyn FnOnce(Result<T, OxiaError>) + Send>;
 
+/// Caps the bytes the asynchronous entry points hold for the operations they
+/// have accepted but not yet called back for.
+///
+/// The blocking entry points need nothing like this: they run the native
+/// operation and park the calling thread until it answers, so the client's
+/// own `max_in_flight_bytes` limiter — which a write awaits before it is
+/// queued — pushes back on the caller by making the call take longer. The
+/// asynchronous ones return before the operation has been admitted, so that
+/// limiter slows the tasks down while this layer's queue grows: the memory
+/// moves out of the batcher and into the jobs waiting here, each holding its
+/// key and value.
+///
+/// The client's limiter cannot be reused for it. It lives on the client's
+/// thread, behind an `Rc<RefCell<..>>`, and a submission happens on a
+/// foreign thread that has no handle on the client at all; and charging a
+/// submission against it there would deadlock, since the operation's own
+/// `put(..).await` reserves the same bytes a second time and would wait for
+/// a release that only its own completion can make. So this is a second
+/// accounting of the same bytes over a longer window — submission to
+/// callback, which contains the client's own window — configured by the
+/// same `max_in_flight_bytes` number, so that a caller has one knob rather
+/// than two to reconcile.
+///
+/// Admission mirrors the client's limiter: a submission is admitted while
+/// usage is *below* the limit and then charged in full, so an operation
+/// larger than the whole budget still goes through when nothing else is
+/// outstanding, and usage can overshoot by one operation.
+pub(crate) struct QueueBudget {
+    /// `0` means unlimited: every submission is admitted untracked.
+    limit: usize,
+    held: AtomicUsize,
+}
+
+impl QueueBudget {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(QueueBudget {
+            limit,
+            held: AtomicUsize::new(0),
+        })
+    }
+
+    /// Charges `size` bytes if there is room for them right now, or reports
+    /// how full the budget is so a caller can be told.
+    fn try_reserve(self: &Arc<Self>, size: usize) -> Result<QueueReservation, (usize, usize)> {
+        if self.limit == 0 {
+            return Ok(QueueReservation {
+                budget: None,
+                size: 0,
+            });
+        }
+        let mut held = self.held.load(Ordering::Acquire);
+        loop {
+            if held >= self.limit {
+                return Err((held, self.limit));
+            }
+            match self.held.compare_exchange_weak(
+                held,
+                held.saturating_add(size),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(QueueReservation {
+                        budget: Some(Arc::clone(self)),
+                        size,
+                    });
+                }
+                Err(current) => held = current,
+            }
+        }
+    }
+}
+
+/// Bytes charged to the submission budget, returned when dropped.
+pub(crate) struct QueueReservation {
+    /// `None` when there is no limit: nothing to return.
+    budget: Option<Arc<QueueBudget>>,
+    size: usize,
+}
+
+impl Drop for QueueReservation {
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget.take() {
+            budget.held.fetch_sub(self.size, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Why a submission was not accepted. Either way its callback does not run.
+pub(crate) enum Rejected {
+    /// The client has been closed.
+    Closed,
+    /// The submission budget is used up: the bytes held, and the limit.
+    QueueFull(usize, usize),
+}
+
 /// An open client.
 ///
 /// Opaque to C: created by `oxia_client_new` and destroyed by
@@ -110,6 +211,7 @@ pub struct oxia_client {
     /// until every task it spawned has finished, so without this the client's
     /// thread would never stop and [`Drop`] would wait for it forever.
     shutdown: watch::Sender<bool>,
+    queue_budget: Arc<QueueBudget>,
     live_streams: Arc<LiveStreams>,
     worker: Option<JoinHandle<()>>,
     dispatcher: Option<JoinHandle<()>>,
@@ -129,12 +231,23 @@ struct Pending<T: Send + 'static> {
     /// Cleared when the job never reached the client's thread, so that a
     /// rejected submission reports through its return code only.
     armed: Arc<AtomicBool>,
+    /// The submission's bytes, released once the caller's callback has
+    /// returned — the point at which this layer has let go of the operation
+    /// and of its result.
+    budget: Option<QueueReservation>,
 }
 
 impl<T: Send + 'static> Pending<T> {
     fn deliver(&mut self, outcome: Result<T, OxiaError>) {
         if let Some(deliver) = self.deliver.take() {
-            let _ = self.completions.send(Box::new(move || deliver(outcome)));
+            let budget = self.budget.take();
+            let _ = self.completions.send(Box::new(move || {
+                deliver(outcome);
+                // Explicit, because what frees the room for the next
+                // submission is the callback having run, not the operation
+                // having finished.
+                drop(budget);
+            }));
         }
     }
 }
@@ -150,7 +263,12 @@ impl<T: Send + 'static> Drop for Pending<T> {
 impl oxia_client {
     /// Builds the client on a thread of its own and returns once it is
     /// connected, or with the error that stopped it.
-    pub(crate) fn start(builder: OxiaClientBuilder) -> Result<oxia_client, OxiaError> {
+    /// `max_in_flight_bytes` is the client's own cap, applied here as the
+    /// budget for the asynchronous submissions as well; `0` means unlimited.
+    pub(crate) fn start(
+        builder: OxiaClientBuilder,
+        max_in_flight_bytes: usize,
+    ) -> Result<oxia_client, OxiaError> {
         let (completions, completion_rx) = sync_mpsc::channel::<Completion>();
         let dispatcher = std::thread::Builder::new()
             .name("oxia-callbacks".to_string())
@@ -204,6 +322,7 @@ impl oxia_client {
                 jobs,
                 completions: Some(completions),
                 shutdown,
+                queue_budget: QueueBudget::new(max_in_flight_bytes),
                 live_streams: Arc::new(LiveStreams::default()),
                 worker: Some(worker),
                 dispatcher: Some(dispatcher),
@@ -247,22 +366,32 @@ impl oxia_client {
 
     /// Submits `op` and returns immediately. `deliver` runs on the
     /// dispatcher thread, exactly once, if and only if this returns `Ok`.
+    ///
+    /// `size` is the bytes this operation holds — its key and value — which
+    /// are charged against the submission budget until its callback has run.
+    /// A submission that does not fit is refused rather than queued.
     pub(crate) fn submit<T, F, Fut>(
         &self,
+        size: usize,
         op: F,
         deliver: impl FnOnce(Result<T, OxiaError>) + Send + 'static,
-    ) -> Result<(), OxiaError>
+    ) -> Result<(), Rejected>
     where
         T: Send + 'static,
         F: FnOnce(NativeOxiaClient) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, OxiaError>> + 'static,
     {
-        let completions = self.completions.clone().ok_or(OxiaError::Closed)?;
+        let completions = self.completions.clone().ok_or(Rejected::Closed)?;
+        let budget = match self.queue_budget.try_reserve(size) {
+            Ok(reservation) => reservation,
+            Err((held, limit)) => return Err(Rejected::QueueFull(held, limit)),
+        };
         let armed = Arc::new(AtomicBool::new(true));
         let mut pending = Pending {
             completions,
             deliver: Some(Box::new(deliver)),
             armed: Arc::clone(&armed),
+            budget: Some(budget),
         };
         let job: Job = Box::new(move |client| {
             Box::pin(async move {
@@ -273,9 +402,10 @@ impl oxia_client {
         if let Err(rejected) = self.jobs.unbounded_send(job) {
             // Defuse the guard before the rejected job — which owns it — is
             // dropped, so a submission that failed does not also call back.
+            // Dropping it also returns the bytes it reserved.
             armed.store(false, Ordering::Release);
             drop(rejected);
-            return Err(OxiaError::Closed);
+            return Err(Rejected::Closed);
         }
         Ok(())
     }

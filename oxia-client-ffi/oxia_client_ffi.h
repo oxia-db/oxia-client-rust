@@ -42,7 +42,7 @@
  * This is not the crate's version: see `oxia_version_string` for that,
  * which moves for every release whether the ABI changed or not.
  */
-#define OXIA_ABI_VERSION 1
+#define OXIA_ABI_VERSION 2
 
 /**
  * The outcome of an operation.
@@ -141,6 +141,14 @@ enum oxia_error_code
    * over a stream to stop.
    */
   OXIA_STREAM_END = 17,
+  /**
+   * An asynchronous submission was refused because the client already
+   * holds `max_in_flight_bytes` of accepted operations. It was not
+   * accepted, so its callback will not run; retry it once a callback has
+   * run and freed the room. Only the `_async` entry points return this —
+   * the blocking ones wait for room instead.
+   */
+  OXIA_ERR_QUEUE_FULL = 18,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -371,6 +379,22 @@ typedef struct oxia_client_options {
    * SNI, instead of the host in `service_address`.
    */
   struct oxia_slice tls_domain_name;
+  /**
+   * The most bytes to hold for the operations in flight, keys and values
+   * together, before the client pushes back. The default is 64 MiB.
+   *
+   * It bounds both call forms, in the way each can be bounded. A blocking
+   * operation waits for room, so it simply takes longer; an asynchronous
+   * one is refused with `OXIA_ERR_QUEUE_FULL`, because it has to answer
+   * before the operation has been admitted. A refused submission does
+   * not call back, and room frees up as the callbacks of the accepted
+   * ones run.
+   *
+   * `0` asks for the default, as every numeric field here does, so there
+   * is no way to ask for no limit at all: set a very large value for
+   * that.
+   */
+  uint64_t max_in_flight_bytes;
 } oxia_client_options;
 
 /**
@@ -863,6 +887,10 @@ void oxia_version_string(char **out);
  * `OXIA_ERR_GRPC` answers `false`: whether
  * a gRPC status is retryable depends on the status code, which only the
  * message carries.
+ *
+ * `OXIA_ERR_QUEUE_FULL` answers `true`, being the one code that is purely a
+ * matter of timing, but the retry belongs after a callback has run rather
+ * than immediately: resubmitting in a tight loop only spins.
  */
 bool oxia_error_is_retryable(oxia_error_code code);
 

@@ -111,6 +111,45 @@ Under the hood the native client is single-threaded — it lives on a thread of 
 [compio](https://github.com/compio-rs/compio) runtime — and the blocking forms hand work to that
 thread and wait. A caller does not have to know that, beyond the callback rules above.
 
+## Backpressure
+
+`max_in_flight_bytes` caps the bytes the client holds for the operations in flight — their keys
+and values — and defaults to 64 MiB. Both call forms are bounded by it, in the way each can be:
+
+| Over the cap | |
+|---|---|
+| `oxia_client_put` | waits for room, so the call takes longer |
+| `oxia_client_put_async` | returns `OXIA_ERR_QUEUE_FULL`, without accepting the operation |
+
+The blocking form gets this for nothing: it runs the operation on the client's thread and parks
+the calling thread until the result arrives, so waiting for room is part of the wait it already
+does. A caller that outruns the cluster is simply slowed to the cluster's pace. The asynchronous
+form has to answer *before* the operation has been admitted, so refusing is the only thing it can
+do — queue it instead and the memory just moves out of the client and into this library, which is
+what it did before this cap existed.
+
+On `OXIA_ERR_QUEUE_FULL`, retry later. The operation was not accepted, so **its callback does not
+run**: that is the same contract as every other refusal — a submission returning `OXIA_OK` calls
+back exactly once, anything else does not call back at all — and it is what keeps the refusal safe
+for a wrapper that allocates a context per operation. Every *accepted* operation does call back,
+so a completion is always on its way to free room; there is no separate "you may submit again"
+signal to wait for and none is offered. `oxia_error_is_retryable` answers `true` for the code, but
+the retry belongs after a callback has run rather than immediately — resubmitting in a tight loop
+only spins.
+
+Two details worth knowing before setting the cap tightly. An asynchronous operation is charged
+against it twice, over different windows: once by this library, from the submission until its
+callback has returned, and once by the client itself, from the moment the operation is queued
+until the server answers. The two layers cannot see each other's accounting — the client's
+limiter lives on the client's thread and a submission happens on a foreign thread — so a cap of
+*n* bounds an asynchronous flood to roughly 2*n* rather than exactly *n*. And only keys and
+values are counted, as in the Rust client: the fixed cost of an operation, its task and its
+callback context, is not, so a flood of tiny operations is bounded less tightly than a flood of
+large ones.
+
+`0` asks for the default rather than for no limit, as every numeric field in the options does, so
+a caller that wants the client unbounded sets a very large value.
+
 ## Streams
 
 Notifications, sequence updates and the streaming forms of `list` and `range_scan` are **pulled,
@@ -171,29 +210,11 @@ re-read it. A notification type this library does not recognize arrives as
 
 Everything the Rust client can do is here — every operation, every per-operation option, the
 subscriptions and streaming reads, the whole `oxia_version`, and the client configuration
-including timeouts, identity, bearer-token authentication, TLS and the batching limits.
+including timeouts, identity, bearer-token authentication, TLS, the batching limits and the
+memory cap.
 
 `auth_token_provider` and `meter_provider` have no C equivalent. A rotating token would need a
 callback and metrics would need an exporter handle; neither is exposed.
-
-**The callback form has no backpressure.** Submitting is unbounded: the queue to the client's
-thread, the set of operations in flight and the queue of completions waiting for the dispatcher
-all grow as fast as a caller submits. The client's `max_write_batches_in_flight` and
-`max_read_batches_in_flight` cap how many batches are outstanding per shard, so the bytes on the
-wire are bounded, but operations past that limit simply wait — and the memory holding their keys,
-values and callback contexts grows without limit. A caller that submits faster than the cluster
-drains will run out of memory with no signal beforehand, and `oxia_client_free` will wait for all
-of it to settle.
-
-The blocking form does not have this problem: an operation in flight costs the caller a parked
-thread, which caps concurrency by itself. The callback form exists to remove that cost, and
-removes the flow control with it.
-
-An in-flight limit — a count of accepted-but-undelivered operations, with a code for "the queue
-is full" so a caller can apply its own flow control — is deliberately left until the Rust client's
-own backpressure story is settled, so that this ABI mirrors it rather than inventing a second one.
-Until then, a caller that submits without waiting should bound the work itself, by counting
-submissions against completions.
 
 ## Versioning
 
@@ -218,9 +239,10 @@ the ABI changed or not; report it in diagnostics, do not gate on it.
 What bumps `OXIA_ABI_VERSION`: a changed signature, a renumbered error code, a reordered struct
 — and the one that is easy to miss, **a field appended to one of the caller-allocated options
 structs**. The caller allocates those (`oxia_put_options options = {0}`), so a library that knows
-about a longer struct would read past the end of what an older caller gave it. The client's
-`max_in_flight_bytes` cap is a live example: mirroring it into `oxia_client_options` grows that
-struct, so it waits for a bump rather than going in quietly.
+about a longer struct would read past the end of what an older caller gave it. Version 2 is that
+case: `max_in_flight_bytes` mirrored into `oxia_client_options` grew the struct, and the number
+moved with it. A new error code does not, by itself — `OXIA_ERR_QUEUE_FULL` was appended in the
+same version — since an older caller simply does not recognize it.
 
 This is also why the release does not yet publish version-pinned binaries: the first one it
 publishes is the one wrapper SDKs pin to.

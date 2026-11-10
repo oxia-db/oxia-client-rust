@@ -51,7 +51,10 @@
 //! - the blocking form (`oxia_client_put`) parks the calling thread until the
 //!   result arrives;
 //! - the asynchronous form (`oxia_client_put_async`) returns as soon as the
-//!   operation is accepted and calls a callback when it finishes.
+//!   operation is accepted and calls a callback when it finishes. It cannot
+//!   wait for room the way the blocking form does, so it is refused with
+//!   `OXIA_ERR_QUEUE_FULL` while the client already holds
+//!   `max_in_flight_bytes` of accepted operations.
 //!
 //! The subscriptions and the streaming reads are pulled rather than pushed:
 //! see [`streams`] for why, and for the one-request-per-item protocol behind
@@ -115,7 +118,7 @@ use mem::{optional_str, required_bytes, required_str};
 ///
 /// This is not the crate's version: see `oxia_version_string` for that,
 /// which moves for every release whether the ABI changed or not.
-pub const OXIA_ABI_VERSION: u32 = 1;
+pub const OXIA_ABI_VERSION: u32 = 2;
 
 /// The `OXIA_ABI_VERSION` this library was built with.
 ///
@@ -180,10 +183,28 @@ pub struct oxia_client_options {
     /// The name to verify the server's certificate against, and to send as
     /// SNI, instead of the host in `service_address`.
     pub tls_domain_name: oxia_slice,
+    /// The most bytes to hold for the operations in flight, keys and values
+    /// together, before the client pushes back. The default is 64 MiB.
+    ///
+    /// It bounds both call forms, in the way each can be bounded. A blocking
+    /// operation waits for room, so it simply takes longer; an asynchronous
+    /// one is refused with `OXIA_ERR_QUEUE_FULL`, because it has to answer
+    /// before the operation has been admitted. A refused submission does
+    /// not call back, and room frees up as the callbacks of the accepted
+    /// ones run.
+    ///
+    /// `0` asks for the default, as every numeric field here does, so there
+    /// is no way to ask for no limit at all: set a very large value for
+    /// that.
+    pub max_in_flight_bytes: u64,
 }
 
-/// Turns the options into a builder, or explains what was wrong with them.
-unsafe fn builder_from(options: *const oxia_client_options) -> Result<OxiaClientBuilder, String> {
+/// Turns the options into a builder, together with the byte budget the
+/// asynchronous submissions are held to, or explains what was wrong with
+/// them.
+unsafe fn builder_from(
+    options: *const oxia_client_options,
+) -> Result<(OxiaClientBuilder, usize), String> {
     let options = options.as_ref().ok_or("options is NULL")?;
     let mut builder = NativeOxiaClient::builder()
         .service_address(required_str(options.service_address, "service_address")?.to_string());
@@ -214,11 +235,23 @@ unsafe fn builder_from(options: *const oxia_client_options) -> Result<OxiaClient
     if options.max_read_batches_in_flight > 0 {
         builder = builder.max_read_batches_in_flight(options.max_read_batches_in_flight);
     }
+    let max_in_flight_bytes = if options.max_in_flight_bytes > 0 {
+        builder = builder.max_in_flight_bytes(options.max_in_flight_bytes);
+        options.max_in_flight_bytes
+    } else {
+        // `0` means the client's default here, not "no limit". The default
+        // has to be resolved rather than left to the builder, because the
+        // asynchronous submissions are held to the same number.
+        oxia::DEFAULT_MAX_IN_FLIGHT_BYTES
+    };
     if let Some(token) = optional_str(options.auth_token, "auth_token")? {
         builder = builder.auth_token(token.to_string());
     }
     builder = apply_tls(builder, options)?;
-    Ok(builder)
+    Ok((
+        builder,
+        usize::try_from(max_in_flight_bytes).unwrap_or(usize::MAX),
+    ))
 }
 
 #[cfg(feature = "tls")]
@@ -292,11 +325,11 @@ pub unsafe extern "C" fn oxia_client_new(
         } else {
             return invalid(error_message, "the client out-parameter is NULL");
         }
-        let builder = match builder_from(options) {
-            Ok(builder) => builder,
+        let (builder, max_in_flight_bytes) = match builder_from(options) {
+            Ok(built) => built,
             Err(text) => return invalid(error_message, text),
         };
-        match oxia_client::start(builder) {
+        match oxia_client::start(builder, max_in_flight_bytes) {
             Ok(started) => {
                 *client = Box::into_raw(Box::new(started));
                 oxia_error_code::OXIA_OK
@@ -399,12 +432,27 @@ mod tests {
             tls_client_cert_pem: oxia_slice::none(),
             tls_client_key_pem: oxia_slice::none(),
             tls_domain_name: oxia_slice::none(),
+            max_in_flight_bytes: 0,
         }
     }
 
     #[test]
     fn the_minimal_options_build_a_client_builder() {
         assert!(unsafe { builder_from(&options()) }.is_ok());
+    }
+
+    #[test]
+    fn a_zero_memory_cap_resolves_to_the_clients_own_default() {
+        let (_, budget) = unsafe { builder_from(&options()) }.unwrap();
+        assert_eq!(budget as u64, oxia::DEFAULT_MAX_IN_FLIGHT_BYTES);
+    }
+
+    #[test]
+    fn a_memory_cap_is_the_budget_the_submissions_are_held_to() {
+        let mut capped = options();
+        capped.max_in_flight_bytes = 4096;
+        let (_, budget) = unsafe { builder_from(&capped) }.unwrap();
+        assert_eq!(budget, 4096);
     }
 
     #[test]
@@ -434,6 +482,7 @@ mod tests {
         full.max_write_batches_in_flight = 4;
         full.max_read_batches_in_flight = 4;
         full.auth_token = slice("token");
+        full.max_in_flight_bytes = 8 * 1024 * 1024;
         assert!(unsafe { builder_from(&full) }.is_ok());
     }
 
