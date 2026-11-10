@@ -1,9 +1,17 @@
 # oxia-client-ffi
 
-A C ABI over [`oxia-client`](../oxia-client), for C and C++ applications and as the core
-another language's Oxia SDK can be built on. The generated header is
-[`oxia_client_ffi.h`](./oxia_client_ffi.h); [`examples/example.c`](./examples/example.c) is a
-complete program.
+Exposes [`oxia-client`](../oxia-client) to C, C++ and other languages through a stable C ABI: for
+C and C++ applications directly, and as the core another language's Oxia SDK can be built on. The
+generated header is [`oxia_client_ffi.h`](./oxia_client_ffi.h);
+[`examples/example.c`](./examples/example.c) is a complete program.
+
+Two words for two things, since the crate is named for one and these docs mostly talk about the
+other. The *FFI* — foreign function interface — is the mechanism: calling into this library from
+another language, which is why the crate exists and what it is named after. The *ABI* —
+application binary interface — is the contract that makes doing so safe: the exported symbols,
+the struct layouts, and the ownership, threading and error-reporting rules below. The mechanism
+is unremarkable; the contract is the part worth reading, and the part that has to stay stable
+once another SDK compiles against it.
 
 This crate is not published to crates.io. It is built as a shared library (`cdylib`), a static
 library (`staticlib`) for linking into another SDK's artifact, and an `rlib` so that the tests can
