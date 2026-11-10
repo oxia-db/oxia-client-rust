@@ -189,11 +189,19 @@ impl Cluster {
 /// Builds a client, retrying until the server at `address` serves the shard
 /// assignments.
 async fn connect_with_retry(address: &str) -> OxiaClient {
+    connect_with_session_timeout(address, Duration::from_secs(30)).await
+}
+
+/// Builds a client whose sessions time out after `session_timeout`, retrying
+/// until the server at `address` serves the shard assignments.
+async fn connect_with_session_timeout(address: &str, session_timeout: Duration) -> OxiaClient {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let result = OxiaClientBuilder::new()
             .service_address(address.to_string())
             .request_timeout(Duration::from_secs(10))
+            .session_timeout(session_timeout)
+            .session_keep_alive(session_timeout / 3)
             .build()
             .await;
         match result {
@@ -340,6 +348,62 @@ async fn test_shard_split_reroutes_live_client() {
     assert_eq!(got.value.as_deref(), Some(b"done".as_ref()));
 
     client.close().await.unwrap();
+}
+
+/// Ephemeral records across a live shard split: the shards that replace the
+/// split shard inherit its session along with the records in their own hash
+/// range, and expire it — deleting those records — unless the client keeps the
+/// session alive on them too. The client writes one ephemeral record in each
+/// half of the hash space, splits their shard, then stays idle for longer than
+/// the session timeout: the records may only disappear when it closes.
+#[compio::test]
+async fn test_ephemeral_records_survive_a_live_split() {
+    let session_timeout = Duration::from_secs(3);
+    let cluster = start_cluster(2, 1).await;
+    let client = connect_with_session_timeout(&cluster.address, session_timeout).await;
+
+    // One record per half of the hash space: the split puts one on each child
+    // shard, so both children must keep the inherited session alive.
+    let keys = [key_in_half("eph/", false), key_in_half("eph/", true)];
+    for key in &keys {
+        client.put(key.clone(), "held").ephemeral().await.unwrap();
+    }
+
+    let split_output = cluster.split_shard(0).await;
+    assert!(
+        split_output.contains("\"Error\":null"),
+        "split must succeed, got: {split_output}"
+    );
+    cluster.wait_until_removed(0).await;
+
+    // Idle: only the keep-alive of the inherited sessions can hold the
+    // records now. Without it they are gone one session timeout after the
+    // children were elected.
+    compio::time::sleep(session_timeout * 3).await;
+
+    for key in &keys {
+        let got = client
+            .get(key.clone())
+            .await
+            .unwrap_or_else(|e| panic!("ephemeral record {key} must have survived the split: {e}"));
+        assert_eq!(got.value.as_deref(), Some(b"held".as_ref()));
+        assert!(
+            got.version.is_ephemeral(),
+            "record {key} must still be ephemeral"
+        );
+    }
+
+    // Closing the client closes the inherited sessions, which deletes the
+    // records they hold on the shards that replaced the split shard.
+    client.close().await.unwrap();
+    let reader = connect_with_retry(&cluster.address).await;
+    for key in &keys {
+        assert!(
+            matches!(reader.get(key.clone()).await, Err(OxiaError::KeyNotFound)),
+            "ephemeral record {key} must be gone once the client closed"
+        );
+    }
+    reader.close().await.unwrap();
 }
 
 /// A key starting with `prefix` that a two-shard namespace places on its

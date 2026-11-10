@@ -15,16 +15,16 @@
 use crate::errors::OxiaError;
 use crate::proto::{CloseSessionRequest, CreateSessionRequest, SessionHeartbeat};
 use crate::provider_manager::ProviderManager;
-use crate::retry::{RetryError, retry_until_cancelled};
+use crate::retry::{RetryError, retry_until, retry_until_cancelled};
 use crate::server_error::decode_status;
 use crate::shard_manager::ShardManager;
 use compio::runtime::JoinHandle;
 use compio::time::interval;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tracing::{info, warn};
@@ -67,7 +67,7 @@ impl Session {
             request_timeout,
             alive.clone(),
         ))));
-        let session = Self {
+        Self {
             handle,
             context,
             alive,
@@ -78,12 +78,7 @@ impl Session {
                 shard_manager,
                 provider_manager,
             }),
-        };
-        info!(
-            "Created a new session. shard_id={:?} session_id={:?}",
-            shard_id, session_id
-        );
-        session
+        }
     }
 
     /// Whether the session is still believed valid. Turns `false` once the
@@ -199,6 +194,35 @@ pub(crate) struct SessionManager {
     sessions: RefCell<HashMap<i64, Rc<OnceCell<Session>>>>,
     shard_manager: Rc<ShardManager>,
     provider_manager: Rc<ProviderManager>,
+    /// Cancels the task that follows the splits of the shards with a session.
+    context: CancellationToken,
+    follow_splits_handle: RefCell<Option<JoinHandle<()>>>,
+}
+
+/// Has `manager` follow the splits of the shards with a session on every
+/// change of the shard assignments, until the manager is dropped or `context`
+/// is cancelled.
+async fn follow_splits_on_assignments_change(
+    context: CancellationToken,
+    mut changes: watch::Receiver<u64>,
+    manager: Weak<SessionManager>,
+) {
+    loop {
+        tokio::select! {
+            _ = context.cancelled() => return,
+            changed = changes.changed() => {
+                // The sender lives in the shard manager, which the session
+                // manager holds, so this can only fail once that is gone.
+                if changed.is_err() {
+                    return;
+                }
+                match manager.upgrade() {
+                    None => return,
+                    Some(manager) => manager.follow_splits(),
+                }
+            }
+        }
+    }
 }
 
 impl SessionManager {
@@ -209,19 +233,100 @@ impl SessionManager {
         request_timeout: Duration,
         shard_manager: Rc<ShardManager>,
         provider_manager: Rc<ProviderManager>,
-    ) -> Self {
-        SessionManager {
+    ) -> Rc<Self> {
+        let manager = Rc::new(SessionManager {
             identity,
             session_timeout,
             session_keep_alive,
             request_timeout,
             sessions: RefCell::new(HashMap::new()),
-            shard_manager,
+            shard_manager: shard_manager.clone(),
             provider_manager,
+            context: CancellationToken::new(),
+            follow_splits_handle: RefCell::new(None),
+        });
+        // Subscribe here rather than in the task, which starts later: a
+        // change of the assignments in between would be missed.
+        let changes = shard_manager.subscribe_changes();
+        // Weak, so the task does not keep the manager alive: it stops as soon
+        // as the client drops it.
+        let handle = compio::runtime::spawn(follow_splits_on_assignments_change(
+            manager.context.clone(),
+            changes,
+            Rc::downgrade(&manager),
+        ));
+        *manager.follow_splits_handle.borrow_mut() = Some(handle);
+        manager
+    }
+
+    /// Moves the sessions of the shards that were split or merged away to the
+    /// shards that replaced them. Each of those inherited the session, with
+    /// the ephemeral records of its own hash range, and expires it — deleting
+    /// those records — unless the session is kept alive there too. The shards
+    /// that replaced a shard started to count the session's timeout when they
+    /// were elected, before the client could know them, so this runs on every
+    /// change of the assignments as well as before a session is created.
+    fn follow_splits(&self) {
+        let mut sessions = self.sessions.borrow_mut();
+        let split: Vec<i64> = sessions
+            .keys()
+            .copied()
+            .filter(|shard_id| !self.shard_manager.shard_exists(*shard_id))
+            .collect();
+        for shard_id in split {
+            // Only an established, live session can be inherited: one still
+            // being created has no id to inherit, and the operation waiting
+            // for it re-routes to the shard that took over its key.
+            let Some(session_id) = sessions
+                .get(&shard_id)
+                .and_then(|session_cell| session_cell.get())
+                .filter(|session| session.is_alive())
+                .map(|session| session.inner.id)
+            else {
+                continue;
+            };
+            let successors = self.shard_manager.current_successors(shard_id);
+            if successors.is_empty() {
+                continue;
+            }
+            info!(
+                "Moving the session to the shards that replaced its shard. \
+                 shard_id={shard_id:?} session_id={session_id:?} shards={successors:?}"
+            );
+            for successor in successors {
+                // A shard that already has a session of its own keeps it.
+                sessions.entry(successor).or_insert_with(|| {
+                    Rc::new(OnceCell::new_with(Some(
+                        self.new_session(successor, session_id),
+                    )))
+                });
+            }
+            // Dropping the session stops its keep-alive. The session is not
+            // closed server-side: the shard that held it is gone, and the
+            // shards that replaced it now keep the session alive.
+            sessions.remove(&shard_id);
         }
     }
 
+    /// A session with `session_id` on `shard_id`, kept alive from now on.
+    fn new_session(&self, shard_id: i64, session_id: i64) -> Session {
+        Session::new(
+            shard_id,
+            session_id,
+            self.session_keep_alive,
+            self.request_timeout,
+            self.shard_manager.clone(),
+            self.provider_manager.clone(),
+        )
+    }
+
     pub(crate) async fn get_session_id(&self, shard_id: i64) -> Result<i64, OxiaError> {
+        if !self.sessions.borrow().contains_key(&shard_id) {
+            // The shard may have replaced a shard that was split and
+            // inherited its session, before the task that follows the splits
+            // could move it here.
+            self.follow_splits();
+        }
         // Take the cell out of the map: the map must not stay borrowed while
         // the session is created. The callers that need the session of a
         // shard while it is being created wait for the same one.
@@ -237,41 +342,65 @@ impl SessionManager {
             session_cell.clone()
         };
         let session = session_cell
-            .get_or_try_init(|| async {
-                match self.shard_manager.get_leader(shard_id) {
-                    None => Err(OxiaError::LeaderNotFound { shard: shard_id }),
-                    Some(node) => {
-                        let mut provider = self
-                            .provider_manager
-                            .get_provider(node.service_address)
-                            .await?;
-                        let mut create = Request::new(CreateSessionRequest {
-                            shard: shard_id,
-                            session_timeout_ms: self.session_timeout.as_millis() as u32,
-                            client_identity: self.identity.clone(),
-                        });
-                        create.set_timeout(self.request_timeout);
-                        let response = provider
-                            .create_session(create)
-                            .await
-                            .map_err(OxiaError::from)?;
-                        let session_id = response.into_inner().session_id;
-                        Ok(Session::new(
-                            shard_id,
-                            session_id,
-                            self.session_keep_alive,
-                            self.request_timeout,
-                            self.shard_manager.clone(),
-                            self.provider_manager.clone(),
-                        ))
-                    }
-                }
+            .get_or_try_init(|| {
+                // Retry while the shard has no leader yet (one is being
+                // elected) or its server is briefly unavailable, as the Go
+                // client's session creation does: an operation that needs a
+                // session must not fail where the same operation without one
+                // would be retried. A shard that is gone is not retried here:
+                // `ShardMoved` has the caller re-route to the shard that took
+                // over its key.
+                retry_until(
+                    self.request_timeout,
+                    |err| err.is_retryable() && !matches!(err, OxiaError::ShardMoved),
+                    || self.create_session(shard_id),
+                )
             })
             .await?;
         Ok(session.inner.id)
     }
 
+    /// Creates a session on `shard_id`, kept alive from now on.
+    async fn create_session(&self, shard_id: i64) -> Result<Session, OxiaError> {
+        match self.shard_manager.get_leader(shard_id) {
+            // The shard was split or merged away while the operation was
+            // routed to it, as the Go client's session creation handles when a
+            // split interrupts it.
+            None if !self.shard_manager.shard_exists(shard_id) => Err(OxiaError::ShardMoved),
+            None => Err(OxiaError::LeaderNotFound { shard: shard_id }),
+            Some(node) => {
+                let mut provider = self
+                    .provider_manager
+                    .get_provider(node.service_address)
+                    .await?;
+                let mut create = Request::new(CreateSessionRequest {
+                    shard: shard_id,
+                    session_timeout_ms: self.session_timeout.as_millis() as u32,
+                    client_identity: self.identity.clone(),
+                });
+                create.set_timeout(self.request_timeout);
+                let response = provider
+                    .create_session(create)
+                    .await
+                    .map_err(OxiaError::from)?;
+                let session_id = response.into_inner().session_id;
+                info!(
+                    "Created a new session. shard_id={:?} session_id={:?}",
+                    shard_id, session_id
+                );
+                Ok(self.new_session(shard_id, session_id))
+            }
+        }
+    }
+
     pub(crate) async fn close(&self) -> Result<(), OxiaError> {
+        self.context.cancel();
+        let follow_splits_handle = self.follow_splits_handle.borrow_mut().take();
+        if let Some(handle) = follow_splits_handle {
+            handle
+                .await
+                .map_err(|err| OxiaError::Disconnected(err.to_string()))?;
+        }
         let session_cells: Vec<Rc<OnceCell<Session>>> = self
             .sessions
             .borrow_mut()
@@ -286,5 +415,158 @@ impl SessionManager {
             result?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manager whose shard assignments the test drives, with no server to
+    /// create sessions on: the tests establish the sessions themselves.
+    fn session_manager(shard_manager: Rc<ShardManager>) -> Rc<SessionManager> {
+        SessionManager::new(
+            "test-client".to_string(),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+            shard_manager,
+            Rc::new(ProviderManager::new(Duration::from_secs(1))),
+        )
+    }
+
+    /// Adds an established session on `shard_id`, as a successful
+    /// `CreateSession` would. Its keep-alive runs against an address that
+    /// does not resolve, which only makes it retry in the background.
+    fn establish(manager: &SessionManager, shard_id: i64, session_id: i64) {
+        let session = manager.new_session(shard_id, session_id);
+        manager
+            .sessions
+            .borrow_mut()
+            .insert(shard_id, Rc::new(OnceCell::new_with(Some(session))));
+    }
+
+    /// The id of the session of each shard that has an established one, by
+    /// shard. A shard whose session is still being created is reported with
+    /// `None`.
+    fn sessions_by_shard(manager: &SessionManager) -> Vec<(i64, Option<i64>)> {
+        let mut sessions: Vec<(i64, Option<i64>)> = manager
+            .sessions
+            .borrow()
+            .iter()
+            .map(|(shard_id, session_cell)| {
+                (
+                    *shard_id,
+                    session_cell.get().map(|session| session.inner.id),
+                )
+            })
+            .collect();
+        sessions.sort_unstable();
+        sessions
+    }
+
+    #[compio::test]
+    async fn a_split_moves_the_session_to_the_shards_that_replaced_it() {
+        let shard_manager = ShardManager::detached_for_tests();
+        shard_manager.set_assignments_for_tests(&[(1, 0, u32::MAX)]);
+        let manager = session_manager(shard_manager.clone());
+        establish(&manager, 1, 42);
+
+        shard_manager.set_assignments_for_tests(&[(2, 0, 100), (3, 101, u32::MAX)]);
+        manager.follow_splits();
+
+        // Both shards that replaced shard 1 keep its session alive: each
+        // inherited the ephemeral records in its own hash range.
+        assert_eq!(
+            sessions_by_shard(&manager),
+            vec![(2, Some(42)), (3, Some(42))]
+        );
+    }
+
+    #[compio::test]
+    async fn the_session_follows_a_successor_that_was_split_in_turn() {
+        let shard_manager = ShardManager::detached_for_tests();
+        shard_manager.set_assignments_for_tests(&[(1, 0, u32::MAX)]);
+        let manager = session_manager(shard_manager.clone());
+        establish(&manager, 1, 42);
+
+        // Shard 1 is replaced by 2 and 3, and 3 by 4 and 5, before the
+        // session has followed the first split.
+        shard_manager.set_assignments_for_tests(&[(2, 0, 100), (3, 101, u32::MAX)]);
+        shard_manager.set_assignments_for_tests(&[(2, 0, 100), (4, 101, 200), (5, 201, u32::MAX)]);
+        manager.follow_splits();
+
+        assert_eq!(
+            sessions_by_shard(&manager),
+            vec![(2, Some(42)), (4, Some(42)), (5, Some(42))]
+        );
+    }
+
+    #[compio::test]
+    async fn a_shard_that_already_has_a_session_keeps_it() {
+        let shard_manager = ShardManager::detached_for_tests();
+        shard_manager.set_assignments_for_tests(&[(1, 0, 100), (2, 101, u32::MAX)]);
+        let manager = session_manager(shard_manager.clone());
+        establish(&manager, 1, 42);
+        establish(&manager, 2, 7);
+
+        // Shard 1 is merged into shard 2, which has a session of its own.
+        shard_manager.set_assignments_for_tests(&[(2, 0, u32::MAX)]);
+        manager.follow_splits();
+
+        assert_eq!(sessions_by_shard(&manager), vec![(2, Some(7))]);
+    }
+
+    #[compio::test]
+    async fn a_session_still_being_created_is_not_moved() {
+        let shard_manager = ShardManager::detached_for_tests();
+        shard_manager.set_assignments_for_tests(&[(1, 0, u32::MAX)]);
+        let manager = session_manager(shard_manager.clone());
+        // A cell with no session yet: its `CreateSession` is in flight.
+        manager
+            .sessions
+            .borrow_mut()
+            .insert(1, Rc::new(OnceCell::new()));
+
+        shard_manager.set_assignments_for_tests(&[(2, 0, 100), (3, 101, u32::MAX)]);
+        manager.follow_splits();
+
+        // There is no session id to inherit; the operation waiting for it
+        // re-routes to the shard that took over its key.
+        assert_eq!(sessions_by_shard(&manager), vec![(1, None)]);
+    }
+
+    #[compio::test]
+    async fn a_change_of_the_assignments_moves_the_session_on_its_own() {
+        let shard_manager = ShardManager::detached_for_tests();
+        shard_manager.set_assignments_for_tests(&[(1, 0, u32::MAX)]);
+        let manager = session_manager(shard_manager.clone());
+        establish(&manager, 1, 42);
+
+        shard_manager.set_assignments_for_tests(&[(2, 0, 100), (3, 101, u32::MAX)]);
+        // Nobody asks for a session: the task that watches the assignments is
+        // what keeps the inherited session alive on the new shards.
+        compio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            sessions_by_shard(&manager),
+            vec![(2, Some(42)), (3, Some(42))]
+        );
+    }
+
+    #[compio::test]
+    async fn a_session_of_a_shard_that_is_gone_is_not_created_again() {
+        let shard_manager = ShardManager::detached_for_tests();
+        shard_manager.set_assignments_for_tests(&[(1, 0, u32::MAX)]);
+        let manager = session_manager(shard_manager.clone());
+
+        shard_manager.set_assignments_for_tests(&[(2, 0, u32::MAX)]);
+
+        // The write was routed to shard 1 before the split: it must re-route
+        // rather than wait for a leader of a shard that no longer exists.
+        assert!(matches!(
+            manager.get_session_id(1).await,
+            Err(OxiaError::ShardMoved)
+        ));
     }
 }
