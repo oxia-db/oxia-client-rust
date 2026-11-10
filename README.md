@@ -103,9 +103,10 @@ Oxia's main branch). It does **not** support the legacy `io.streamnative.oxia.pr
 
 - **[oxia-client](./oxia-client)** — the core async Rust client (published to crates.io as
   `oxia-client`, imported as `use oxia::…`).
-- **[oxia-client-ffi](./oxia-client-ffi)** — a C ABI over `oxia-client`, for C and C++
-  applications and as the core another language's Oxia SDK can be built on. Every operation comes
-  in a blocking and a callback form; see its
+- **[oxia-client-ffi](./oxia-client-ffi)** — exposes `oxia-client` to other languages through a
+  stable C ABI: for C and C++ applications, and as the core another language's Oxia SDK can be
+  built on. Every operation comes in a blocking and a callback form, and the subscriptions and
+  streaming reads are pulled from a handle; see its
   [README](./oxia-client-ffi/README.md) for the ownership, threading and error-reporting
   contract. Not published to crates.io.
 - **[oxia-perf](./oxia-perf)** — a load-generation and latency-measurement CLI (like the Go and

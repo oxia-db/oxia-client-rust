@@ -1,9 +1,17 @@
 # oxia-client-ffi
 
-A C ABI over [`oxia-client`](../oxia-client), for C and C++ applications and as the core
-another language's Oxia SDK can be built on. The generated header is
-[`oxia_client_ffi.h`](./oxia_client_ffi.h); [`examples/example.c`](./examples/example.c) is a
-complete program.
+Exposes [`oxia-client`](../oxia-client) to C, C++ and other languages through a stable C ABI: for
+C and C++ applications directly, and as the core another language's Oxia SDK can be built on. The
+generated header is [`oxia_client_ffi.h`](./oxia_client_ffi.h);
+[`examples/example.c`](./examples/example.c) is a complete program.
+
+Two words for two things, since the crate is named for one and these docs mostly talk about the
+other. The *FFI* — foreign function interface — is the mechanism: calling into this library from
+another language, which is why the crate exists and what it is named after. The *ABI* —
+application binary interface — is the contract that makes doing so safe: the exported symbols,
+the struct layouts, and the ownership, threading and error-reporting rules below. The mechanism
+is unremarkable; the contract is the part worth reading, and the part that has to stay stable
+once another SDK compiles against it.
 
 This crate is not published to crates.io. It is built as a shared library (`cdylib`), a static
 library (`staticlib`) for linking into another SDK's artifact, and an `rlib` so that the tests can
@@ -35,7 +43,10 @@ options.value = (oxia_slice){ (const uint8_t *)"hello", 5 };
 
 A slice is unset when its `data` is `NULL`; a non-`NULL` `data` with a `len` of 0 is the empty
 string, which is how `partition_key` tells "no partition key" from "the empty one". Numeric
-fields take the client's default at 0. `exclude_value` is phrased negatively for the same reason:
+fields take the client's default at 0. The exception to "zero is fine" is a *required* string —
+a key, a range bound, a sequence's partition key: leaving one unset is
+`OXIA_ERR_INVALID_ARGUMENT` with a message naming the field, rather than a silently empty
+string on the wire. `exclude_value` is phrased negatively for the same reason:
 a zeroed get returns the value.
 
 **A code, and a message if you want it.** Every fallible function returns an `oxia_error_code` and
@@ -100,14 +111,67 @@ Under the hood the native client is single-threaded — it lives on a thread of 
 [compio](https://github.com/compio-rs/compio) runtime — and the blocking forms hand work to that
 thread and wait. A caller does not have to know that, beyond the callback rules above.
 
+## Streams
+
+Notifications, sequence updates and the streaming forms of `list` and `range_scan` are **pulled,
+not pushed**. Each is an opaque handle with the same three calls:
+
+```c
+oxia_notifications *watcher = NULL;
+oxia_client_notifications(client, &(oxia_notifications_options){0}, &watcher, NULL);
+
+for (;;) {
+    oxia_notification *event = NULL;
+    oxia_error_code code = oxia_notifications_next(watcher, 1000, &event, NULL);
+    if (code == OXIA_STREAM_END) break;        // finished
+    if (code == OXIA_ERR_TIMEOUT) continue;    // nothing within 1 s; not an error
+    if (code != OXIA_OK) break;                // a real failure
+    handle(event);
+    oxia_notification_free(event);
+}
+oxia_notifications_close(watcher);   // ends it
+oxia_notifications_free(watcher);    // releases the handle
+```
+
+`next` asks the client's thread for one item and waits for it; nothing is taken from the stream
+until a caller asks. That is the point: a pushed stream would need somewhere to put items a slow
+consumer has not taken, and an unbounded queue there would throw away the backpressure the
+subscription already applies through its `buffer_size`. Pulling makes the consumer set the pace,
+and keeps at most one item in flight inside this library. The cost is a round trip to the
+client's thread per item, so `oxia_client_list` is faster than `oxia_client_list_stream` for a
+range that fits in memory; the streaming forms are for ranges that do not.
+
+| | |
+|---|---|
+| `timeout_ms` of 0 | waits indefinitely |
+| `OXIA_ERR_TIMEOUT` | nothing arrived in time. Not an error: the request stays outstanding, so the item it was waiting for reaches the next call rather than being dropped |
+| `OXIA_STREAM_END` | the stream is finished — its own end, `close`, or the client being freed |
+| `close` | ends the stream. Idempotent, safe from any thread, and safe to call while another thread is blocked in `next`, which then returns `OXIA_STREAM_END`. The handle stays valid |
+| `free` | releases the handle. No call on it may be in progress on another thread: `close` first, let `next` return, then free |
+
+One thread at a time per handle; a second caller in `next` blocks until the first returns.
+
+The handles and their items:
+
+| Open with | Handle | `next` yields | Free the item with |
+|---|---|---|---|
+| `oxia_client_notifications` | `oxia_notifications` | `oxia_notification *` | `oxia_notification_free` |
+| `oxia_client_sequence_updates` | `oxia_key_stream` | `oxia_bytes` | `oxia_bytes_free` |
+| `oxia_client_list_stream` | `oxia_key_stream` | `oxia_bytes` | `oxia_bytes_free` |
+| `oxia_client_range_scan_stream` | `oxia_record_stream` | `oxia_get_result *` | `oxia_get_result_free` |
+
+Notifications are namespace-wide: a subscription sees every change to the namespace, not only the
+ones this client made, and it starts from the moment it is opened rather than replaying history.
+`OXIA_NOTIFICATION_MISSED` says the server's retention dropped notifications before this
+subscription read them, so any record may have changed unseen and a consumer keeping state has to
+re-read it. A notification type this library does not recognize arrives as
+`OXIA_NOTIFICATION_UNKNOWN` rather than being dropped.
+
 ## What is not here yet
 
-Notifications, sequence updates and the streaming forms of `list` and `range_scan` are not
-exposed: a stream needs an ABI of its own (an iterator handle, or a callback per item plus a
-cancellation handle) and that is worth designing separately. Everything else the Rust client can
-do is here — every operation, every per-operation option, the whole `oxia_version`, and the client
-configuration including timeouts, identity, bearer-token authentication, TLS and the batching
-limits.
+Everything the Rust client can do is here — every operation, every per-operation option, the
+subscriptions and streaming reads, the whole `oxia_version`, and the client configuration
+including timeouts, identity, bearer-token authentication, TLS and the batching limits.
 
 `auth_token_provider` and `meter_provider` have no C equivalent. A rotating token would need a
 callback and metrics would need an exporter handle; neither is exposed.

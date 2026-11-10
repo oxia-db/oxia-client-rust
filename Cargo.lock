@@ -1951,6 +1951,7 @@ dependencies = [
  "futures",
  "oxia-client",
  "testcontainers",
+ "tokio",
  "tonic",
 ]
 

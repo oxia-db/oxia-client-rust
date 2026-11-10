@@ -53,6 +53,10 @@
 //! - the asynchronous form (`oxia_client_put_async`) returns as soon as the
 //!   operation is accepted and calls a callback when it finishes.
 //!
+//! The subscriptions and the streaming reads are pulled rather than pushed:
+//! see [`streams`] for why, and for the one-request-per-item protocol behind
+//! them.
+//!
 //! A callback runs on a dispatcher thread of the client's, never on the
 //! thread that submitted the operation and never on the thread the client
 //! itself runs on. It is therefore free to block and to make blocking Oxia
@@ -77,6 +81,7 @@ mod mem;
 mod ops;
 mod results;
 mod runtime;
+mod streams;
 
 use std::ffi::c_char;
 use std::ptr;
@@ -85,10 +90,11 @@ use std::time::Duration;
 use oxia::{OxiaClient as NativeOxiaClient, OxiaClientBuilder};
 
 pub use error::{oxia_error_code, oxia_error_is_retryable, oxia_string_free};
-pub use mem::{oxia_bytes, oxia_slice};
+pub use mem::{oxia_bytes, oxia_bytes_free, oxia_slice};
 pub use ops::*;
 pub use results::*;
 pub use runtime::oxia_client;
+pub use streams::*;
 
 use error::{fail, guard, guard_void, invalid, write_message};
 use mem::{optional_str, required_bytes, required_str};
@@ -376,13 +382,11 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_service_address_is_rejected() {
+    fn a_missing_service_address_names_itself() {
         let mut bare = options();
         bare.service_address = oxia_slice::none();
-        // An empty address is not a usable one; the builder keeps the
-        // message pointing at the field that was left out.
-        let built = unsafe { builder_from(&bare) };
-        assert!(built.is_ok(), "an empty address is caught when connecting");
+        let err = unsafe { builder_from(&bare) }.unwrap_err();
+        assert!(err.contains("service_address"), "{err}");
     }
 
     #[test]

@@ -229,7 +229,84 @@ int main(int argc, char **argv) {
     printf("range scan example/ -> %zu records\n", records->len);
     oxia_record_list_free(records);
 
-    // 7. A key that is not there is a code, not a crash.
+    // 7. A subscription. Notifications are namespace-wide, so this filters
+    //    for the key it just wrote; a real consumer would act on all of them.
+    oxia_notifications_options watch_options = {0};
+    oxia_notifications *watcher = NULL;
+    message = NULL;
+    code = oxia_client_notifications(client, &watch_options, &watcher, &message);
+    if (failed("subscribe", code, message)) {
+        oxia_client_free(client);
+        return 1;
+    }
+    oxia_put_options watched = {0};
+    watched.key = SLICE("example/watched");
+    watched.value = SLICE("v");
+    put_result = NULL;
+    if (oxia_client_put(client, &watched, &put_result, NULL) == OXIA_OK) {
+        oxia_put_result_free(put_result);
+    }
+    for (int seen = 0; seen < 1;) {
+        oxia_notification *event = NULL;
+        message = NULL;
+        // A 2 s wait rather than 0, so a lost notification cannot hang this
+        // example for good.
+        code = oxia_notifications_next(watcher, 2000, &event, &message);
+        if (code == OXIA_ERR_TIMEOUT) {
+            printf("no notification within 2s; giving up\n");
+            break;
+        }
+        if (code == OXIA_STREAM_END) {
+            printf("the subscription ended\n");
+            break;
+        }
+        if (failed("notifications_next", code, message)) {
+            break;
+        }
+        if (event->key.len == strlen("example/watched")
+            && memcmp(event->key.data, "example/watched", event->key.len) == 0) {
+            printf("notification: type %d for %.*s", (int)event->type_,
+                   (int)event->key.len, (const char *)event->key.data);
+            if (event->has_version_id) {
+                printf(" at version %lld", (long long)event->version_id);
+            }
+            printf("\n");
+            seen++;
+        }
+        oxia_notification_free(event);
+    }
+    // Closing ends the subscription; freeing releases the handle. Both are
+    // needed, and in this order.
+    oxia_notifications_close(watcher);
+    oxia_notifications_free(watcher);
+
+    // 8. The same list as above, pulled one key at a time. Use this when the
+    //    range is too large to hold in memory; `oxia_client_list` is faster
+    //    when it fits.
+    oxia_key_stream *keys_stream = NULL;
+    message = NULL;
+    code = oxia_client_list_stream(client, &range, &keys_stream, &message);
+    if (failed("list stream", code, message)) {
+        oxia_client_free(client);
+        return 1;
+    }
+    printf("streamed list of example/:\n");
+    for (;;) {
+        oxia_bytes key = {0};
+        message = NULL;
+        code = oxia_key_stream_next(keys_stream, 10000, &key, &message);
+        if (code == OXIA_STREAM_END) {
+            break;
+        }
+        if (failed("key_stream_next", code, message)) {
+            break;
+        }
+        printf("  %.*s\n", (int)key.len, (const char *)key.data);
+        oxia_bytes_free(key);
+    }
+    oxia_key_stream_free(keys_stream);
+
+    // 9. A key that is not there is a code, not a crash.
     get_options.key = SLICE("example/absent");
     record = NULL;
     message = NULL;
@@ -238,7 +315,7 @@ int main(int argc, char **argv) {
            message ? message : "no detail");
     oxia_string_free(message);
 
-    // 8. Clean up the keys, then close and free. Closing is optional —
+    // 10. Clean up the keys, then close and free. Closing is optional —
     //    freeing closes too — but only closing can report a failure to
     //    flush.
     oxia_delete_range_options wipe = {0};

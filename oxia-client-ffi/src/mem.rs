@@ -103,6 +103,19 @@ impl oxia_bytes {
     }
 }
 
+/// Frees an owned buffer handed over on its own, rather than inside a result
+/// struct — as `oxia_key_stream_next` does. Does nothing when `data` is
+/// `NULL`, so it is safe to call unconditionally.
+///
+/// # Safety
+///
+/// `buffer` must have been handed over by this library and must not have been
+/// freed already.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxia_bytes_free(buffer: oxia_bytes) {
+    crate::error::guard_void(|| buffer.free());
+}
+
 /// Copies an optional string, as an absent [`oxia_bytes`] when it is `None`.
 pub fn optional_bytes(src: Option<&str>) -> oxia_bytes {
     match src {
@@ -130,10 +143,20 @@ pub unsafe fn required_bytes<'a>(s: oxia_slice, what: &str) -> Result<&'a [u8], 
 
 /// Borrows a required slice as the UTF-8 string the wire format needs.
 ///
+/// A `NULL` `data` is "not set", which for a required field is an error
+/// naming it — unlike [`required_bytes`], where a `NULL` of length 0 is a
+/// legitimately empty value. Keys, range bounds and the other required
+/// strings go through here, so leaving one out of an otherwise zeroed
+/// options struct says which one is missing instead of quietly sending an
+/// empty string.
+///
 /// # Safety
 ///
 /// As [`required_bytes`].
 pub unsafe fn required_str<'a>(s: oxia_slice, what: &str) -> Result<&'a str, String> {
+    if s.data.is_null() {
+        return Err(format!("{what} is required but its data is NULL"));
+    }
     let bytes = required_bytes(s, what)?;
     str::from_utf8(bytes).map_err(|err| format!("{what}: not valid UTF-8 ({err})"))
 }
@@ -230,6 +253,22 @@ mod tests {
         };
         let err = unsafe { required_bytes(bogus, "value") }.unwrap_err();
         assert!(err.contains("value"), "{err}");
+    }
+
+    #[test]
+    fn a_required_string_that_was_left_unset_names_itself() {
+        let err = unsafe { required_str(oxia_slice::none(), "partition_key") }.unwrap_err();
+        assert!(err.contains("partition_key"), "{err}");
+        assert!(err.contains("required"), "{err}");
+    }
+
+    #[test]
+    fn a_required_string_may_still_be_empty_when_it_is_set() {
+        let empty = oxia_slice {
+            data: b"".as_ptr(),
+            len: 0,
+        };
+        assert_eq!(unsafe { required_str(empty, "key") }.unwrap(), "");
     }
 
     #[test]

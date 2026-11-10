@@ -441,7 +441,7 @@ impl DeleteRangeRequest {
     }
 }
 
-struct RangeRequest {
+pub(crate) struct RangeRequest {
     min_key_inclusive: String,
     max_key_exclusive: String,
     partition_key: Option<String>,
@@ -451,7 +451,7 @@ struct RangeRequest {
 }
 
 impl RangeRequest {
-    unsafe fn parse(options: *const oxia_range_options) -> Result<RangeRequest, String> {
+    pub(crate) unsafe fn parse(options: *const oxia_range_options) -> Result<RangeRequest, String> {
         let options = options.as_ref().ok_or("options is NULL")?;
         Ok(RangeRequest {
             min_key_inclusive: required_str(options.min_key_inclusive, "min_key_inclusive")?
@@ -466,7 +466,7 @@ impl RangeRequest {
         })
     }
 
-    async fn list(self, client: NativeOxiaClient) -> Result<Vec<String>, OxiaError> {
+    fn list_builder(self, client: NativeOxiaClient) -> oxia::ListBuilder {
         let mut list = client
             .list(self.min_key_inclusive, self.max_key_exclusive)
             .include_internal_keys(self.include_internal_keys);
@@ -479,10 +479,10 @@ impl RangeRequest {
         if self.end_inclusive {
             list = list.end_inclusive();
         }
-        list.await
+        list
     }
 
-    async fn range_scan(self, client: NativeOxiaClient) -> Result<Vec<GetResult>, OxiaError> {
+    fn range_scan_builder(self, client: NativeOxiaClient) -> oxia::RangeScanBuilder {
         let mut scan = client
             .range_scan(self.min_key_inclusive, self.max_key_exclusive)
             .include_internal_keys(self.include_internal_keys);
@@ -495,7 +495,29 @@ impl RangeRequest {
         if self.end_inclusive {
             scan = scan.end_inclusive();
         }
-        scan.await
+        scan
+    }
+
+    async fn list(self, client: NativeOxiaClient) -> Result<Vec<String>, OxiaError> {
+        self.list_builder(client).await
+    }
+
+    pub(crate) async fn list_stream(
+        self,
+        client: NativeOxiaClient,
+    ) -> Result<oxia::ListStream, OxiaError> {
+        self.list_builder(client).stream().await
+    }
+
+    pub(crate) async fn range_scan_stream(
+        self,
+        client: NativeOxiaClient,
+    ) -> Result<oxia::RangeScanStream, OxiaError> {
+        self.range_scan_builder(client).stream().await
+    }
+
+    async fn range_scan(self, client: NativeOxiaClient) -> Result<Vec<GetResult>, OxiaError> {
+        self.range_scan_builder(client).await
     }
 }
 
