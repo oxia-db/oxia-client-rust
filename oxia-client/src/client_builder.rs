@@ -29,6 +29,7 @@ use std::time::Duration;
 /// | [`identity`](OxiaClientBuilder::identity) | random UUID |
 /// | [`batch_max_size`](OxiaClientBuilder::batch_max_size) | 128 KiB |
 /// | [`max_requests_per_batch`](OxiaClientBuilder::max_requests_per_batch) | 1000 |
+/// | [`max_in_flight_bytes`](OxiaClientBuilder::max_in_flight_bytes) | 64 MiB |
 /// | [`max_write_batches_in_flight`](OxiaClientBuilder::max_write_batches_in_flight) | 4 |
 /// | [`max_read_batches_in_flight`](OxiaClientBuilder::max_read_batches_in_flight) | 4 |
 /// | [`session_timeout`](OxiaClientBuilder::session_timeout) | 15 s |
@@ -57,6 +58,7 @@ pub struct OxiaClientBuilder {
     identity: Option<String>,
     batch_max_size: Option<u32>,
     max_requests_per_batch: Option<u32>,
+    max_in_flight_bytes: Option<u64>,
     max_write_batches_in_flight: Option<u32>,
     max_read_batches_in_flight: Option<u32>,
     session_timeout: Option<Duration>,
@@ -143,6 +145,28 @@ impl OxiaClientBuilder {
         self
     }
 
+    /// The maximum number of bytes the client holds for the writes in
+    /// flight, counting their keys and values (default: 64MiB); `0` disables
+    /// the limit.
+    ///
+    /// Batches are unbounded on their own:
+    /// [`max_write_batches_in_flight`](Self::max_write_batches_in_flight)
+    /// caps how many batches a shard has outstanding, but once that window is
+    /// exhausted the open batch keeps growing. This is the bound on the
+    /// memory that costs, and the backpressure that keeps it: while the
+    /// budget is used up, a write waits for the writes in flight to be
+    /// acknowledged before it is queued, so `put(..).await` takes longer
+    /// instead of the client growing without limit. Writes are admitted in
+    /// the order they were issued.
+    ///
+    /// Reads are not accounted for: a get holds only its key until its
+    /// response arrives. A single write larger than the whole budget is
+    /// admitted when nothing else is in flight, so the limit cannot deadlock.
+    pub fn max_in_flight_bytes(mut self, max_in_flight_bytes: u64) -> Self {
+        self.max_in_flight_bytes = Some(max_in_flight_bytes);
+        self
+    }
+
     /// The session timeout for ephemeral records (default: 15s). Ephemeral
     /// records disappear if the client fails to heartbeat for this long.
     pub fn session_timeout(mut self, session_timeout: Duration) -> Self {
@@ -223,6 +247,9 @@ impl OxiaClientBuilder {
         }
         if let Some(max_requests_per_batch) = self.max_requests_per_batch {
             options.max_requests_per_batch = max_requests_per_batch;
+        }
+        if let Some(max_in_flight_bytes) = self.max_in_flight_bytes {
+            options.max_in_flight_bytes = max_in_flight_bytes;
         }
         if let Some(max) = self.max_write_batches_in_flight {
             options.max_write_batches_in_flight = max;

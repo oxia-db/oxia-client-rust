@@ -97,7 +97,7 @@ pub(crate) enum WriteOp {
 impl WriteOp {
     /// Cheap size estimate used for batch byte accounting; mirrors the Java
     /// client (key length + value length — proto framing overhead ignored).
-    fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         match self {
             WriteOp::Put(p) => p.request.key.len() + p.request.value.len(),
             WriteOp::Delete(d) => d.request.key.len(),

@@ -1098,6 +1098,48 @@ mod tests {
         );
     }
 
+    /// `max_in_flight_bytes` bounds the writes the client holds: with the
+    /// in-flight window saturated the open batch would otherwise take every
+    /// write issued (the default `batch_max_size` fits them all), but the
+    /// budget only ever admits two, so no batch carries more.
+    #[compio::test]
+    async fn the_byte_budget_bounds_the_writes_in_flight() {
+        let mock = MockOxia::start(Behavior {
+            write: WriteMode::DelayResponses(Duration::from_millis(20)),
+            ..Behavior::default()
+        })
+        .await;
+        let client = OxiaClientBuilder::new()
+            .service_address(mock.address.clone())
+            .request_timeout(Duration::from_secs(10))
+            .max_write_batches_in_flight(1)
+            // Two ~106-byte puts are admitted; the third waits for one of
+            // them to be acknowledged.
+            .max_in_flight_bytes(212)
+            .build()
+            .await
+            .expect("connect");
+
+        let puts: Vec<_> = (0..12)
+            .map(|i| {
+                let client = client.clone();
+                compio::runtime::spawn(async move {
+                    client.put(format!("mem/{i:02}"), vec![0u8; 100]).await
+                })
+            })
+            .collect();
+        for put in puts {
+            put.await.expect("join").expect("put");
+        }
+
+        let sizes = mock.write_batch_sizes();
+        assert_eq!(sizes.iter().sum::<usize>(), 12, "sizes: {sizes:?}");
+        assert!(
+            sizes.iter().all(|&s| s <= 2),
+            "the budget must cap the writes in flight at 2, got {sizes:?}"
+        );
+    }
+
     /// A write larger than `batch_max_size` goes out in a batch of its own,
     /// after the writes issued before it and ahead of those issued after it.
     #[compio::test]

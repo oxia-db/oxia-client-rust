@@ -231,6 +231,7 @@ mod client_options;
 mod errors;
 mod hash;
 mod key;
+mod memory_limit;
 mod metrics;
 #[cfg(test)]
 mod mock_server;
