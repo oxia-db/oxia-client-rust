@@ -190,6 +190,15 @@ pub enum Notification {
         /// the records from `key` on.
         key_range_last: Option<String>,
     },
+    /// Notifications were deleted by the server's retention before this
+    /// subscription could read them, so any record may have changed without a
+    /// notification for it. No key is carried: a consumer that keeps state
+    /// from the notifications has to re-read it.
+    ///
+    /// This event is synthesized by the client, not sent by the server. It is
+    /// reported once per gap, when a subscription that resumes from an offset
+    /// finds that the server starts it after that offset.
+    NotificationsMissed,
 }
 
 impl Notification {
@@ -216,13 +225,15 @@ impl Notification {
     }
 
     /// The key the notification refers to (the range start for
-    /// [`Notification::KeyRangeDeleted`]).
+    /// [`Notification::KeyRangeDeleted`]), empty for
+    /// [`Notification::NotificationsMissed`], which carries no key.
     pub fn key(&self) -> &str {
         match self {
             Notification::KeyCreated { key, .. }
             | Notification::KeyModified { key, .. }
             | Notification::KeyDeleted { key }
             | Notification::KeyRangeDeleted { key, .. } => key,
+            Notification::NotificationsMissed => "",
         }
     }
 }
@@ -243,6 +254,7 @@ impl fmt::Display for Notification {
             } => {
                 write!(f, "KeyRangeDeleted(key={key}, last={key_range_last:?})")
             }
+            Notification::NotificationsMissed => write!(f, "NotificationsMissed"),
         }
     }
 }

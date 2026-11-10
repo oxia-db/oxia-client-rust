@@ -156,7 +156,6 @@ struct State {
 type AssignmentSender = mpsc::UnboundedSender<Result<proto::ShardAssignments, Status>>;
 
 /// The notification batches of a shard, as its leader keeps them.
-#[derive(Default)]
 struct ShardNotifications {
     /// The batches, in offset order: those of the shard it was split from, on
     /// its side of the split, then those published on it.
@@ -166,13 +165,29 @@ struct ShardNotifications {
     held: bool,
     /// Bumped to end the streams open on the shard.
     generation: u32,
+    /// The offset up to which the retention deleted the batches, or -1: a
+    /// subscription cannot start before it.
+    retention_floor: i64,
+}
+
+impl Default for ShardNotifications {
+    fn default() -> Self {
+        ShardNotifications {
+            batches: Vec::new(),
+            held: false,
+            generation: 0,
+            retention_floor: -1,
+        }
+    }
 }
 
 impl ShardNotifications {
-    /// The offset of the last batch, or -1: where a subscription without a
-    /// start offset starts.
+    /// The offset of the last batch, or of the last one the retention
+    /// deleted, or -1: where a subscription without a start offset starts.
     fn last_offset(&self) -> i64 {
-        self.batches.last().map_or(-1, |batch| batch.offset)
+        self.batches
+            .last()
+            .map_or(self.retention_floor, |batch| batch.offset)
     }
 }
 
@@ -470,6 +485,27 @@ impl MockOxia {
     pub(crate) fn hold_notifications(&self, shard: i64) {
         let mut notifications = self.state.notifications.lock().expect("notifications lock");
         notifications.entry(shard).or_default().held = true;
+    }
+
+    /// The notification streams of `shard` send its batches again.
+    pub(crate) fn resume_notifications(&self, shard: i64) {
+        let mut notifications = self.state.notifications.lock().expect("notifications lock");
+        notifications.entry(shard).or_default().held = false;
+        drop(notifications);
+        self.state.notifications_changed.send_replace(());
+    }
+
+    /// Deletes the notification batches of `shard` up to and including
+    /// `offset`, as the retention of the server does. A subscription that
+    /// asks to start before `offset` is confirmed at `offset` instead: the
+    /// batches in between are gone.
+    pub(crate) fn delete_notifications_up_to(&self, shard: i64, offset: i64) {
+        let mut notifications = self.state.notifications.lock().expect("notifications lock");
+        let shard_notifications = notifications.entry(shard).or_default();
+        shard_notifications
+            .batches
+            .retain(|batch| batch.offset > offset);
+        shard_notifications.retention_floor = offset;
     }
 
     /// Ends the notification streams open on `shard` with `UNAVAILABLE`, as
@@ -885,12 +921,16 @@ impl OxiaService for Service {
             let mut notifications = self.state.notifications.lock().expect("notifications lock");
             let shard_notifications = notifications.entry(shard).or_default();
             (
-                start_offset_exclusive.unwrap_or_else(|| shard_notifications.last_offset()),
+                start_offset_exclusive.map_or_else(
+                    || shard_notifications.last_offset(),
+                    |start| start.max(shard_notifications.retention_floor),
+                ),
                 shard_notifications.generation,
             )
         };
         // As a server, confirm the subscription with an empty batch at its
-        // start offset, then send the batches after it as they come.
+        // start offset — after the batches the retention deleted, if it asked
+        // to start before them — then send the batches after it as they come.
         let confirmation = proto::NotificationBatch {
             shard,
             offset: start,
@@ -948,7 +988,7 @@ impl OxiaService for Service {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OxiaClient, OxiaClientBuilder, OxiaError};
+    use crate::{Notification, OxiaClient, OxiaClientBuilder, OxiaError};
     use std::time::Instant;
 
     async fn connect(mock: &MockOxia, request_timeout: Duration) -> OxiaClient {
@@ -2076,6 +2116,48 @@ mod tests {
             }
             assert_no_more_notifications(&mut notifications).await;
         }
+    }
+
+    /// The retention of the server deleted the batches a subscription had not
+    /// read when its stream broke: the subscription reports the gap once, as
+    /// a `NotificationsMissed`, before the notifications it receives from
+    /// there on.
+    #[compio::test]
+    async fn notifications_report_the_batches_the_retention_deleted() {
+        let mock = MockOxia::start(Behavior::default()).await;
+        let client = connect(&mock, Duration::from_secs(5)).await;
+        assert_eq!(mock.notify(0, &["before"]), 0);
+        let mut notifications = client.notifications().await.expect("subscribe");
+        assert_eq!(mock.notify(0, &["a"]), 1);
+        assert_eq!(next_keys(&mut notifications, 1).await, ["a"]);
+
+        // The subscriber lags behind: the retention deletes the batches it
+        // has not read, up to the one of "b", before its stream breaks.
+        mock.hold_notifications(0);
+        assert_eq!(mock.notify(0, &["b"]), 2);
+        mock.delete_notifications_up_to(0, 2);
+        assert_eq!(mock.notify(0, &["c"]), 3);
+        mock.close_notification_streams(0);
+        mock.resume_notifications(0);
+
+        // It resumes after the batch of "a", which is gone: the server
+        // confirms the subscription at the retention floor instead.
+        assert_eq!(
+            compio::time::timeout(Duration::from_secs(5), notifications.recv())
+                .await
+                .expect("a notification arrives")
+                .expect("the subscription is open"),
+            Notification::NotificationsMissed
+        );
+        assert_eq!(next_keys(&mut notifications, 1).await, ["c"]);
+        assert_eq!(start_offsets(&mock, 0), [None, Some(1)]);
+
+        // The gap is reported once: a later reconnect that resumes where it
+        // asked reports nothing.
+        mock.close_notification_streams(0);
+        assert_eq!(mock.notify(0, &["d"]), 4);
+        assert_eq!(next_keys(&mut notifications, 1).await, ["d"]);
+        assert_no_more_notifications(&mut notifications).await;
     }
 
     /// A shard split before the subscription to it is established: the

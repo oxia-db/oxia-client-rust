@@ -112,7 +112,10 @@
 //!   ([`use_index`](GetBuilder::use_index)).
 //!   ([guide](https://oxia-db.github.io/docs/features/secondary-indexes))
 //! - **Notifications** ([`notifications`](OxiaClient::notifications)) stream
-//!   every change applied to the database.
+//!   every change applied to the database; a
+//!   [`NotificationsMissed`](Notification::NotificationsMissed) tells the
+//!   consumer that the server's retention deleted notifications before the
+//!   subscription could read them.
 //!   ([guide](https://oxia-db.github.io/docs/features/notifications))
 //!
 //! Keys are ordered by the key sorting of their namespace: hierarchical by
