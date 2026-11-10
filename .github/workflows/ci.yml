@@ -75,6 +75,58 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # oxia-client-ffi's header is checked in, so it can go stale against the
+      # Rust it describes. cbindgen's formatting varies between releases, so
+      # pin the version the header was generated with or the diff below is
+      # noise.
+      - name: Install cbindgen
+        run: cargo install cbindgen --locked --version 0.29.4
+
+      - name: Check the C header is up to date
+        run: |
+          cbindgen --config cbindgen.toml --crate oxia-client-ffi \
+            --output "$RUNNER_TEMP/oxia_client_ffi.h"
+          if ! diff -u oxia-client-ffi/oxia_client_ffi.h "$RUNNER_TEMP/oxia_client_ffi.h"; then
+            echo "::error file=oxia-client-ffi/oxia_client_ffi.h::out of date; regenerate it (see oxia-client-ffi/README.md)"
+            exit 1
+          fi
+
+      # The header is the contract for every caller of the FFI, C and C++
+      # alike, so a change must not break either language. Compiling it is
+      # enough to catch what goes wrong in practice: a C-only construct, a
+      # missing extern "C", a name that collides.
+      - name: Compile the C header as C and as C++
+        run: |
+          printf '%s\n' \
+            '#include "oxia_client_ffi.h"' \
+            'int main(void) {' \
+            '    oxia_client_options options = {0};' \
+            '    oxia_client *client = NULL;' \
+            '    return oxia_client_new(&options, &client, NULL) == OXIA_OK;' \
+            '}' > "$RUNNER_TEMP/header.c"
+          printf '%s\n' \
+            '#include "oxia_client_ffi.h"' \
+            'int main() {' \
+            '    oxia_client_options options = {};' \
+            '    oxia_client *client = nullptr;' \
+            '    return oxia_client_new(&options, &client, nullptr) == OXIA_OK;' \
+            '}' > "$RUNNER_TEMP/header.cpp"
+          for std in c99 c11 c17; do
+            echo "== $std"
+            cc -std=$std -Wall -Wextra -Werror -I oxia-client-ffi \
+              -c "$RUNNER_TEMP/header.c" -o "$RUNNER_TEMP/header-$std.o"
+          done
+          for std in c++11 c++17 c++20; do
+            echo "== $std"
+            c++ -std=$std -Wall -Wextra -Werror -I oxia-client-ffi \
+              -c "$RUNNER_TEMP/header.cpp" -o "$RUNNER_TEMP/header-$std.o"
+          done
+
+      - name: Build the C example
+        run: |
+          cmake -S oxia-client-ffi/examples -B "$RUNNER_TEMP/ffi-example"
+          cmake --build "$RUNNER_TEMP/ffi-example"
+
       # The dockerized integration tests each start a container and, on a cold
       # runner, would otherwise all pull this image at once — concurrent pulls of
       # the same image race in the Docker client ("bytes remaining on stream").
