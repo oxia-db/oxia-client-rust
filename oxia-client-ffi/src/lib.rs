@@ -60,9 +60,13 @@
 //! see [`streams`] for why, and for the one-request-per-item protocol behind
 //! them.
 //!
-//! A callback runs on a dispatcher thread of the client's, never on the
-//! thread that submitted the operation and never on the thread the client
-//! itself runs on. It is therefore free to block and to make blocking Oxia
+//! The one exception is a log callback, which `logging` explains: it runs on
+//! whichever thread emitted the event, because a log line is droppable and
+//! queueing those would build an unbounded buffer during a log storm.
+//!
+//! A completion callback runs on a dispatcher thread of the client's, never
+//! on the thread that submitted the operation and never on the thread the
+//! client itself runs on. It is therefore free to block and to make blocking Oxia
 //! calls. Callbacks are invoked one at a time, in the order the operations
 //! completed, and each is invoked exactly once for every submission that
 //! returned `OXIA_OK`. Do not call `oxia_client_free` from a callback: it
@@ -80,6 +84,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod error;
+mod logging;
 mod mem;
 mod ops;
 mod results;
@@ -93,6 +98,7 @@ use std::time::Duration;
 use oxia::{OxiaClient as NativeOxiaClient, OxiaClientBuilder};
 
 pub use error::{oxia_error_code, oxia_error_is_retryable, oxia_string_free};
+pub use logging::*;
 pub use mem::{oxia_bytes, oxia_bytes_free, oxia_slice};
 pub use ops::*;
 pub use results::*;

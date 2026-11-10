@@ -1630,3 +1630,176 @@ fn a_stream_opened_with_bad_options_reports_why() {
 
     unsafe { oxia_client_free(client) };
 }
+
+// ===========================================================================
+// Logging
+//
+// `tracing`'s dispatcher is process-global, so all of this is one test rather
+// than several: separate tests would race each other over the level and the
+// sink. Other tests in this binary emit events too, so the assertions are
+// about what arrives and what stops arriving, never about exact counts.
+// ===========================================================================
+
+static DELIVERED: Mutex<Vec<(oxia_log_level, String, String)>> = Mutex::new(Vec::new());
+static REPLACEMENT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+extern "C" fn collect(
+    level: oxia_log_level,
+    target: *const c_char,
+    message: *const c_char,
+    ctx: *mut c_void,
+) {
+    // The context travels through untouched; prove it arrives as handed over.
+    assert_eq!(ctx as usize, 0x5EED);
+    let target = unsafe { CStr::from_ptr(target) }
+        .to_string_lossy()
+        .into_owned();
+    let message = unsafe { CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned();
+    DELIVERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((level, target, message));
+}
+
+extern "C" fn collect_replacement(
+    _level: oxia_log_level,
+    target: *const c_char,
+    _message: *const c_char,
+    _ctx: *mut c_void,
+) {
+    let target = unsafe { CStr::from_ptr(target) }
+        .to_string_lossy()
+        .into_owned();
+    REPLACEMENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(target);
+}
+
+fn delivered() -> Vec<(oxia_log_level, String, String)> {
+    DELIVERED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Lets the events already past their level check arrive before a baseline is
+/// taken.
+///
+/// Changing the level or the sink stops *new* events, but an event another
+/// thread is already delivering is not recalled — and the other tests in this
+/// binary keep their clients busy throughout. So each baseline below is taken
+/// after a pause, not immediately.
+fn let_in_flight_events_settle() {
+    std::thread::sleep(Duration::from_millis(250));
+}
+
+/// Creates and closes a client, which is enough to make the client log: the
+/// listeners and the session keep-alive report themselves stopping.
+fn generate_log_activity() {
+    let client = client();
+    put(client, b"logging/a", b"v");
+    unsafe { oxia_client_free(client) };
+}
+
+#[test]
+fn the_log_bridge_delivers_filters_and_can_be_replaced() {
+    let mut message: *mut c_char = ptr::null_mut();
+    let code = unsafe {
+        oxia_set_log_callback(
+            Some(collect),
+            oxia_log_level::OXIA_LOG_DEBUG,
+            0x5EED as *mut c_void,
+            &mut message,
+        )
+    };
+    // Nothing else in this binary installs a subscriber, so this must win.
+    assert_eq!(
+        code,
+        oxia_error_code::OXIA_OK,
+        "install failed: {}",
+        unsafe { message_of(message) }.unwrap_or_default()
+    );
+
+    // 1. Real client work reaches the callback, with the client's own module
+    //    as the target.
+    generate_log_activity();
+    let seen = delivered();
+    assert!(
+        seen.iter().any(|(_, target, _)| target.starts_with("oxia")),
+        "nothing from the client arrived; got {:?}",
+        seen.iter().map(|(_, t, _)| t).collect::<Vec<_>>()
+    );
+    assert!(
+        seen.iter()
+            .all(|(level, _, _)| *level <= oxia_log_level::OXIA_LOG_DEBUG),
+        "an event more verbose than the level asked for arrived"
+    );
+    assert!(
+        seen.iter().all(|(_, _, text)| !text.is_empty()),
+        "an event arrived with no message"
+    );
+
+    // 2. Turning the level off stops delivery, whoever emits. This and the
+    //    step after it are the regression guard for the level reaching
+    //    `tracing`'s own cached filter: store it without rebuilding the
+    //    interest cache and every macro short-circuits, so nothing is
+    //    delivered however high the level is set.
+    oxia_set_log_level(oxia_log_level::OXIA_LOG_OFF);
+    let_in_flight_events_settle();
+    let before = delivered().len();
+    generate_log_activity();
+    assert_eq!(
+        delivered().len(),
+        before,
+        "events were delivered while the level was OFF"
+    );
+
+    // 3. And raising it again resumes, without reinstalling anything.
+    oxia_set_log_level(oxia_log_level::OXIA_LOG_DEBUG);
+    generate_log_activity();
+    assert!(
+        delivered().len() > before,
+        "raising the level again delivered nothing"
+    );
+
+    // 4. Installing another callback redirects, rather than being refused:
+    //    a caller may start on stderr and move to its own logger.
+    let code = unsafe {
+        oxia_set_log_callback(
+            Some(collect_replacement),
+            oxia_log_level::OXIA_LOG_DEBUG,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(code, oxia_error_code::OXIA_OK);
+    let_in_flight_events_settle();
+    let first_sink_count = delivered().len();
+    generate_log_activity();
+    assert_eq!(
+        delivered().len(),
+        first_sink_count,
+        "the replaced callback was still being called"
+    );
+    assert!(
+        !REPLACEMENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty(),
+        "the replacement callback received nothing"
+    );
+
+    // 5. Clearing it stops delivery altogether.
+    oxia_clear_log_callback();
+    let_in_flight_events_settle();
+    let cleared_at = REPLACEMENT.lock().unwrap_or_else(|e| e.into_inner()).len();
+    generate_log_activity();
+    assert_eq!(
+        REPLACEMENT.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        cleared_at,
+        "events arrived after the callback was cleared"
+    );
+
+    // Leave the bridge off, so the rest of the binary is unaffected.
+    oxia_clear_log_callback();
+}
