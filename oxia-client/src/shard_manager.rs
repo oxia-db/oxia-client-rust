@@ -21,7 +21,7 @@ use crate::proto::{NamespaceShardsAssignment, ShardAssignmentsRequest, ShardKeyR
 use crate::provider_manager::ProviderManager;
 use crate::retry::{RetryError, retry_until_cancelled};
 use compio::runtime::JoinHandle;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -203,12 +203,18 @@ async fn start_assignments_listener(
     inner: Rc<Inner>,
     init_tx: mpsc::Sender<Result<(), OxiaError>>,
 ) {
+    // Whether the first assignment has been stored, like the reference Go
+    // client's `shardManagerImpl.initialized`: it decides how a stream error is
+    // classified (see [`classify_status`]). This task is its only writer, and
+    // shares its thread with every reader.
+    let initialized = Rc::new(Cell::new(false));
     let op = || {
         let local_address = address.clone();
         let local_inner = inner.clone();
         let local_context = context.clone();
         let ns = namespace.clone();
         let init_sender = init_tx.clone();
+        let local_initialized = initialized.clone();
         async move {
             let mut provider = local_inner
                 .provider_manager
@@ -222,7 +228,9 @@ async fn start_assignments_listener(
                 .await
             {
                 Ok(response) => response.into_inner(),
-                Err(status) => return classify_status(status, &init_sender).await,
+                Err(status) => {
+                    return classify_status(status, &init_sender, &local_initialized).await;
+                }
             };
             loop {
                 tokio::select! {
@@ -238,12 +246,15 @@ async fn start_assignments_listener(
                                 "shard assignment stream closed by server".to_string(),
                             )));
                         }
-                        Some(Err(status)) => return classify_status(status, &init_sender).await,
+                        Some(Err(status)) => {
+                            return classify_status(status, &init_sender, &local_initialized).await;
+                        }
                         Some(Ok(assignments)) => {
                             if let Some(na) = assignments.namespaces.get(&ns) {
                                 // This task is the only one to store them.
                                 let next = local_inner.assignments.borrow().next(na);
                                 local_inner.set_assignments(next);
+                                local_initialized.set(true);
                                 if !init_sender.is_closed() {
                                     let _ = init_sender.send(Ok(())).await;
                                 }
@@ -280,19 +291,30 @@ fn collect_current_successors(assignments: &Assignments, removed: i64, current: 
     }
 }
 
-/// Classifies a gRPC error from the assignment stream. `Unauthenticated` (bad
-/// credentials) and `NotFound` (on this stream, only the namespace can be not
-/// found) are permanent — retrying cannot help — so the error is also forwarded
-/// to [`ShardManager::new`] to unblock it immediately. Everything else is
-/// transient and retried.
+/// Classifies a gRPC error from the assignment stream.
+///
+/// Until the first assignment has been stored (`initialized`),
+/// `Unauthenticated` and `PermissionDenied` (bad credentials, or an authority
+/// the server rejects) and `NotFound` (on this stream, only the namespace can be
+/// not found) are permanent: [`ShardManager::new`] is still waiting for the
+/// assignments, so the error is forwarded to unblock it immediately with the
+/// real cause instead of letting it time out.
+///
+/// Afterwards there is no caller left to report them to, and they are retried
+/// like every other error, as in the reference Go client: they can be transient
+/// — an authentication token that the next attempt renews — and stopping the
+/// watcher would leave the client routing on frozen assignments for good,
+/// never seeing another shard split, merge or leader change.
 async fn classify_status(
     status: tonic::Status,
     init_sender: &mpsc::Sender<Result<(), OxiaError>>,
+    initialized: &Cell<bool>,
 ) -> Result<(), RetryError> {
-    let fatal = matches!(
-        status.code(),
-        tonic::Code::Unauthenticated | tonic::Code::NotFound
-    );
+    let fatal = !initialized.get()
+        && matches!(
+            status.code(),
+            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied | tonic::Code::NotFound
+        );
     let err = OxiaError::from(status);
     if fatal {
         if !init_sender.is_closed() {
@@ -722,6 +744,148 @@ mod tests {
         assert_eq!(successor_ids(&manager, &shard_3), vec![4, 5]);
         // A shard that still exists is its own only successor.
         assert_eq!(successor_ids(&manager, &shard_1), vec![1]);
+    }
+
+    /// A stream error, and what the classification forwarded to
+    /// `ShardManager::new`.
+    async fn classify(code: tonic::Code, initialized: bool) -> (RetryError, Option<OxiaError>) {
+        let (init_tx, mut init_rx) = mpsc::channel::<Result<(), OxiaError>>(1);
+        let classified = classify_status(
+            tonic::Status::new(code, "scripted"),
+            &init_tx,
+            &Cell::new(initialized),
+        )
+        .await
+        .expect_err("a stream error never finishes the listener");
+        let forwarded = match init_rx.try_recv() {
+            Ok(Err(err)) => Some(err),
+            _ => None,
+        };
+        (classified, forwarded)
+    }
+
+    /// Before the first assignment, bad credentials, a rejected authority and
+    /// an unknown namespace stop the listener and are forwarded to
+    /// `ShardManager::new`; everything else is retried.
+    #[compio::test]
+    async fn pre_init_permission_errors_are_permanent() {
+        for code in [
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+            tonic::Code::NotFound,
+        ] {
+            let (classified, forwarded) = classify(code, false).await;
+            assert!(
+                matches!(classified, RetryError::Fatal(_)),
+                "{code:?} must be permanent before the first assignment"
+            );
+            assert!(
+                matches!(forwarded, Some(OxiaError::Grpc { code: c, .. }) if c == code),
+                "{code:?} must be forwarded to ShardManager::new, got {forwarded:?}"
+            );
+        }
+        for code in [tonic::Code::Unavailable, tonic::Code::Internal] {
+            let (classified, forwarded) = classify(code, false).await;
+            assert!(matches!(classified, RetryError::Transient(_)), "{code:?}");
+            assert!(forwarded.is_none(), "{code:?} is not a permanent failure");
+        }
+    }
+
+    /// Once the first assignment has been stored there is no caller left to
+    /// report to, and the same errors are retried: an expiring token must not
+    /// freeze the routing table for good.
+    #[compio::test]
+    async fn post_init_permission_errors_are_retried() {
+        for code in [
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+            tonic::Code::NotFound,
+            tonic::Code::Unavailable,
+        ] {
+            let (classified, forwarded) = classify(code, true).await;
+            assert!(
+                matches!(classified, RetryError::Transient(_)),
+                "{code:?} must be retried once initialized"
+            );
+            assert!(forwarded.is_none(), "{code:?}");
+        }
+    }
+
+    async fn manager_for(
+        address: String,
+        request_timeout: Duration,
+    ) -> Result<ShardManager, OxiaError> {
+        ShardManager::new(ShardManagerOptions {
+            address: ensure_protocol(address),
+            namespace: "default".to_string(),
+            provider_manager: Rc::new(ProviderManager::new(request_timeout)),
+            request_timeout,
+        })
+        .await
+    }
+
+    /// A server that rejects the stream before any assignment fails
+    /// `ShardManager::new` right away with the gRPC error, rather than making
+    /// it wait out the request timeout and report `Timeout`.
+    #[compio::test]
+    async fn pre_init_permission_error_fails_new_fast() {
+        for code in [
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+            tonic::Code::NotFound,
+        ] {
+            let mock = crate::mock_server::MockOxia::start(crate::mock_server::Behavior {
+                assignments_error: Some(code),
+                ..Default::default()
+            })
+            .await;
+            let start = std::time::Instant::now();
+            let err = manager_for(mock.address.clone(), Duration::from_secs(30))
+                .await
+                .err()
+                .expect("a permanent error fails the shard manager");
+            assert!(
+                matches!(&err, OxiaError::Grpc { code: c, .. } if *c == code),
+                "{code:?} must surface as itself, got {err:?}"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "{code:?} must fail fast, took {:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    /// The same errors on a stream that already delivered assignments only
+    /// reconnect the watcher: the assignments keep being updated.
+    #[compio::test]
+    async fn post_init_permission_error_keeps_the_watcher_alive() {
+        for code in [
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+            tonic::Code::NotFound,
+        ] {
+            let mock = crate::mock_server::MockOxia::start(Default::default()).await;
+            let manager = manager_for(mock.address.clone(), Duration::from_secs(30))
+                .await
+                .expect("the shard manager starts");
+            let version = manager.assignments_version();
+            assert!(manager.get_shard("a-key").is_some(), "{code:?}");
+
+            mock.fail_assignment_streams(code);
+
+            // The watcher reconnects and the new stream delivers the
+            // assignments again, bumping the version.
+            manager
+                .wait_for_update(version, Duration::from_secs(10))
+                .await;
+            assert!(
+                manager.assignments_version() > version,
+                "{code:?} must not stop the watcher"
+            );
+            assert!(manager.get_shard("a-key").is_some(), "{code:?}");
+            manager.close().await.expect("the manager closes");
+        }
     }
 
     #[compio::test]

@@ -26,6 +26,11 @@
 //! on its side of the split before its own, so that each notification is
 //! delivered once.
 //!
+//! A subscription that resumes after a connection loss can find that the
+//! server's retention deleted the batches it had not read yet: the listener
+//! reports that gap once, as a [`Notification::NotificationsMissed`], before
+//! the notifications of the batch it resumes on.
+//!
 //! Notifications from one shard are delivered in the order the server applied
 //! them (the batch is a server-sorted `repeated NotificationEntry`); ordering
 //! across shards is unspecified.
@@ -33,7 +38,7 @@
 //! [`Notifications`]: crate::Notifications
 
 use crate::errors::OxiaError;
-use crate::proto::NotificationsRequest;
+use crate::proto::{NotificationBatch, NotificationsRequest};
 use crate::provider_manager::ProviderManager;
 use crate::retry::{RetryError, retry_until_cancelled};
 use crate::shard_manager::{ShardManager, ShardRange};
@@ -227,6 +232,22 @@ fn listen(
     .boxed_local()
 }
 
+/// Whether `batch`, the first batch of an attempt that asked to resume after
+/// `start_offset_exclusive`, shows that the subscription missed notifications;
+/// the offset they were missed after, when it does.
+///
+/// The server confirms a subscription with an empty batch that carries no
+/// write timestamp. When it confirms one that asked to resume at an offset
+/// with a batch past that offset, the batches in between are gone: the
+/// retention deleted them before the subscription could read them. A server
+/// that confirms only new subscriptions instead starts a resumed one with its
+/// next batch, which carries a timestamp, or entries, or both.
+fn missed_after(start_offset_exclusive: Option<i64>, batch: &NotificationBatch) -> Option<i64> {
+    let from_exclusive = start_offset_exclusive?;
+    (batch.offset > from_exclusive && batch.timestamp == 0 && batch.notifications.is_empty())
+        .then_some(from_exclusive)
+}
+
 /// One attempt of a listener: streams the notifications of the shard of
 /// `range` until the subscription stops, the stream fails, or the shard turns
 /// out split, which it records in `state` for the listener to follow.
@@ -287,6 +308,7 @@ async fn stream_notifications(
             return Err(RetryError::fatal(err));
         }
     };
+    let mut first = true;
     loop {
         tokio::select! {
             _ = subscription.context.cancelled() => {
@@ -307,6 +329,27 @@ async fn stream_notifications(
                 Some(notification) => {
                     let batch = notification
                         .map_err(|err| RetryError::transient(OxiaError::from(err)))?;
+                    let missed = std::mem::take(&mut first)
+                        .then(|| missed_after(start_offset_exclusive, &batch))
+                        .flatten();
+                    if let Some(from_exclusive) = missed {
+                        warn!(
+                            shard = shard_id,
+                            from_offset_exclusive = from_exclusive,
+                            to_offset_inclusive = batch.offset,
+                            "missed notifications that the retention deleted \
+                             before they were read"
+                        );
+                        if subscription
+                            .sender
+                            .send(Notification::NotificationsMissed)
+                            .await
+                            .is_err()
+                        {
+                            // The Notifications handle was dropped.
+                            return Ok(());
+                        }
+                    }
                     let init = {
                         let mut state = state.borrow_mut();
                         state.last_offset = Some(batch.offset);
@@ -331,5 +374,57 @@ async fn stream_notifications(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{NotificationEntry, NotificationType};
+
+    fn batch(offset: i64, timestamp: u64, entries: usize) -> NotificationBatch {
+        NotificationBatch {
+            shard: 1,
+            offset,
+            timestamp,
+            notifications: (0..entries)
+                .map(|i| NotificationEntry {
+                    key: Some(format!("key-{i}")),
+                    value: Some(crate::proto::Notification {
+                        r#type: NotificationType::KeyCreated as i32,
+                        version_id: Some(1),
+                        key_range_last: None,
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn missed_when_the_confirmation_batch_starts_past_the_requested_offset() {
+        assert_eq!(missed_after(Some(10), &batch(15, 0, 0)), Some(10));
+    }
+
+    #[test]
+    fn not_missed_on_a_new_subscription() {
+        // Without a requested offset nothing can have been missed: the first
+        // batch only primes the cursor.
+        assert_eq!(missed_after(None, &batch(15, 0, 0)), None);
+    }
+
+    #[test]
+    fn not_missed_when_the_subscription_resumes_where_it_asked() {
+        assert_eq!(missed_after(Some(10), &batch(10, 0, 0)), None);
+        assert_eq!(missed_after(Some(10), &batch(11, 0, 1)), None);
+    }
+
+    #[test]
+    fn not_missed_on_a_batch_of_a_write() {
+        // A server that confirms only new subscriptions starts a resumed one
+        // with its next batch: it carries the timestamp of the write, and its
+        // entries, which are not a gap.
+        assert_eq!(missed_after(Some(10), &batch(15, 1_700_000_000, 2)), None);
+        assert_eq!(missed_after(Some(10), &batch(15, 1_700_000_000, 0)), None);
+        assert_eq!(missed_after(Some(10), &batch(15, 0, 2)), None);
     }
 }
