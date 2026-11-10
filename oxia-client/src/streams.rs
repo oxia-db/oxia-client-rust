@@ -205,8 +205,10 @@ impl fmt::Debug for RangeScanStream {
 /// Notifications from the same shard arrive in the order the changes were
 /// applied; interleaving across shards is unspecified. The subscription
 /// survives connection loss: each per-shard listener reconnects and resumes
-/// from its last delivered offset. Dropping the handle releases the
-/// subscription.
+/// from its last delivered offset. A
+/// [`NotificationsMissed`](Notification::NotificationsMissed) reports that
+/// the server's retention deleted notifications before a listener could read
+/// them. Dropping the handle releases the subscription.
 pub struct Notifications {
     rx: mpsc::Receiver<Notification>,
     // Stops the per-shard listeners when this handle is dropped.
