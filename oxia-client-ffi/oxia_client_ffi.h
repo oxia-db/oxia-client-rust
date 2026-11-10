@@ -25,11 +25,31 @@
 #include <stdlib.h>
 
 /**
+ * The binary interface this header describes.
+ *
+ * Bumped on every change that makes a caller built against an older header
+ * incompatible with a newer library — a changed signature, a renumbered
+ * code, a reordered struct, and also a *field appended to one of the
+ * caller-allocated options structs*, because the library would then read
+ * past what an older caller allocated.
+ *
+ * A caller that loads this library separately from the header it was built
+ * against — which is every wrapper SDK shipping a prebuilt binary — should
+ * compare this against `oxia_abi_version` before its first call and
+ * refuse to go on if they differ. Exact equality, not "at least": while
+ * this ABI is pre-1.0 there is no compatibility window to rely on.
+ *
+ * This is not the crate's version: see `oxia_version_string` for that,
+ * which moves for every release whether the ABI changed or not.
+ */
+#define OXIA_ABI_VERSION 1
+
+/**
  * The outcome of an operation.
  *
  * Codes are stable: a new one is appended rather than renumbering the
  * others, and an error this version of the library does not know maps to
- * [`OXIA_ERR_OTHER`](oxia_error_code::OXIA_ERR_OTHER). Pass an
+ * `OXIA_ERR_OTHER`. Pass an
  * `error_message` out-parameter to recover the detail a code leaves out —
  * which argument was invalid, which gRPC status the server returned.
  */
@@ -757,16 +777,29 @@ extern "C" {
 #endif // __cplusplus
 
 /**
+ * The `OXIA_ABI_VERSION` this library was built with.
+ *
+ * ```c
+ * if (oxia_abi_version() != OXIA_ABI_VERSION) {
+ *     fprintf(stderr, "liboxia_client_ffi is ABI %u, this build expects %u\n",
+ *             oxia_abi_version(), OXIA_ABI_VERSION);
+ *     return 1;
+ * }
+ * ```
+ */
+uint32_t oxia_abi_version(void);
+
+/**
  * Connects a client, blocking until it is ready to use.
  *
  * Fails fast — within the request timeout — when the cluster is
  * unreachable, the namespace does not exist, or the first shard assignments
  * cannot be obtained. On `OXIA_OK`, `*client` owns a client the caller
- * destroys with [`oxia_client_free`]; on any error it is set to `NULL`.
+ * destroys with `oxia_client_free`; on any error it is set to `NULL`.
  *
  * # Safety
  *
- * `options` must point at an initialized [`oxia_client_options`] whose
+ * `options` must point at an initialized `oxia_client_options` whose
  * slices are valid for the call. `client` must point at a writable pointer,
  * and `error_message` must be `NULL` or point at one.
  */
@@ -779,14 +812,14 @@ oxia_error_code oxia_client_new(const struct oxia_client_options *options,
  * has finished.
  *
  * Idempotent, and the handle stays valid: a later operation on it fails
- * with `OXIA_ERR_CLOSED`, and [`oxia_client_free`] still has to be called
+ * with `OXIA_ERR_CLOSED`, and `oxia_client_free` still has to be called
  * to release it. Closing explicitly is how a caller learns that the final
- * flush succeeded — [`oxia_client_free`] closes too, but has no way to
+ * flush succeeded — `oxia_client_free` closes too, but has no way to
  * report a failure.
  *
  * # Safety
  *
- * `client` must be a client from [`oxia_client_new`] that has not been
+ * `client` must be a client from `oxia_client_new` that has not been
  * freed. `error_message` must be `NULL` or point at a writable `char *`.
  */
 oxia_error_code oxia_client_close(struct oxia_client *client, char **error_message);
@@ -795,13 +828,13 @@ oxia_error_code oxia_client_close(struct oxia_client *client, char **error_messa
  * Destroys a client, closing it first if it is still open.
  *
  * The only call that invalidates the handle, and safe to call after
- * [`oxia_client_close`]. Does nothing when `client` is `NULL`. Waits for
+ * `oxia_client_close`. Does nothing when `client` is `NULL`. Waits for
  * the operations in flight to settle and for every pending callback to run,
  * so it must not be called from a callback.
  *
  * # Safety
  *
- * `client` must be `NULL`, or a client from [`oxia_client_new`] that has
+ * `client` must be `NULL`, or a client from `oxia_client_new` that has
  * not been freed yet. No operation on it may be in progress on another
  * thread.
  */
@@ -811,7 +844,7 @@ void oxia_client_free(struct oxia_client *client);
  * Writes this library's version, as `MAJOR.MINOR.PATCH`, to `out`.
  *
  * Useful to a wrapper SDK that wants to report the core it is built on.
- * The caller frees the string with [`oxia_string_free`].
+ * The caller frees the string with `oxia_string_free`.
  *
  * # Safety
  *
@@ -827,7 +860,7 @@ void oxia_version_string(char **out);
  * each operation's timeout, so a retryable code means the whole operation
  * may be worth submitting again.
  *
- * [`OXIA_ERR_GRPC`](oxia_error_code::OXIA_ERR_GRPC) answers `false`: whether
+ * `OXIA_ERR_GRPC` answers `false`: whether
  * a gRPC status is retryable depends on the status code, which only the
  * message carries.
  */
