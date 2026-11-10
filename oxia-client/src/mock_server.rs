@@ -416,6 +416,16 @@ impl MockOxia {
         }
     }
 
+    /// Fails the open assignment streams with `code`, as a server does when
+    /// the client's authentication token expires: the next stream the client
+    /// opens is served normally.
+    pub(crate) fn fail_assignment_streams(&self, code: tonic::Code) {
+        let mut senders = self.state.assignment_senders.lock().expect("senders lock");
+        for (_, sender) in senders.drain(..) {
+            let _ = sender.unbounded_send(Err(Status::new(code, "scripted stream failure")));
+        }
+    }
+
     /// The reads, lists, range scans and notification subscriptions that
     /// failed because their shard was split away.
     pub(crate) fn split_shard_requests(&self) -> u32 {
