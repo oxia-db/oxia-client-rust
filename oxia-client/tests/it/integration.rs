@@ -783,6 +783,41 @@ async fn test_notifications_drop_releases_subscription() {
         .unwrap();
 }
 
+#[compio::test]
+async fn test_close_with_a_live_notifications_handle() {
+    // `close` stops the subscription while its handle is still alive, as it
+    // documents, instead of waiting for the handle to be dropped: the
+    // listeners stop even while one is parked on a send into a channel the
+    // consumer has stopped reading, and the handle then reports the end of
+    // the stream rather than blocking forever.
+    let (_container, address) = start_oxia().await;
+    let client = new_client(&address).await;
+
+    let mut rx = client.notifications().buffer_size(1).await.unwrap();
+    for i in 0..5 {
+        client
+            .put(format!("close/notif{i}"), b"v".to_vec())
+            .await
+            .unwrap();
+    }
+
+    compio::time::timeout(Duration::from_secs(10), client.close())
+        .await
+        .expect("close hung with a live Notifications handle")
+        .unwrap();
+
+    // The notifications buffered before the close are still delivered; the
+    // stream then ends.
+    loop {
+        let next = compio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("recv blocked after the client was closed");
+        if next.is_none() {
+            break;
+        }
+    }
+}
+
 // ============================================================
 // Partition Key Tests
 // ============================================================
@@ -863,6 +898,34 @@ async fn test_sequence_keys() {
         .unwrap();
 
     client.close().await.unwrap();
+}
+
+#[compio::test]
+async fn test_close_with_a_live_sequence_updates_handle() {
+    // The listener of a sequence that has not advanced yet is parked on the
+    // server's streaming call, which answers only once it has an update to
+    // send: `close` must still stop it while the handle is alive, and the
+    // handle then reports the end of the stream rather than blocking forever.
+    let (_container, address) = start_oxia().await;
+    let client = new_client(&address).await;
+
+    let mut updates = client
+        .sequence_updates("seq/close", "seq/close")
+        .await
+        .unwrap();
+
+    compio::time::timeout(Duration::from_secs(10), client.close())
+        .await
+        .expect("close hung with a live SequenceUpdates handle")
+        .unwrap();
+
+    let next = compio::time::timeout(Duration::from_secs(5), updates.recv())
+        .await
+        .expect("recv blocked after the client was closed");
+    assert!(
+        next.is_none(),
+        "the subscription should have ended with the client, got {next:?}"
+    );
 }
 
 // ============================================================

@@ -122,9 +122,12 @@ impl Backoff {
 /// [`RetryError::Fatal`], or `token` is cancelled.
 ///
 /// [`RetryError::Transient`] results are retried with unbounded exponential
-/// backoff. Cancellation interrupts the delay between attempts; the operation
-/// itself is expected to observe `token` (typically via `tokio::select!`) to
-/// interrupt a live attempt.
+/// backoff. Cancellation interrupts both the delay between attempts and a live
+/// attempt, whose future is dropped where it stands: an attempt may park in an
+/// await that observes nothing of its own — a gRPC call whose response headers
+/// the server withholds until it has something to stream, a send into a
+/// subscription channel a consumer has stopped reading — and the shutdown of
+/// the owning component waits for this loop to return.
 pub(crate) async fn retry_until_cancelled<F, Fut>(token: &CancellationToken, what: &str, mut op: F)
 where
     F: FnMut() -> Fut,
@@ -133,7 +136,11 @@ where
     let mut backoff = Backoff::new();
     loop {
         let started = Instant::now();
-        let result = op().await;
+        let result = tokio::select! {
+            biased;
+            _ = token.cancelled() => return,
+            result = op() => result,
+        };
         let healthy = started.elapsed() >= RESET_AFTER;
         match result {
             Ok(()) => return,
