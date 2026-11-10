@@ -116,7 +116,7 @@ pub unsafe extern "C" fn oxia_bytes_free(buffer: oxia_bytes) {
     crate::error::guard_void(|| buffer.free());
 }
 
-/// Copies an optional string, as an absent [`oxia_bytes`] when it is `None`.
+/// Copies an optional string, as an absent `oxia_bytes` when it is `None`.
 pub fn optional_bytes(src: Option<&str>) -> oxia_bytes {
     match src {
         Some(s) => oxia_bytes::copy_from(s.as_bytes()),

@@ -24,7 +24,7 @@ use oxia::OxiaError;
 ///
 /// Codes are stable: a new one is appended rather than renumbering the
 /// others, and an error this version of the library does not know maps to
-/// [`OXIA_ERR_OTHER`](oxia_error_code::OXIA_ERR_OTHER). Pass an
+/// `OXIA_ERR_OTHER`. Pass an
 /// `error_message` out-parameter to recover the detail a code leaves out —
 /// which argument was invalid, which gRPC status the server returned.
 #[repr(i32)]
@@ -112,7 +112,7 @@ impl From<&OxiaError> for oxia_error_code {
 /// each operation's timeout, so a retryable code means the whole operation
 /// may be worth submitting again.
 ///
-/// [`OXIA_ERR_GRPC`](oxia_error_code::OXIA_ERR_GRPC) answers `false`: whether
+/// `OXIA_ERR_GRPC` answers `false`: whether
 /// a gRPC status is retryable depends on the status code, which only the
 /// message carries.
 #[unsafe(no_mangle)]
@@ -182,7 +182,7 @@ pub unsafe fn invalid(out: *mut *mut c_char, text: impl AsRef<str>) -> oxia_erro
 }
 
 /// Runs an entry point's body, turning a panic into
-/// [`OXIA_ERR_PANIC`](oxia_error_code::OXIA_ERR_PANIC).
+/// `OXIA_ERR_PANIC`.
 ///
 /// Every `extern "C"` function in this crate goes through here. A panic that
 /// reached the boundary would otherwise abort the process, which for a
