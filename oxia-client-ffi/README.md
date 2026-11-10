@@ -112,6 +112,25 @@ limits.
 `auth_token_provider` and `meter_provider` have no C equivalent. A rotating token would need a
 callback and metrics would need an exporter handle; neither is exposed.
 
+**The callback form has no backpressure.** Submitting is unbounded: the queue to the client's
+thread, the set of operations in flight and the queue of completions waiting for the dispatcher
+all grow as fast as a caller submits. The client's `max_write_batches_in_flight` and
+`max_read_batches_in_flight` cap how many batches are outstanding per shard, so the bytes on the
+wire are bounded, but operations past that limit simply wait — and the memory holding their keys,
+values and callback contexts grows without limit. A caller that submits faster than the cluster
+drains will run out of memory with no signal beforehand, and `oxia_client_free` will wait for all
+of it to settle.
+
+The blocking form does not have this problem: an operation in flight costs the caller a parked
+thread, which caps concurrency by itself. The callback form exists to remove that cost, and
+removes the flow control with it.
+
+An in-flight limit — a count of accepted-but-undelivered operations, with a code for "the queue
+is full" so a caller can apply its own flow control — is deliberately left until the Rust client's
+own backpressure story is settled, so that this ABI mirrors it rather than inventing a second one.
+Until then, a caller that submits without waiting should bound the work itself, by counting
+submissions against completions.
+
 ## Building
 
 ```bash
