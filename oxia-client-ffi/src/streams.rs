@@ -89,14 +89,10 @@ pub(crate) async fn serve<T, S, Fut>(
     items: sync_mpsc::Sender<StreamItem<T>>,
     mut cancelled: oneshot::Receiver<()>,
     mut shutdown: watch::Receiver<bool>,
-    live: std::sync::Arc<crate::runtime::LiveStreams>,
 ) where
     Fut: Future<Output = Result<S, OxiaError>>,
     S: Stream<Item = Result<T, OxiaError>>,
 {
-    // Reports this task as finished however it leaves, including the paths
-    // that never get as far as a stream.
-    let _finished = FinishedOnDrop(live);
     let stream = match open.await {
         Ok(stream) => {
             // Nobody waiting for the handle any more: give up before
@@ -143,16 +139,6 @@ pub(crate) async fn serve<T, S, Fut>(
     }
     // Dropping `stream` ends the subscription, and dropping `items`
     // disconnects whoever is blocked in `next`.
-}
-
-/// Decrements the client's live-stream count however `serve` returns, so
-/// that teardown is never left waiting for a task that has gone.
-struct FinishedOnDrop(std::sync::Arc<crate::runtime::LiveStreams>);
-
-impl Drop for FinishedOnDrop {
-    fn drop(&mut self) {
-        self.0.finished();
-    }
 }
 
 /// The consumer's end of the protocol. Behind a mutex, because `next` is the
