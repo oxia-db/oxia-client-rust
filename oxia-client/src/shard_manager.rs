@@ -268,6 +268,29 @@ async fn start_assignments_listener(
     retry_until_cancelled(&context, "shard-assignments", op).await;
 }
 
+/// Appends to `current` the shards of `assignments` that took over the keys of
+/// the removed shard `removed`, following a successor that was removed in turn
+/// to its own successors. Shard ids are never reused and a successor is always
+/// a shard the assignments gained later, so the recursion terminates.
+fn collect_current_successors(assignments: &Assignments, removed: i64, current: &mut Vec<i64>) {
+    let Some(replacement) = assignments
+        .replacements
+        .iter()
+        .find(|replacement| replacement.removed == removed)
+    else {
+        return;
+    };
+    for successor in &replacement.successors {
+        if assignments.leaders.contains_key(&successor.shard) {
+            if !current.contains(&successor.shard) {
+                current.push(successor.shard);
+            }
+        } else {
+            collect_current_successors(assignments, successor.shard, current);
+        }
+    }
+}
+
 /// Classifies a gRPC error from the assignment stream.
 ///
 /// Until the first assignment has been stored (`initialized`),
@@ -467,6 +490,18 @@ impl ShardManager {
             .filter(|range| range.overlaps(removed))
             .copied()
             .collect()
+    }
+
+    /// The shards of the current assignments that own the keys of `removed`, a
+    /// shard that was split or merged away: the shards that replaced it, or —
+    /// where one of those was itself replaced since — the shards that replaced
+    /// those, recursively. Empty when `removed` is unknown, or is still in the
+    /// assignments.
+    pub(crate) fn current_successors(&self, removed: i64) -> Vec<i64> {
+        let assignments = self.inner.assignments.borrow();
+        let mut current = Vec::new();
+        collect_current_successors(&assignments, removed, &mut current);
+        current
     }
 
     /// A receiver that sees each replacement of the assignments from now on.

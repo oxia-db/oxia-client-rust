@@ -210,14 +210,14 @@ impl OxiaClient {
             request_timeout: options.request_timeout,
             metrics,
         });
-        let session_manager = Rc::new(SessionManager::new(
+        let session_manager = SessionManager::new(
             options.identity.clone(),
             options.session_timeout,
             options.session_keep_alive,
             options.request_timeout,
             shard_manager.clone(),
             provider_manager.clone(),
-        ));
+        );
         Ok(OxiaClient {
             inner: Rc::new(Inner {
                 options,

@@ -107,10 +107,16 @@ async fn start_cluster(servers: usize, initial_shards: u32) -> Cluster {
         probe.close().await.expect("close probe client");
     }
 
-    Cluster {
+    let cluster = Cluster {
         container: Arc::new(container),
         address: format!("localhost:{}", host_ports[0]),
-    }
+    };
+    // A server serves the assignments as soon as the coordinator sends them,
+    // which is before the coordinator has elected a leader for every shard:
+    // a client builds, and an admin command on a shard still in its initial
+    // election is rejected ("shard 0 is not in steady state (status=Election)").
+    cluster.wait_until_steady(initial_shards).await;
+    cluster
 }
 
 impl Cluster {
@@ -134,27 +140,52 @@ impl Cluster {
         .await
     }
 
+    /// The coordinator's view of the namespace, as the admin CLI's JSON.
+    async fn namespace_status(&self) -> String {
+        let status = self
+            .exec(
+                &[
+                    "oxia",
+                    "admin",
+                    "namespace",
+                    "get",
+                    "default",
+                    "--output",
+                    "json",
+                ],
+                "namespace get",
+            )
+            .await;
+        assert!(status.contains("\"shards\""), "unexpected status: {status}");
+        status
+    }
+
+    /// Waits until the coordinator reports a leader for each of the
+    /// namespace's `shards`: a shard has one once its initial election is
+    /// over, and only then does the coordinator accept an admin command on it.
+    async fn wait_until_steady(&self, shards: u32) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let status = self.namespace_status().await;
+            let with_leader = status.matches("\"leader\"").count();
+            if with_leader == shards as usize {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {with_leader} of the {shards} shards have a leader: {status}"
+            );
+            compio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Waits until the coordinator no longer lists `shard` in the namespace
     /// status: a split parent is deleted once its children have taken over.
     async fn wait_until_removed(&self, shard: i64) {
         let entry = format!("\"{shard}\": {{");
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let status = self
-                .exec(
-                    &[
-                        "oxia",
-                        "admin",
-                        "namespace",
-                        "get",
-                        "default",
-                        "--output",
-                        "json",
-                    ],
-                    "namespace get",
-                )
-                .await;
-            assert!(status.contains("\"shards\""), "unexpected status: {status}");
+            let status = self.namespace_status().await;
             if !status.contains(&entry) {
                 return;
             }
@@ -169,31 +200,64 @@ impl Cluster {
     /// Runs `cmd` in the container and returns its stdout. The command runs
     /// off the clients' thread, which the blocking container API would
     /// otherwise hold up: the clients keep running meanwhile.
+    ///
+    /// Every caller parses the stdout, so a command that exits non-zero — or
+    /// that prints nothing at all — panics here, naming the command line, the
+    /// exit code and the container's stderr, rather than handing the caller
+    /// an empty string to assert on.
     async fn exec(&self, cmd: &[&str], what: &'static str) -> String {
         let container = self.container.clone();
         let cmd: Vec<String> = cmd.iter().map(|arg| arg.to_string()).collect();
         compio::runtime::spawn_blocking(move || {
+            let line = cmd.join(" ");
             let mut result = container
                 .exec(testcontainers::core::ExecCommand::new(cmd))
-                .unwrap_or_else(|e| panic!("exec {what}: {e}"));
+                .unwrap_or_else(|e| panic!("exec {what} (`{line}`): {e}"));
+            // Reading stdout to the end waits for the command to exit, so the
+            // exit code is there by the time it is asked for. stderr and
+            // stdout are fed by independent unbounded channels, so draining
+            // one after the other cannot deadlock.
             let stdout = result
                 .stdout_to_vec()
-                .unwrap_or_else(|e| panic!("{what} stdout: {e}"));
-            String::from_utf8_lossy(&stdout).to_string()
+                .unwrap_or_else(|e| panic!("{what} (`{line}`) stdout: {e}"));
+            let stderr = result
+                .stderr_to_vec()
+                .unwrap_or_else(|e| panic!("{what} (`{line}`) stderr: {e}"));
+            let code = result
+                .exit_code()
+                .unwrap_or_else(|e| panic!("{what} (`{line}`) exit code: {e}"));
+            let stdout = String::from_utf8_lossy(&stdout).to_string();
+            if code == Some(0) && !stdout.trim().is_empty() {
+                return Ok(stdout);
+            }
+            Err(format!(
+                "{what}: `{line}` exited with {code:?}\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&stderr)
+            ))
         })
         .await
         .expect("the container command runs")
+        .unwrap_or_else(|report| panic!("{report}"))
     }
 }
 
 /// Builds a client, retrying until the server at `address` serves the shard
 /// assignments.
 async fn connect_with_retry(address: &str) -> OxiaClient {
+    connect_with_session_timeout(address, Duration::from_secs(30)).await
+}
+
+/// Builds a client whose sessions time out after `session_timeout`, retrying
+/// until the server at `address` serves the shard assignments.
+async fn connect_with_session_timeout(address: &str, session_timeout: Duration) -> OxiaClient {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let result = OxiaClientBuilder::new()
             .service_address(address.to_string())
             .request_timeout(Duration::from_secs(10))
+            .session_timeout(session_timeout)
+            .session_keep_alive(session_timeout / 3)
             .build()
             .await;
         match result {
@@ -340,6 +404,62 @@ async fn test_shard_split_reroutes_live_client() {
     assert_eq!(got.value.as_deref(), Some(b"done".as_ref()));
 
     client.close().await.unwrap();
+}
+
+/// Ephemeral records across a live shard split: the shards that replace the
+/// split shard inherit its session along with the records in their own hash
+/// range, and expire it — deleting those records — unless the client keeps the
+/// session alive on them too. The client writes one ephemeral record in each
+/// half of the hash space, splits their shard, then stays idle for longer than
+/// the session timeout: the records may only disappear when it closes.
+#[compio::test]
+async fn test_ephemeral_records_survive_a_live_split() {
+    let session_timeout = Duration::from_secs(3);
+    let cluster = start_cluster(2, 1).await;
+    let client = connect_with_session_timeout(&cluster.address, session_timeout).await;
+
+    // One record per half of the hash space: the split puts one on each child
+    // shard, so both children must keep the inherited session alive.
+    let keys = [key_in_half("eph/", false), key_in_half("eph/", true)];
+    for key in &keys {
+        client.put(key.clone(), "held").ephemeral().await.unwrap();
+    }
+
+    let split_output = cluster.split_shard(0).await;
+    assert!(
+        split_output.contains("\"Error\":null"),
+        "split must succeed, got: {split_output}"
+    );
+    cluster.wait_until_removed(0).await;
+
+    // Idle: only the keep-alive of the inherited sessions can hold the
+    // records now. Without it they are gone one session timeout after the
+    // children were elected.
+    compio::time::sleep(session_timeout * 3).await;
+
+    for key in &keys {
+        let got = client
+            .get(key.clone())
+            .await
+            .unwrap_or_else(|e| panic!("ephemeral record {key} must have survived the split: {e}"));
+        assert_eq!(got.value.as_deref(), Some(b"held".as_ref()));
+        assert!(
+            got.version.is_ephemeral(),
+            "record {key} must still be ephemeral"
+        );
+    }
+
+    // Closing the client closes the inherited sessions, which deletes the
+    // records they hold on the shards that replaced the split shard.
+    client.close().await.unwrap();
+    let reader = connect_with_retry(&cluster.address).await;
+    for key in &keys {
+        assert!(
+            matches!(reader.get(key.clone()).await, Err(OxiaError::KeyNotFound)),
+            "ephemeral record {key} must be gone once the client closed"
+        );
+    }
+    reader.close().await.unwrap();
 }
 
 /// A key starting with `prefix` that a two-shard namespace places on its
