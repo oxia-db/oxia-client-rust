@@ -31,4 +31,30 @@ header = """
 // limitations under the License.
 
 #include <stdint.h>"""
-cpp_compat = false
+# Wrap the declarations in `extern "C"` and guard the enum typedef, so the
+# header can be included from C++ as well as from C.
+cpp_compat = true
+
+# Carry the doc comments across: the header is the contract another SDK's
+# authors read.
+documentation = true
+documentation_style = "doxy"
+
+[export]
+# The callback typedefs: the asynchronous entry points write their signature
+# out inline, because cbindgen renders `Option<extern "C" fn(..)>` as an
+# opaque struct when it reaches it through a type alias. Listing the aliases
+# here keeps the named typedefs in the header for callers to declare against.
+include = [
+  "oxia_put_callback",
+  "oxia_get_callback",
+  "oxia_status_callback",
+  "oxia_list_callback",
+  "oxia_range_scan_callback",
+]
+
+[enum]
+# The variants are already spelled as the C constants they should be
+# (OXIA_OK, not oxia_error_code_OXIA_OK), so cbindgen must not prefix them
+# with the enum's own name.
+prefix_with_name = false

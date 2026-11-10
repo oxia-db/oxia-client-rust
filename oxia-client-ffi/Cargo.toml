@@ -15,17 +15,32 @@
 [package]
 name = "oxia-client-ffi"
 version = "0.1.0"
-edition = "2021"
-
-
+edition = "2024"
+rust-version = "1.99"
+description = "A C ABI over the Oxia Rust client, for C and C++ applications and as the core of other language SDKs."
+license = "Apache-2.0"
+repository = "https://github.com/oxia-db/oxia-client-rust"
+publish = false
 
 [lib]
 name = "oxia_client_ffi"
-crate-type = ["cdylib"]
+# cdylib for a shared library, staticlib for linking into another SDK's
+# artifact (a Go binary through cgo, a Python wheel, a JNI bundle), rlib so
+# that the ABI itself can be exercised from the Rust tests in tests/.
+crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+# TLS is on by default: a library that another SDK links has to be able to
+# reach a TLS cluster without being rebuilt.
+default = ["tls"]
+tls = ["oxia-client/tls"]
 
 [dependencies]
 oxia-client = { workspace = true }
 compio = { workspace = true }
 futures = { workspace = true }
-libc = { workspace = true }
+
+[dev-dependencies]
+# The error-mapping test names the gRPC status codes.
+tonic = { workspace = true }
+testcontainers = { version = "0.23", features = ["blocking"] }

@@ -24,79 +24,924 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-enum COxiaError {
-  Ok = 0,
-  KeyNotFound = 1,
-  UnexpectedVersionId = 2,
-  SessionExpired = 3,
-  RequestTooLarge = 4,
-  InvalidArgument = 5,
-  LeaderNotFound = 6,
-  NoShardForKey = 7,
-  Disconnected = 8,
-  Timeout = 9,
-  Grpc = 10,
-  Decode = 11,
-  Closed = 12,
-  Other = 13,
+/**
+ * The outcome of an operation.
+ *
+ * Codes are stable: a new one is appended rather than renumbering the
+ * others, and an error this version of the library does not know maps to
+ * [`OXIA_ERR_OTHER`](oxia_error_code::OXIA_ERR_OTHER). Pass an
+ * `error_message` out-parameter to recover the detail a code leaves out —
+ * which argument was invalid, which gRPC status the server returned.
+ */
+enum oxia_error_code
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * The operation succeeded.
+   */
+  OXIA_OK = 0,
+  /**
+   * The requested key does not exist.
+   */
+  OXIA_ERR_KEY_NOT_FOUND = 1,
+  /**
+   * A conditional operation found a different version than it expected.
+   */
+  OXIA_ERR_UNEXPECTED_VERSION_ID = 2,
+  /**
+   * The session backing an ephemeral record has expired or been closed.
+   */
+  OXIA_ERR_SESSION_EXPIRED = 3,
+  /**
+   * Kept for compatibility; the server now reports an oversized write as a
+   * gRPC status.
+   */
+  OXIA_ERR_REQUEST_TOO_LARGE = 4,
+  /**
+   * An argument or option was invalid. The message says which.
+   */
+  OXIA_ERR_INVALID_ARGUMENT = 5,
+  /**
+   * No leader is available for the shard, e.g. during an election.
+   * Retryable.
+   */
+  OXIA_ERR_LEADER_NOT_FOUND = 6,
+  /**
+   * No shard owns the key yet, because assignments are still loading.
+   * Retryable.
+   */
+  OXIA_ERR_NO_SHARD_FOR_KEY = 7,
+  /**
+   * A connection was lost or could not be established. Retryable.
+   */
+  OXIA_ERR_DISCONNECTED = 8,
+  /**
+   * The operation did not finish before its deadline.
+   */
+  OXIA_ERR_TIMEOUT = 9,
+  /**
+   * The server returned a gRPC status. The message carries the code and
+   * the server's text.
+   */
+  OXIA_ERR_GRPC = 10,
+  /**
+   * A server response could not be decoded: a protocol mismatch or a
+   * server bug.
+   */
+  OXIA_ERR_DECODE = 11,
+  /**
+   * The client has been closed and can no longer be used.
+   */
+  OXIA_ERR_CLOSED = 12,
+  /**
+   * An error this version of the library does not recognize. The message
+   * carries its text.
+   */
+  OXIA_ERR_OTHER = 13,
+  /**
+   * A shard's leader does not support an inclusive end of range.
+   */
+  OXIA_ERR_END_INCLUSIVE_UNSUPPORTED = 14,
+  /**
+   * The shard was split or merged while the operation targeted it.
+   * Retryable.
+   */
+  OXIA_ERR_SHARD_MOVED = 15,
+  /**
+   * A bug in the library: a panic was caught at the boundary rather than
+   * being allowed to unwind into the caller, which would end the process.
+   * The message carries the panic text; please report it.
+   */
+  OXIA_ERR_PANIC = 16,
 };
-typedef int32_t COxiaError;
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum oxia_error_code oxia_error_code;
+#else
+typedef int32_t oxia_error_code;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
-typedef struct OxiaClient OxiaClient;
+/**
+ * Which record a get selects relative to the requested key.
+ */
+enum oxia_comparison_type
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * The stored key must equal the requested key.
+   */
+  OXIA_COMPARISON_EQUAL = 0,
+  /**
+   * The highest key `<=` the requested key.
+   */
+  OXIA_COMPARISON_FLOOR = 1,
+  /**
+   * The lowest key `>=` the requested key.
+   */
+  OXIA_COMPARISON_CEILING = 2,
+  /**
+   * The highest key `<` the requested key.
+   */
+  OXIA_COMPARISON_LOWER = 3,
+  /**
+   * The lowest key `>` the requested key.
+   */
+  OXIA_COMPARISON_HIGHER = 4,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum oxia_comparison_type oxia_comparison_type;
+#else
+typedef int32_t oxia_comparison_type;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
-typedef struct COxiaClientOptions {
-  const char *service_address;
-  const char *namespace_;
-} COxiaClientOptions;
+/**
+ * An open client.
+ *
+ * Opaque to C: created by `oxia_client_new` and destroyed by
+ * `oxia_client_free`. Operations may be submitted from any thread.
+ */
+typedef struct oxia_client oxia_client;
 
-typedef struct COxiaPutResult {
-  char *key;
+/**
+ * Bytes borrowed from the caller, as a pointer and a length.
+ *
+ * Keys and values cross the boundary as bytes, not as NUL-terminated
+ * strings: an Oxia key is a protobuf `string`, so it is UTF-8 but may
+ * contain a NUL byte, and a value is arbitrary binary.
+ *
+ * `data` may be `NULL` only when `len` is 0. For the options that take an
+ * optional string, a `NULL` `data` means "unset", while a non-`NULL` `data`
+ * with `len` 0 means the empty string.
+ */
+typedef struct oxia_slice {
+  /**
+   * The first byte, or `NULL`.
+   */
+  const uint8_t *data;
+  /**
+   * The number of bytes.
+   */
+  uintptr_t len;
+} oxia_slice;
+
+/**
+ * How a client connects and behaves.
+ *
+ * A zeroed struct with only `service_address` set asks for the client's
+ * defaults throughout: every numeric field means "the default" when it is
+ * 0, and every slice means "unset" when its `data` is `NULL`.
+ */
+typedef struct oxia_client_options {
+  /**
+   * The address of an Oxia service, such as `"localhost:6648"`. Required.
+   * An `https://` address needs the library to have been built with TLS.
+   */
+  struct oxia_slice service_address;
+  /**
+   * The namespace to operate in. Unset means `default`.
+   */
+  struct oxia_slice namespace_;
+  /**
+   * The identity this client claims on its session, which ephemeral
+   * records record. Unset means a generated one.
+   */
+  struct oxia_slice identity;
+  /**
+   * How long an operation may take before it fails with
+   * `OXIA_ERR_TIMEOUT`, in milliseconds.
+   */
+  uint64_t request_timeout_ms;
+  /**
+   * How long the server keeps this client's session alive without a
+   * keep-alive, in milliseconds.
+   */
+  uint64_t session_timeout_ms;
+  /**
+   * How often to send a session keep-alive, in milliseconds. The default
+   * is a tenth of the session timeout.
+   */
+  uint64_t session_keep_alive_ms;
+  /**
+   * The soft byte limit of a write batch.
+   */
+  uint32_t batch_max_size;
+  /**
+   * The most operations to put in one batch.
+   */
+  uint32_t max_requests_per_batch;
+  /**
+   * The most write batches to keep in flight per shard.
+   */
+  uint32_t max_write_batches_in_flight;
+  /**
+   * The most read batches to keep in flight per shard.
+   */
+  uint32_t max_read_batches_in_flight;
+  /**
+   * A bearer token to authenticate with, sent on every request. Unset
+   * means no authentication.
+   */
+  struct oxia_slice auth_token;
+  /**
+   * Connect with TLS, verifying the server against the operating
+   * system's trust roots. Implied by any of the `tls_` fields below.
+   */
+  bool tls;
+  /**
+   * PEM-encoded CA certificates to verify the server against, instead of
+   * the operating system's trust roots.
+   */
+  struct oxia_slice tls_trusted_ca_pem;
+  /**
+   * A PEM-encoded certificate to present as this client's identity, for
+   * mutual TLS. Requires `tls_client_key_pem`.
+   */
+  struct oxia_slice tls_client_cert_pem;
+  /**
+   * The PEM-encoded private key of `tls_client_cert_pem`.
+   */
+  struct oxia_slice tls_client_key_pem;
+  /**
+   * The name to verify the server's certificate against, and to send as
+   * SNI, instead of the host in `service_address`.
+   */
+  struct oxia_slice tls_domain_name;
+} oxia_client_options;
+
+/**
+ * An additional index a put writes the record under.
+ */
+typedef struct oxia_secondary_index {
+  /**
+   * The name of the index. Must not contain `/`.
+   */
+  struct oxia_slice index_name;
+  /**
+   * The key to index the record under.
+   */
+  struct oxia_slice secondary_key;
+} oxia_secondary_index;
+
+/**
+ * The arguments of a put.
+ */
+typedef struct oxia_put_options {
+  /**
+   * The key to write. Required, and must be valid UTF-8.
+   */
+  struct oxia_slice key;
+  /**
+   * The value to write. May be empty.
+   */
+  struct oxia_slice value;
+  /**
+   * Compare-and-swap: the write only applies if the stored version
+   * matches. Read only when `has_expected_version_id` is true.
+   */
+  int64_t expected_version_id;
+  /**
+   * Whether `expected_version_id` applies.
+   */
+  bool has_expected_version_id;
+  /**
+   * The write only applies if the record does not exist yet.
+   */
+  bool expected_record_not_exists;
+  /**
+   * Bind the record to this client's session, so it is deleted when the
+   * session closes or expires.
+   */
+  bool ephemeral;
+  /**
+   * Co-locate the record on the shard this key hashes to; `data` `NULL`
+   * to route by the record's own key.
+   */
+  struct oxia_slice partition_key;
+  /**
+   * Per-delta monotonic suffixes the server appends to the key; `NULL`
+   * for a plain key.
+   */
+  const uint64_t *sequence_key_deltas;
+  /**
+   * How many deltas `sequence_key_deltas` holds.
+   */
+  uintptr_t sequence_key_deltas_len;
+  /**
+   * Secondary indexes to add the record to; `NULL` for none.
+   */
+  const struct oxia_secondary_index *secondary_indexes;
+  /**
+   * How many entries `secondary_indexes` holds.
+   */
+  uintptr_t secondary_indexes_len;
+} oxia_put_options;
+
+/**
+ * Bytes owned by the caller, freed by the `_free` function of the result
+ * that carries them.
+ *
+ * `data` points at `len` bytes followed by a NUL terminator that is not
+ * counted in `len`, so a key or value without interior NUL bytes can be
+ * passed straight to `printf("%s")`. Use `len` whenever it may contain
+ * them. A `NULL` `data` means the field is absent.
+ */
+typedef struct oxia_bytes {
+  /**
+   * The first byte, or `NULL` when the field is absent.
+   */
+  uint8_t *data;
+  /**
+   * The number of bytes, excluding the NUL terminator.
+   */
+  uintptr_t len;
+} oxia_bytes;
+
+/**
+ * The version metadata of a record.
+ */
+typedef struct oxia_version {
+  /**
+   * Changes on every modification; the value to pass as
+   * `expected_version_id` for a compare-and-swap.
+   */
   int64_t version_id;
-} COxiaPutResult;
+  /**
+   * How many times the record has been modified since it was created.
+   */
+  int64_t modifications_count;
+  /**
+   * When the record was created, in milliseconds since the epoch.
+   */
+  uint64_t created_timestamp;
+  /**
+   * When the record was last modified, in milliseconds since the epoch.
+   */
+  uint64_t modified_timestamp;
+  /**
+   * Whether the record is ephemeral, i.e. bound to a client session.
+   */
+  bool is_ephemeral;
+  /**
+   * The owning session, meaningful only when `is_ephemeral` is true.
+   */
+  int64_t session_id;
+  /**
+   * The identity of the client that last wrote the record — the one it
+   * set as `identity`, or a generated id. Reported for every record, not
+   * only for ephemeral ones; `data` is `NULL` when the server sent none.
+   */
+  struct oxia_bytes client_identity;
+} oxia_version;
 
-typedef struct COxiaGetResult {
-  char *key;
-  uint8_t *value;
-  uintptr_t value_len;
-  int64_t version_id;
-} COxiaGetResult;
+/**
+ * What a put stored.
+ */
+typedef struct oxia_put_result {
+  /**
+   * The key written. Differs from the requested key when the server
+   * generated it from sequence key deltas.
+   */
+  struct oxia_bytes key;
+  /**
+   * The version of the record just written.
+   */
+  struct oxia_version version;
+} oxia_put_result;
 
-typedef struct COxiaListResult {
-  char **keys;
-  uintptr_t keys_len;
-} COxiaListResult;
+/**
+ * The arguments of a get.
+ */
+typedef struct oxia_get_options {
+  /**
+   * The key to read. Required, and must be valid UTF-8.
+   */
+  struct oxia_slice key;
+  /**
+   * Which record to select; zero is an exact match.
+   */
+  oxia_comparison_type comparison;
+  /**
+   * Return only the version, without the value. Zero — the default —
+   * returns the value.
+   */
+  bool exclude_value;
+  /**
+   * Read from the shard this key hashes to; `data` `NULL` to route by the
+   * requested key.
+   */
+  struct oxia_slice partition_key;
+  /**
+   * Resolve the key through this secondary index instead of the primary
+   * one; `data` `NULL` for the primary.
+   */
+  struct oxia_slice use_index;
+} oxia_get_options;
 
-COxiaError oxia_client_new(struct COxiaClientOptions options, struct OxiaClient **client_ptr);
+/**
+ * A record a get or a range scan returned.
+ */
+typedef struct oxia_get_result {
+  /**
+   * The key of the record. Differs from the requested key for a
+   * non-`EQUAL` comparison, such as a floor or ceiling query.
+   */
+  struct oxia_bytes key;
+  /**
+   * Whether the response carried a value. False when the query asked not
+   * to have one (`exclude_value`), and also when the record carries no
+   * value.
+   *
+   * A record stored with an empty value reads back as `has_value` false:
+   * the server leaves the field out of the response for an empty value
+   * just as it does for no value, so the two cannot be told apart here.
+   */
+  bool has_value;
+  /**
+   * The value, when `has_value` is true.
+   */
+  struct oxia_bytes value;
+  /**
+   * The version metadata of the record.
+   */
+  struct oxia_version version;
+  /**
+   * The matching secondary-index key when the query used an index;
+   * `data` is `NULL` otherwise.
+   */
+  struct oxia_bytes secondary_index_key;
+} oxia_get_result;
 
-void oxia_client_free(struct OxiaClient *client);
+/**
+ * The arguments of a delete.
+ */
+typedef struct oxia_delete_options {
+  /**
+   * The key to delete. Required, and must be valid UTF-8.
+   */
+  struct oxia_slice key;
+  /**
+   * Compare-and-swap: the delete only applies if the stored version
+   * matches. Read only when `has_expected_version_id` is true.
+   */
+  int64_t expected_version_id;
+  /**
+   * Whether `expected_version_id` applies.
+   */
+  bool has_expected_version_id;
+  /**
+   * Route to the shard this key hashes to; `data` `NULL` to route by the
+   * record's own key.
+   */
+  struct oxia_slice partition_key;
+} oxia_delete_options;
 
-COxiaError oxia_client_put(const struct OxiaClient *client,
-                           const char *key,
-                           const uint8_t *value,
-                           uintptr_t value_len,
-                           struct COxiaPutResult **result_ptr);
+/**
+ * The arguments of a delete over a range of keys.
+ */
+typedef struct oxia_delete_range_options {
+  /**
+   * The first key of the range, included. Required.
+   */
+  struct oxia_slice min_key_inclusive;
+  /**
+   * The key the range stops before, excluded. Required.
+   */
+  struct oxia_slice max_key_exclusive;
+  /**
+   * Delete only within the shard this key hashes to; `data` `NULL` to
+   * cover every shard.
+   */
+  struct oxia_slice partition_key;
+} oxia_delete_range_options;
 
-COxiaError oxia_client_get(const struct OxiaClient *client,
-                           const char *key,
-                           struct COxiaGetResult **result_ptr);
+/**
+ * The arguments of a list or a range scan, which take the same options.
+ */
+typedef struct oxia_range_options {
+  /**
+   * The first key of the range, included. Required.
+   */
+  struct oxia_slice min_key_inclusive;
+  /**
+   * The key the range stops at. Excluded unless `end_inclusive`.
+   */
+  struct oxia_slice max_key_exclusive;
+  /**
+   * Read only the shard this key hashes to; `data` `NULL` to merge every
+   * shard.
+   */
+  struct oxia_slice partition_key;
+  /**
+   * Walk this secondary index instead of the primary one; `data` `NULL`
+   * for the primary.
+   */
+  struct oxia_slice use_index;
+  /**
+   * Include `max_key_exclusive` itself. Fails with
+   * `OXIA_ERR_END_INCLUSIVE_UNSUPPORTED` against a shard whose leader is
+   * too old to support it.
+   */
+  bool end_inclusive;
+  /**
+   * Include the keys Oxia keeps for its own bookkeeping.
+   */
+  bool include_internal_keys;
+} oxia_range_options;
 
-COxiaError oxia_client_shutdown(struct OxiaClient *client);
+/**
+ * The keys a list returned, in the key order of the namespace.
+ */
+typedef struct oxia_key_list {
+  /**
+   * The keys; `NULL` when `len` is 0.
+   */
+  struct oxia_bytes *keys;
+  /**
+   * How many keys there are.
+   */
+  uintptr_t len;
+} oxia_key_list;
 
-void oxia_put_result_free(struct COxiaPutResult *result);
+/**
+ * The records a range scan returned, in the key order of the namespace.
+ */
+typedef struct oxia_record_list {
+  /**
+   * The records; `NULL` when `len` is 0.
+   */
+  struct oxia_get_result *records;
+  /**
+   * How many records there are.
+   */
+  uintptr_t len;
+} oxia_record_list;
 
-COxiaError oxia_client_delete(const struct OxiaClient *client, const char *key);
+/**
+ * Called once when a put submitted with `oxia_client_put_async` finishes.
+ */
+typedef void (*oxia_put_callback)(oxia_error_code, const char*, const struct oxia_put_result*, void*);
 
-COxiaError oxia_client_list(const struct OxiaClient *client,
-                            const char *min_key_inclusive,
-                            const char *max_key_exclusive,
-                            struct COxiaListResult **result_ptr);
+/**
+ * Called once when a get submitted with `oxia_client_get_async` finishes.
+ */
+typedef void (*oxia_get_callback)(oxia_error_code, const char*, const struct oxia_get_result*, void*);
 
-void oxia_list_result_free(struct COxiaListResult *result);
+/**
+ * Called once when an operation with no result finishes.
+ */
+typedef void (*oxia_status_callback)(oxia_error_code, const char*, void*);
 
-COxiaError oxia_client_delete_range(const struct OxiaClient *client,
-                                    const char *min_key_inclusive,
-                                    const char *max_key_exclusive);
+/**
+ * Called once when a list submitted with `oxia_client_list_async` finishes.
+ */
+typedef void (*oxia_list_callback)(oxia_error_code, const char*, const struct oxia_key_list*, void*);
 
-void oxia_get_result_free(struct COxiaGetResult *result);
+/**
+ * Called once when a scan submitted with `oxia_client_range_scan_async`
+ * finishes.
+ */
+typedef void (*oxia_range_scan_callback)(oxia_error_code,
+                                         const char*,
+                                         const struct oxia_record_list*,
+                                         void*);
+
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
+/**
+ * Connects a client, blocking until it is ready to use.
+ *
+ * Fails fast — within the request timeout — when the cluster is
+ * unreachable, the namespace does not exist, or the first shard assignments
+ * cannot be obtained. On `OXIA_OK`, `*client` owns a client the caller
+ * destroys with [`oxia_client_free`]; on any error it is set to `NULL`.
+ *
+ * # Safety
+ *
+ * `options` must point at an initialized [`oxia_client_options`] whose
+ * slices are valid for the call. `client` must point at a writable pointer,
+ * and `error_message` must be `NULL` or point at one.
+ */
+oxia_error_code oxia_client_new(const struct oxia_client_options *options,
+                                struct oxia_client **client,
+                                char **error_message);
+
+/**
+ * Flushes the client's pending writes and shuts it down, blocking until it
+ * has finished.
+ *
+ * Idempotent, and the handle stays valid: a later operation on it fails
+ * with `OXIA_ERR_CLOSED`, and [`oxia_client_free`] still has to be called
+ * to release it. Closing explicitly is how a caller learns that the final
+ * flush succeeded — [`oxia_client_free`] closes too, but has no way to
+ * report a failure.
+ *
+ * # Safety
+ *
+ * `client` must be a client from [`oxia_client_new`] that has not been
+ * freed. `error_message` must be `NULL` or point at a writable `char *`.
+ */
+oxia_error_code oxia_client_close(struct oxia_client *client, char **error_message);
+
+/**
+ * Destroys a client, closing it first if it is still open.
+ *
+ * The only call that invalidates the handle, and safe to call after
+ * [`oxia_client_close`]. Does nothing when `client` is `NULL`. Waits for
+ * the operations in flight to settle and for every pending callback to run,
+ * so it must not be called from a callback.
+ *
+ * # Safety
+ *
+ * `client` must be `NULL`, or a client from [`oxia_client_new`] that has
+ * not been freed yet. No operation on it may be in progress on another
+ * thread.
+ */
+void oxia_client_free(struct oxia_client *client);
+
+/**
+ * Writes this library's version, as `MAJOR.MINOR.PATCH`, to `out`.
+ *
+ * Useful to a wrapper SDK that wants to report the core it is built on.
+ * The caller frees the string with [`oxia_string_free`].
+ *
+ * # Safety
+ *
+ * `out` must be `NULL` or point at a writable `char *`.
+ */
+void oxia_version_string(char **out);
+
+/**
+ * Whether retrying an operation that failed with `code` might succeed.
+ *
+ * Mirrors `OxiaError::is_retryable` in the Rust client and the retryable set
+ * of the reference Go client. The client already retries internally within
+ * each operation's timeout, so a retryable code means the whole operation
+ * may be worth submitting again.
+ *
+ * [`OXIA_ERR_GRPC`](oxia_error_code::OXIA_ERR_GRPC) answers `false`: whether
+ * a gRPC status is retryable depends on the status code, which only the
+ * message carries.
+ */
+bool oxia_error_is_retryable(oxia_error_code code);
+
+/**
+ * Frees a message an `error_message` out-parameter was set to.
+ *
+ * Does nothing when `message` is `NULL`, so it is safe to call
+ * unconditionally.
+ *
+ * # Safety
+ *
+ * `message` must have been set by this library and not yet been freed.
+ */
+void oxia_string_free(char *message);
+
+/**
+ * Writes a record, blocking until the server has acknowledged it.
+ *
+ * On `OXIA_OK`, `*result` owns a result the caller frees with
+ * `oxia_put_result_free`; on any error it is set to `NULL`.
+ *
+ * # Safety
+ *
+ * `client` must be an open client. `options` must point at an initialized
+ * options struct whose slices stay valid for the call. `result` must point
+ * at a writable pointer, and `error_message` must be `NULL` or point at
+ * one.
+ */
+oxia_error_code oxia_client_put(const struct oxia_client *client,
+                                const struct oxia_put_options *options,
+                                struct oxia_put_result **result,
+                                char **error_message);
+
+/**
+ * Submits a put and returns at once; `callback` runs when it finishes.
+ *
+ * Returns `OXIA_OK` once the operation has been accepted, which is when
+ * `callback` is guaranteed to run exactly once. Any other code means it was
+ * rejected and `callback` will not run.
+ *
+ * # Safety
+ *
+ * As `oxia_client_put`, except that the options are read before this
+ * returns and need not outlive it. `ctx` is passed back untouched and must
+ * be usable from the dispatcher thread.
+ */
+oxia_error_code oxia_client_put_async(const struct oxia_client *client,
+                                      const struct oxia_put_options *options,
+                                      void (*callback)(oxia_error_code,
+                                                       const char*,
+                                                       const struct oxia_put_result*,
+                                                       void*),
+                                      void *ctx,
+                                      char **error_message);
+
+/**
+ * Reads a record, blocking until the server has answered.
+ *
+ * A missing record is `OXIA_ERR_KEY_NOT_FOUND`, not an empty result. On
+ * `OXIA_OK`, `*result` owns a result the caller frees with
+ * `oxia_get_result_free`; on any error it is set to `NULL`.
+ *
+ * # Safety
+ *
+ * As `oxia_client_put`.
+ */
+oxia_error_code oxia_client_get(const struct oxia_client *client,
+                                const struct oxia_get_options *options,
+                                struct oxia_get_result **result,
+                                char **error_message);
+
+/**
+ * Submits a get and returns at once; `callback` runs when it finishes.
+ *
+ * # Safety
+ *
+ * As `oxia_client_put_async`.
+ */
+oxia_error_code oxia_client_get_async(const struct oxia_client *client,
+                                      const struct oxia_get_options *options,
+                                      void (*callback)(oxia_error_code,
+                                                       const char*,
+                                                       const struct oxia_get_result*,
+                                                       void*),
+                                      void *ctx,
+                                      char **error_message);
+
+/**
+ * Deletes a record, blocking until the server has acknowledged it.
+ *
+ * Deleting a key that does not exist is `OXIA_ERR_KEY_NOT_FOUND`.
+ *
+ * # Safety
+ *
+ * `client` must be an open client, `options` must point at an initialized
+ * options struct, and `error_message` must be `NULL` or point at a writable
+ * `char *`.
+ */
+oxia_error_code oxia_client_delete(const struct oxia_client *client,
+                                   const struct oxia_delete_options *options,
+                                   char **error_message);
+
+/**
+ * Submits a delete and returns at once; `callback` runs when it finishes.
+ *
+ * # Safety
+ *
+ * As `oxia_client_put_async`.
+ */
+oxia_error_code oxia_client_delete_async(const struct oxia_client *client,
+                                         const struct oxia_delete_options *options,
+                                         void (*callback)(oxia_error_code, const char*, void*),
+                                         void *ctx,
+                                         char **error_message);
+
+/**
+ * Deletes every record in a range, blocking until the server has
+ * acknowledged it. An empty range succeeds.
+ *
+ * # Safety
+ *
+ * As `oxia_client_delete`.
+ */
+oxia_error_code oxia_client_delete_range(const struct oxia_client *client,
+                                         const struct oxia_delete_range_options *options,
+                                         char **error_message);
+
+/**
+ * Submits a range delete and returns at once; `callback` runs when it
+ * finishes.
+ *
+ * # Safety
+ *
+ * As `oxia_client_put_async`.
+ */
+oxia_error_code oxia_client_delete_range_async(const struct oxia_client *client,
+                                               const struct oxia_delete_range_options *options,
+                                               void (*callback)(oxia_error_code, const char*, void*),
+                                               void *ctx,
+                                               char **error_message);
+
+/**
+ * Lists the keys in a range, merged across shards in the key order of the
+ * namespace. An empty range is `OXIA_OK` with a list of length 0.
+ *
+ * On `OXIA_OK`, `*result` owns a list the caller frees with
+ * `oxia_key_list_free`; on any error it is set to `NULL`.
+ *
+ * # Safety
+ *
+ * As `oxia_client_put`.
+ */
+oxia_error_code oxia_client_list(const struct oxia_client *client,
+                                 const struct oxia_range_options *options,
+                                 struct oxia_key_list **result,
+                                 char **error_message);
+
+/**
+ * Submits a list and returns at once; `callback` runs when it finishes.
+ *
+ * # Safety
+ *
+ * As `oxia_client_put_async`.
+ */
+oxia_error_code oxia_client_list_async(const struct oxia_client *client,
+                                       const struct oxia_range_options *options,
+                                       void (*callback)(oxia_error_code,
+                                                        const char*,
+                                                        const struct oxia_key_list*,
+                                                        void*),
+                                       void *ctx,
+                                       char **error_message);
+
+/**
+ * Reads every record in a range, merged across shards in the key order of
+ * the namespace.
+ *
+ * On `OXIA_OK`, `*result` owns a list the caller frees with
+ * `oxia_record_list_free`; on any error it is set to `NULL`.
+ *
+ * # Safety
+ *
+ * As `oxia_client_put`.
+ */
+oxia_error_code oxia_client_range_scan(const struct oxia_client *client,
+                                       const struct oxia_range_options *options,
+                                       struct oxia_record_list **result,
+                                       char **error_message);
+
+/**
+ * Submits a range scan and returns at once; `callback` runs when it
+ * finishes.
+ *
+ * # Safety
+ *
+ * As `oxia_client_put_async`.
+ */
+oxia_error_code oxia_client_range_scan_async(const struct oxia_client *client,
+                                             const struct oxia_range_options *options,
+                                             void (*callback)(oxia_error_code,
+                                                              const char*,
+                                                              const struct oxia_record_list*,
+                                                              void*),
+                                             void *ctx,
+                                             char **error_message);
+
+/**
+ * Frees a result from `oxia_client_put`. Does nothing when `result` is
+ * `NULL`.
+ *
+ * # Safety
+ *
+ * `result` must have come from `oxia_client_put` and must not have been
+ * freed already.
+ */
+void oxia_put_result_free(struct oxia_put_result *result);
+
+/**
+ * Frees a result from `oxia_client_get`. Does nothing when `result` is
+ * `NULL`.
+ *
+ * # Safety
+ *
+ * `result` must have come from `oxia_client_get` and must not have been
+ * freed already.
+ */
+void oxia_get_result_free(struct oxia_get_result *result);
+
+/**
+ * Frees a result from `oxia_client_list`. Does nothing when `result` is
+ * `NULL`.
+ *
+ * # Safety
+ *
+ * `result` must have come from `oxia_client_list` and must not have been
+ * freed already.
+ */
+void oxia_key_list_free(struct oxia_key_list *result);
+
+/**
+ * Frees a result from `oxia_client_range_scan`. Does nothing when `result`
+ * is `NULL`.
+ *
+ * # Safety
+ *
+ * `result` must have come from `oxia_client_range_scan` and must not have
+ * been freed already.
+ */
+void oxia_record_list_free(struct oxia_record_list *result);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif  // __cplusplus
 
 #endif  /* oxia_client_ffi_H */
