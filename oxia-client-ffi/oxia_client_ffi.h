@@ -115,6 +115,12 @@ enum oxia_error_code
    * The message carries the panic text; please report it.
    */
   OXIA_ERR_PANIC = 16,
+  /**
+   * A stream has no more items: it reached its end, it was closed, or the
+   * client was closed under it. Not an error — the expected way for a loop
+   * over a stream to stop.
+   */
+  OXIA_STREAM_END = 17,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -162,12 +168,84 @@ typedef int32_t oxia_comparison_type;
 #endif // __cplusplus
 
 /**
+ * What happened to a record.
+ */
+enum oxia_notification_type
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A record was created. `version_id` is set.
+   */
+  OXIA_NOTIFICATION_KEY_CREATED = 0,
+  /**
+   * A record was modified. `version_id` is set.
+   */
+  OXIA_NOTIFICATION_KEY_MODIFIED = 1,
+  /**
+   * A record was deleted.
+   */
+  OXIA_NOTIFICATION_KEY_DELETED = 2,
+  /**
+   * A range of records was deleted. `key` is the first key of the range
+   * and `key_range_last` the key it stops before.
+   */
+  OXIA_NOTIFICATION_KEY_RANGE_DELETED = 3,
+  /**
+   * The server's retention deleted notifications before this subscription
+   * could read them, so any record may have changed without a
+   * notification for it. No key is carried: a consumer keeping state from
+   * the notifications has to re-read it.
+   */
+  OXIA_NOTIFICATION_MISSED = 4,
+  /**
+   * A notification this version of the library does not recognize.
+   * Reported rather than dropped, so a consumer knows something happened.
+   */
+  OXIA_NOTIFICATION_UNKNOWN = 5,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum oxia_notification_type oxia_notification_type;
+#else
+typedef int32_t oxia_notification_type;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * An open client.
  *
  * Opaque to C: created by `oxia_client_new` and destroyed by
  * `oxia_client_free`. Operations may be submitted from any thread.
  */
 typedef struct oxia_client oxia_client;
+
+/**
+ * A stream of keys.
+ *
+ * Opaque to C. Produced by `oxia_client_sequence_updates`, which never ends
+ * on its own, and by `oxia_client_list_stream`, which ends when the range is
+ * exhausted. Finished with `oxia_key_stream_close` and released with
+ * `oxia_key_stream_free`.
+ */
+typedef struct oxia_key_stream oxia_key_stream;
+
+/**
+ * A subscription to every change in the namespace.
+ *
+ * Opaque to C: created by `oxia_client_notifications`, finished with
+ * `oxia_notifications_close` and released with `oxia_notifications_free`.
+ */
+typedef struct oxia_notifications oxia_notifications;
+
+/**
+ * A stream of records, from `oxia_client_range_scan_stream`.
+ *
+ * Opaque to C. Finished with `oxia_record_stream_close` and released with
+ * `oxia_record_stream_free`.
+ */
+typedef struct oxia_record_stream oxia_record_stream;
 
 /**
  * Bytes borrowed from the caller, as a pointer and a length.
@@ -276,6 +354,26 @@ typedef struct oxia_client_options {
 } oxia_client_options;
 
 /**
+ * Bytes owned by the caller, freed by the `_free` function of the result
+ * that carries them.
+ *
+ * `data` points at `len` bytes followed by a NUL terminator that is not
+ * counted in `len`, so a key or value without interior NUL bytes can be
+ * passed straight to `printf("%s")`. Use `len` whenever it may contain
+ * them. A `NULL` `data` means the field is absent.
+ */
+typedef struct oxia_bytes {
+  /**
+   * The first byte, or `NULL` when the field is absent.
+   */
+  uint8_t *data;
+  /**
+   * The number of bytes, excluding the NUL terminator.
+   */
+  uintptr_t len;
+} oxia_bytes;
+
+/**
  * An additional index a put writes the record under.
  */
 typedef struct oxia_secondary_index {
@@ -342,26 +440,6 @@ typedef struct oxia_put_options {
    */
   uintptr_t secondary_indexes_len;
 } oxia_put_options;
-
-/**
- * Bytes owned by the caller, freed by the `_free` function of the result
- * that carries them.
- *
- * `data` points at `len` bytes followed by a NUL terminator that is not
- * counted in `len`, so a key or value without interior NUL bytes can be
- * passed straight to `printf("%s")`. Use `len` whenever it may contain
- * them. A `NULL` `data` means the field is absent.
- */
-typedef struct oxia_bytes {
-  /**
-   * The first byte, or `NULL` when the field is absent.
-   */
-  uint8_t *data;
-  /**
-   * The number of bytes, excluding the NUL terminator.
-   */
-  uintptr_t len;
-} oxia_bytes;
 
 /**
  * The version metadata of a record.
@@ -584,6 +662,68 @@ typedef struct oxia_record_list {
 } oxia_record_list;
 
 /**
+ * How a notifications subscription behaves.
+ */
+typedef struct oxia_notifications_options {
+  /**
+   * How many notifications the client buffers before it applies
+   * backpressure to the server. 0 selects the client's default.
+   */
+  uintptr_t buffer_size;
+} oxia_notifications_options;
+
+/**
+ * One change to the database.
+ */
+typedef struct oxia_notification {
+  /**
+   * What happened.
+   */
+  oxia_notification_type type_;
+  /**
+   * The key it happened to; `data` is `NULL` for
+   * `OXIA_NOTIFICATION_MISSED`.
+   */
+  struct oxia_bytes key;
+  /**
+   * Whether `version_id` is set, which it is for a creation and a
+   * modification.
+   */
+  bool has_version_id;
+  /**
+   * The version the record now has.
+   */
+  int64_t version_id;
+  /**
+   * The end of the deleted range, for
+   * `OXIA_NOTIFICATION_KEY_RANGE_DELETED`; `data` is `NULL` otherwise, and
+   * also when the range runs to the end of the keyspace.
+   */
+  struct oxia_bytes key_range_last;
+} oxia_notification;
+
+/**
+ * Which sequence to follow.
+ */
+typedef struct oxia_sequence_updates_options {
+  /**
+   * The key whose sequence to follow, without the generated suffix.
+   * Required.
+   */
+  struct oxia_slice key;
+  /**
+   * The partition key the sequence is written under. Required: a sequence
+   * lives on one shard.
+   */
+  struct oxia_slice partition_key;
+  /**
+   * How many updates the client buffers before it applies backpressure to
+   * the server. 0 selects the client's default.
+   */
+  uintptr_t buffer_size;
+} oxia_sequence_updates_options;
+
+/**
  * Called once when a put submitted with `oxia_client_put_async` finishes.
  */
 typedef void (*oxia_put_callback)(oxia_error_code, const char*, const struct oxia_put_result*, void*);
@@ -704,6 +844,18 @@ bool oxia_error_is_retryable(oxia_error_code code);
  * `message` must have been set by this library and not yet been freed.
  */
 void oxia_string_free(char *message);
+
+/**
+ * Frees an owned buffer handed over on its own, rather than inside a result
+ * struct — as `oxia_key_stream_next` does. Does nothing when `data` is
+ * `NULL`, so it is safe to call unconditionally.
+ *
+ * # Safety
+ *
+ * `buffer` must have been handed over by this library and must not have been
+ * freed already.
+ */
+void oxia_bytes_free(struct oxia_bytes buffer);
 
 /**
  * Writes a record, blocking until the server has acknowledged it.
@@ -939,6 +1091,215 @@ void oxia_key_list_free(struct oxia_key_list *result);
  * been freed already.
  */
 void oxia_record_list_free(struct oxia_record_list *result);
+
+/**
+ * Subscribes to every change applied to the namespace.
+ *
+ * A subscription starts from the moment it is opened; changes made before
+ * are not replayed. On `OXIA_OK`, `*subscription` owns a handle the caller
+ * releases with `oxia_notifications_free`; on any error it is set to `NULL`.
+ *
+ * # Safety
+ *
+ * `client` must be an open client, `options` must point at an initialized
+ * options struct, `subscription` must point at a writable pointer, and
+ * `error_message` must be `NULL` or point at one.
+ */
+oxia_error_code oxia_client_notifications(const struct oxia_client *client,
+                                          const struct oxia_notifications_options *options,
+                                          struct oxia_notifications **subscription,
+                                          char **error_message);
+
+/**
+ * Waits for the next notification.
+ *
+ * Returns `OXIA_OK` with `*notification` set, which the caller frees with
+ * `oxia_notification_free`; `OXIA_ERR_TIMEOUT` when `timeout_ms` passed with
+ * nothing to report, which is not an error and leaves the subscription
+ * usable; or `OXIA_STREAM_END` once the subscription is finished. A
+ * `timeout_ms` of 0 waits indefinitely.
+ *
+ * One thread at a time per subscription: a second caller blocks until the
+ * first returns.
+ *
+ * # Safety
+ *
+ * `subscription` must be a handle that has not been freed, `notification`
+ * must point at a writable pointer, and `error_message` must be `NULL` or
+ * point at one.
+ */
+oxia_error_code oxia_notifications_next(struct oxia_notifications *subscription,
+                                        uint64_t timeout_ms,
+                                        struct oxia_notification **notification,
+                                        char **error_message);
+
+/**
+ * Stops a subscription.
+ *
+ * Idempotent, safe to call from any thread, and safe to call while another
+ * thread is blocked in `oxia_notifications_next` — that call returns
+ * `OXIA_STREAM_END`. The handle stays valid and must still be released with
+ * `oxia_notifications_free`.
+ *
+ * # Safety
+ *
+ * `subscription` must be `NULL`, or a handle that has not been freed.
+ */
+void oxia_notifications_close(struct oxia_notifications *subscription);
+
+/**
+ * Releases a subscription, stopping it first if it is still running.
+ *
+ * Does nothing when `subscription` is `NULL`. No call on the handle may be
+ * in progress on another thread: use `oxia_notifications_close` to end a
+ * blocked `oxia_notifications_next` first, and free the handle once that
+ * call has returned.
+ *
+ * # Safety
+ *
+ * `subscription` must be `NULL`, or a handle that has not been freed.
+ */
+void oxia_notifications_free(struct oxia_notifications *subscription);
+
+/**
+ * Frees a notification. Does nothing when `notification` is `NULL`.
+ *
+ * # Safety
+ *
+ * `notification` must have come from `oxia_notifications_next` and must not
+ * have been freed already.
+ */
+void oxia_notification_free(struct oxia_notification *notification);
+
+/**
+ * Follows the highest key of a sequence as the server appends to it.
+ *
+ * On `OXIA_OK`, `*stream` owns a handle the caller releases with
+ * `oxia_key_stream_free`; on any error it is set to `NULL`.
+ *
+ * # Safety
+ *
+ * As `oxia_client_notifications`.
+ */
+oxia_error_code oxia_client_sequence_updates(const struct oxia_client *client,
+                                             const struct oxia_sequence_updates_options *options,
+                                             struct oxia_key_stream **stream,
+                                             char **error_message);
+
+/**
+ * Lists the keys in a range as a stream, instead of collecting them like
+ * `oxia_client_list`.
+ *
+ * Keys arrive in the key order of the namespace, merged across shards. Use
+ * this for a range too large to hold in memory at once; it costs a round
+ * trip to the client's thread per key, so `oxia_client_list` is faster for a
+ * range that fits.
+ *
+ * # Safety
+ *
+ * As `oxia_client_notifications`.
+ */
+oxia_error_code oxia_client_list_stream(const struct oxia_client *client,
+                                        const struct oxia_range_options *options,
+                                        struct oxia_key_stream **stream,
+                                        char **error_message);
+
+/**
+ * Waits for the next key.
+ *
+ * Returns `OXIA_OK` with `*key` set, which the caller frees with
+ * `oxia_bytes_free`; `OXIA_ERR_TIMEOUT` when `timeout_ms` passed with
+ * nothing to report; or `OXIA_STREAM_END` once the stream is finished. A
+ * `timeout_ms` of 0 waits indefinitely.
+ *
+ * One thread at a time per stream.
+ *
+ * # Safety
+ *
+ * `stream` must be a handle that has not been freed, `key` must point at a
+ * writable `oxia_bytes`, and `error_message` must be `NULL` or point at a
+ * writable `char *`.
+ */
+oxia_error_code oxia_key_stream_next(struct oxia_key_stream *stream,
+                                     uint64_t timeout_ms,
+                                     struct oxia_bytes *key,
+                                     char **error_message);
+
+/**
+ * Stops a key stream. As `oxia_notifications_close`.
+ *
+ * # Safety
+ *
+ * `stream` must be `NULL`, or a handle that has not been freed.
+ */
+void oxia_key_stream_close(struct oxia_key_stream *stream);
+
+/**
+ * Releases a key stream. As `oxia_notifications_free`.
+ *
+ * # Safety
+ *
+ * `stream` must be `NULL`, or a handle that has not been freed, with no call
+ * on it in progress on another thread.
+ */
+void oxia_key_stream_free(struct oxia_key_stream *stream);
+
+/**
+ * Reads every record in a range as a stream, instead of collecting them
+ * like `oxia_client_range_scan`.
+ *
+ * Records arrive in the key order of the namespace, merged across shards.
+ * Use this for a range too large to hold in memory at once; it costs a round
+ * trip to the client's thread per record.
+ *
+ * # Safety
+ *
+ * As `oxia_client_notifications`.
+ */
+oxia_error_code oxia_client_range_scan_stream(const struct oxia_client *client,
+                                              const struct oxia_range_options *options,
+                                              struct oxia_record_stream **stream,
+                                              char **error_message);
+
+/**
+ * Waits for the next record.
+ *
+ * Returns `OXIA_OK` with `*record` set, which the caller frees with
+ * `oxia_get_result_free`; `OXIA_ERR_TIMEOUT` when `timeout_ms` passed with
+ * nothing to report; or `OXIA_STREAM_END` once the stream is finished. A
+ * `timeout_ms` of 0 waits indefinitely.
+ *
+ * One thread at a time per stream.
+ *
+ * # Safety
+ *
+ * `stream` must be a handle that has not been freed, `record` must point at
+ * a writable pointer, and `error_message` must be `NULL` or point at a
+ * writable `char *`.
+ */
+oxia_error_code oxia_record_stream_next(struct oxia_record_stream *stream,
+                                        uint64_t timeout_ms,
+                                        struct oxia_get_result **record,
+                                        char **error_message);
+
+/**
+ * Stops a record stream. As `oxia_notifications_close`.
+ *
+ * # Safety
+ *
+ * `stream` must be `NULL`, or a handle that has not been freed.
+ */
+void oxia_record_stream_close(struct oxia_record_stream *stream);
+
+/**
+ * Releases a record stream. As `oxia_notifications_free`.
+ *
+ * # Safety
+ *
+ * `stream` must be `NULL`, or a handle that has not been freed, with no call
+ * on it in progress on another thread.
+ */
+void oxia_record_stream_free(struct oxia_record_stream *stream);
 
 #ifdef __cplusplus
 }  // extern "C"

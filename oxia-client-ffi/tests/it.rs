@@ -173,8 +173,9 @@ fn get(client: *const oxia_client, key: &[u8]) -> Result<*mut oxia_get_result, o
 #[test]
 fn a_non_utf8_key_is_rejected_instead_of_aborting() {
     let client = client();
+    let invalid_key = [b'k', 0xff, 0xfe];
     let mut options: oxia_put_options = zeroed();
-    options.key = slice_of(&[b'k', 0xff, 0xfe]);
+    options.key = slice_of(&invalid_key);
     options.value = slice_of(b"x");
     let mut result: *mut oxia_put_result = ptr::null_mut();
     let mut message: *mut c_char = ptr::null_mut();
@@ -990,5 +991,435 @@ fn one_client_serves_many_threads_at_once() {
     for thread in threads {
         thread.join().expect("a worker thread failed");
     }
+    unsafe { oxia_client_free(client) };
+}
+
+// ===========================================================================
+// Subscriptions and streaming reads
+//
+// Notifications are namespace-wide, and these tests share one server, so a
+// subscription here also sees what every other test is writing. Assertions
+// about notifications therefore filter for the key under test rather than
+// looking at whatever arrives first. Where a test needs a genuinely idle
+// stream — to check a timeout, or a blocked consumer — it uses
+// `sequence_updates`, which only reports the one sequence it was opened on.
+//
+// `OXIA_NOTIFICATION_MISSED` is not covered here: the client only synthesizes
+// it when a resumed subscription finds the server's retention has already
+// dropped notifications, which oxia-client reproduces with its in-process
+// mock server. That module is private to that crate, so it is out of reach
+// from here; the conversion is unit-tested in `src/streams.rs` instead.
+// ===========================================================================
+
+/// Opens a notifications subscription with the client's defaults.
+fn notifications(client: *const oxia_client) -> *mut oxia_notifications {
+    let options: oxia_notifications_options = zeroed();
+    let mut subscription: *mut oxia_notifications = ptr::null_mut();
+    let mut message: *mut c_char = ptr::null_mut();
+    let code =
+        unsafe { oxia_client_notifications(client, &options, &mut subscription, &mut message) };
+    assert_eq!(
+        code,
+        oxia_error_code::OXIA_OK,
+        "subscribe failed: {}",
+        unsafe { take_message(message) }
+    );
+    assert!(!subscription.is_null());
+    subscription
+}
+
+/// Reads notifications until one matches, or gives up after `within`.
+///
+/// Returns the type and the key, which is all these tests assert on.
+fn await_notification(
+    subscription: *mut oxia_notifications,
+    within: Duration,
+    matches: impl Fn(oxia_notification_type, &[u8]) -> bool,
+) -> (oxia_notification_type, Vec<u8>) {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        let mut notification: *mut oxia_notification = ptr::null_mut();
+        let mut message: *mut c_char = ptr::null_mut();
+        let code =
+            unsafe { oxia_notifications_next(subscription, 250, &mut notification, &mut message) };
+        match code {
+            oxia_error_code::OXIA_OK => {
+                let type_ = unsafe { (*notification).type_ };
+                let key = unsafe { owned((*notification).key) }.unwrap_or_default();
+                unsafe { oxia_notification_free(notification) };
+                if matches(type_, &key) {
+                    return (type_, key);
+                }
+            }
+            oxia_error_code::OXIA_ERR_TIMEOUT => {}
+            other => panic!(
+                "the subscription stopped with code {other:?}: {}",
+                unsafe { message_of(message) }.unwrap_or_default()
+            ),
+        }
+    }
+    panic!("no matching notification within {within:?}");
+}
+
+/// Drains a key stream to its end.
+fn drain_keys(stream: *mut oxia_key_stream) -> Vec<Vec<u8>> {
+    let mut keys = Vec::new();
+    loop {
+        let mut key = oxia_bytes::none();
+        let mut message: *mut c_char = ptr::null_mut();
+        match unsafe { oxia_key_stream_next(stream, 10_000, &mut key, &mut message) } {
+            oxia_error_code::OXIA_OK => {
+                keys.push(unsafe { owned(key) }.expect("a key"));
+                unsafe { oxia_bytes_free(key) };
+            }
+            oxia_error_code::OXIA_STREAM_END => return keys,
+            other => panic!(
+                "stream failed with {other:?}: {}",
+                unsafe { message_of(message) }.unwrap_or_default()
+            ),
+        }
+    }
+}
+
+#[test]
+fn a_subscription_reports_a_create_a_modify_and_a_delete() {
+    let client = client();
+    let subscription = notifications(client);
+    let key = b"notify/record";
+
+    put(client, key, b"first");
+    let (type_, _) = await_notification(subscription, Duration::from_secs(20), |type_, seen| {
+        seen == key && type_ == oxia_notification_type::OXIA_NOTIFICATION_KEY_CREATED
+    });
+    assert_eq!(type_, oxia_notification_type::OXIA_NOTIFICATION_KEY_CREATED);
+
+    put(client, key, b"second");
+    await_notification(subscription, Duration::from_secs(20), |type_, seen| {
+        seen == key && type_ == oxia_notification_type::OXIA_NOTIFICATION_KEY_MODIFIED
+    });
+
+    let mut delete: oxia_delete_options = zeroed();
+    delete.key = slice_of(key);
+    assert_eq!(
+        unsafe { oxia_client_delete(client, &delete, ptr::null_mut()) },
+        oxia_error_code::OXIA_OK
+    );
+    await_notification(subscription, Duration::from_secs(20), |type_, seen| {
+        seen == key && type_ == oxia_notification_type::OXIA_NOTIFICATION_KEY_DELETED
+    });
+
+    unsafe { oxia_notifications_close(subscription) };
+    unsafe { oxia_notifications_free(subscription) };
+    unsafe { oxia_client_free(client) };
+}
+
+#[test]
+fn a_created_record_notification_carries_its_version() {
+    let client = client();
+    let subscription = notifications(client);
+    let key = b"notify/versioned";
+    put(client, key, b"v");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "no notification");
+        let mut notification: *mut oxia_notification = ptr::null_mut();
+        let code = unsafe {
+            oxia_notifications_next(subscription, 250, &mut notification, ptr::null_mut())
+        };
+        if code == oxia_error_code::OXIA_ERR_TIMEOUT {
+            continue;
+        }
+        assert_eq!(code, oxia_error_code::OXIA_OK);
+        let seen = unsafe { owned((*notification).key) }.unwrap_or_default();
+        let is_mine = seen == key
+            && unsafe { (*notification).type_ }
+                == oxia_notification_type::OXIA_NOTIFICATION_KEY_CREATED;
+        if is_mine {
+            assert!(unsafe { (*notification).has_version_id });
+            assert!(unsafe { (*notification).version_id } >= 0);
+            assert!(unsafe { (*notification).key_range_last.data.is_null() });
+            unsafe { oxia_notification_free(notification) };
+            break;
+        }
+        unsafe { oxia_notification_free(notification) };
+    }
+
+    unsafe { oxia_notifications_free(subscription) };
+    unsafe { oxia_client_free(client) };
+}
+
+/// Opens a sequence-updates stream, which is idle until this test writes to
+/// its own sequence.
+fn sequence_updates(
+    client: *const oxia_client,
+    key: &[u8],
+    partition_key: &[u8],
+) -> *mut oxia_key_stream {
+    let mut options: oxia_sequence_updates_options = zeroed();
+    options.key = slice_of(key);
+    options.partition_key = slice_of(partition_key);
+    let mut stream: *mut oxia_key_stream = ptr::null_mut();
+    let mut message: *mut c_char = ptr::null_mut();
+    let code = unsafe { oxia_client_sequence_updates(client, &options, &mut stream, &mut message) };
+    assert_eq!(
+        code,
+        oxia_error_code::OXIA_OK,
+        "subscribe failed: {}",
+        unsafe { take_message(message) }
+    );
+    stream
+}
+
+#[test]
+fn a_sequence_update_reports_the_generated_key() {
+    let client = client();
+    let key = b"seq/updates";
+    let stream = sequence_updates(client, key, key);
+
+    let deltas: [u64; 1] = [1];
+    let mut options: oxia_put_options = zeroed();
+    options.key = slice_of(key);
+    options.value = slice_of(b"entry");
+    options.partition_key = slice_of(key);
+    options.sequence_key_deltas = deltas.as_ptr();
+    options.sequence_key_deltas_len = deltas.len();
+    let mut result: *mut oxia_put_result = ptr::null_mut();
+    let mut message: *mut c_char = ptr::null_mut();
+    let code = unsafe { oxia_client_put(client, &options, &mut result, &mut message) };
+    assert_eq!(code, oxia_error_code::OXIA_OK, "{}", unsafe {
+        take_message(message)
+    });
+    let written = unsafe { owned((*result).key) }.unwrap();
+    unsafe { oxia_put_result_free(result) };
+
+    let mut updated = oxia_bytes::none();
+    let mut message: *mut c_char = ptr::null_mut();
+    let code = unsafe { oxia_key_stream_next(stream, 20_000, &mut updated, &mut message) };
+    assert_eq!(code, oxia_error_code::OXIA_OK, "{}", unsafe {
+        take_message(message)
+    });
+    assert_eq!(unsafe { owned(updated) }.unwrap(), written);
+    unsafe { oxia_bytes_free(updated) };
+
+    unsafe { oxia_key_stream_close(stream) };
+    unsafe { oxia_key_stream_free(stream) };
+    unsafe { oxia_client_free(client) };
+}
+
+/// The property the pull protocol is built around: a `next` that times out
+/// leaves its request outstanding, so the item it was waiting for reaches the
+/// following call rather than being dropped.
+#[test]
+fn a_timed_out_next_does_not_lose_the_item_that_follows() {
+    let client = client();
+    let key = b"seq/timeout";
+    let stream = sequence_updates(client, key, key);
+
+    // Nothing has been written to this sequence, so these find nothing.
+    for _ in 0..3 {
+        let mut nothing = oxia_bytes::none();
+        assert_eq!(
+            unsafe { oxia_key_stream_next(stream, 50, &mut nothing, ptr::null_mut()) },
+            oxia_error_code::OXIA_ERR_TIMEOUT
+        );
+        assert!(nothing.data.is_null());
+    }
+
+    let deltas: [u64; 1] = [1];
+    let mut options: oxia_put_options = zeroed();
+    options.key = slice_of(key);
+    options.value = slice_of(b"entry");
+    options.partition_key = slice_of(key);
+    options.sequence_key_deltas = deltas.as_ptr();
+    options.sequence_key_deltas_len = deltas.len();
+    let mut result: *mut oxia_put_result = ptr::null_mut();
+    assert_eq!(
+        unsafe { oxia_client_put(client, &options, &mut result, ptr::null_mut()) },
+        oxia_error_code::OXIA_OK
+    );
+    unsafe { oxia_put_result_free(result) };
+
+    // The update still arrives, on the request the timed-out calls left open.
+    let mut updated = oxia_bytes::none();
+    assert_eq!(
+        unsafe { oxia_key_stream_next(stream, 20_000, &mut updated, ptr::null_mut()) },
+        oxia_error_code::OXIA_OK
+    );
+    assert!(!unsafe { owned(updated) }.unwrap().is_empty());
+    unsafe { oxia_bytes_free(updated) };
+
+    unsafe { oxia_key_stream_free(stream) };
+    unsafe { oxia_client_free(client) };
+}
+
+#[test]
+fn closing_a_stream_wakes_a_consumer_blocked_in_next() {
+    let client = client();
+    let key = b"seq/blocked";
+    let stream = sequence_updates(client, key, key);
+
+    // The consumer waits with no timeout, so only the close can free it.
+    let shared = stream as usize;
+    let consumer = std::thread::spawn(move || {
+        let stream = shared as *mut oxia_key_stream;
+        let mut nothing = oxia_bytes::none();
+        let code = unsafe { oxia_key_stream_next(stream, 0, &mut nothing, ptr::null_mut()) };
+        assert!(nothing.data.is_null());
+        code
+    });
+
+    std::thread::sleep(Duration::from_millis(300));
+    unsafe { oxia_key_stream_close(stream) };
+    let code = consumer.join().expect("the consumer thread panicked");
+    assert_eq!(code, oxia_error_code::OXIA_STREAM_END);
+
+    // Closing again is a no-op, and the handle is still ours to free.
+    unsafe { oxia_key_stream_close(stream) };
+    unsafe { oxia_key_stream_free(stream) };
+    unsafe { oxia_client_free(client) };
+}
+
+#[test]
+fn freeing_the_client_ends_an_open_stream() {
+    let client = client();
+    let key = b"seq/orphaned";
+    let stream = sequence_updates(client, key, key);
+
+    unsafe { oxia_client_free(client) };
+
+    let mut nothing = oxia_bytes::none();
+    assert_eq!(
+        unsafe { oxia_key_stream_next(stream, 5_000, &mut nothing, ptr::null_mut()) },
+        oxia_error_code::OXIA_STREAM_END
+    );
+    unsafe { oxia_key_stream_free(stream) };
+}
+
+#[test]
+fn a_streamed_list_yields_every_key_in_order_then_ends() {
+    let client = client();
+    for key in [b"liststream/a", b"liststream/b", b"liststream/c"] {
+        put(client, key, b"v");
+    }
+
+    let mut options: oxia_range_options = zeroed();
+    options.min_key_inclusive = slice_of(b"liststream/");
+    options.max_key_exclusive = slice_of(b"liststream/~");
+    let mut stream: *mut oxia_key_stream = ptr::null_mut();
+    let mut message: *mut c_char = ptr::null_mut();
+    let code = unsafe { oxia_client_list_stream(client, &options, &mut stream, &mut message) };
+    assert_eq!(code, oxia_error_code::OXIA_OK, "{}", unsafe {
+        take_message(message)
+    });
+
+    let keys = drain_keys(stream);
+    assert_eq!(
+        keys,
+        vec![
+            b"liststream/a".to_vec(),
+            b"liststream/b".to_vec(),
+            b"liststream/c".to_vec()
+        ]
+    );
+    // Once ended, it stays ended.
+    let mut nothing = oxia_bytes::none();
+    assert_eq!(
+        unsafe { oxia_key_stream_next(stream, 1_000, &mut nothing, ptr::null_mut()) },
+        oxia_error_code::OXIA_STREAM_END
+    );
+    unsafe { oxia_key_stream_free(stream) };
+    unsafe { oxia_client_free(client) };
+}
+
+#[test]
+fn a_streamed_list_over_an_empty_range_ends_at_once() {
+    let client = client();
+    let mut options: oxia_range_options = zeroed();
+    options.min_key_inclusive = slice_of(b"emptystream/");
+    options.max_key_exclusive = slice_of(b"emptystream/~");
+    let mut stream: *mut oxia_key_stream = ptr::null_mut();
+    assert_eq!(
+        unsafe { oxia_client_list_stream(client, &options, &mut stream, ptr::null_mut()) },
+        oxia_error_code::OXIA_OK
+    );
+    assert!(drain_keys(stream).is_empty());
+    unsafe { oxia_key_stream_free(stream) };
+    unsafe { oxia_client_free(client) };
+}
+
+#[test]
+fn a_streamed_range_scan_yields_whole_records_then_ends() {
+    let client = client();
+    put(client, b"scanstream/a", b"1");
+    put(client, b"scanstream/b", b"2");
+
+    let mut options: oxia_range_options = zeroed();
+    options.min_key_inclusive = slice_of(b"scanstream/");
+    options.max_key_exclusive = slice_of(b"scanstream/~");
+    let mut stream: *mut oxia_record_stream = ptr::null_mut();
+    let mut message: *mut c_char = ptr::null_mut();
+    let code =
+        unsafe { oxia_client_range_scan_stream(client, &options, &mut stream, &mut message) };
+    assert_eq!(code, oxia_error_code::OXIA_OK, "{}", unsafe {
+        take_message(message)
+    });
+
+    let mut seen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    loop {
+        let mut record: *mut oxia_get_result = ptr::null_mut();
+        match unsafe { oxia_record_stream_next(stream, 10_000, &mut record, ptr::null_mut()) } {
+            oxia_error_code::OXIA_OK => {
+                assert!(unsafe { (*record).has_value });
+                assert!(unsafe { (*record).version.version_id } >= 0);
+                seen.push((
+                    unsafe { owned((*record).key) }.unwrap(),
+                    unsafe { owned((*record).value) }.unwrap(),
+                ));
+                unsafe { oxia_get_result_free(record) };
+            }
+            oxia_error_code::OXIA_STREAM_END => break,
+            other => panic!("scan stream failed with {other:?}"),
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (b"scanstream/a".to_vec(), b"1".to_vec()),
+            (b"scanstream/b".to_vec(), b"2".to_vec()),
+        ]
+    );
+
+    unsafe { oxia_record_stream_close(stream) };
+    unsafe { oxia_record_stream_free(stream) };
+    unsafe { oxia_client_free(client) };
+}
+
+#[test]
+fn a_stream_opened_with_bad_options_reports_why() {
+    let client = client();
+    // A sequence stream needs both a key and a partition key.
+    let mut options: oxia_sequence_updates_options = zeroed();
+    options.key = slice_of(b"seq/bad");
+    let mut stream: *mut oxia_key_stream = 0xdead_beef_usize as *mut oxia_key_stream;
+    let mut message: *mut c_char = ptr::null_mut();
+    let code = unsafe { oxia_client_sequence_updates(client, &options, &mut stream, &mut message) };
+    assert_eq!(code, oxia_error_code::OXIA_ERR_INVALID_ARGUMENT);
+    assert!(stream.is_null(), "a failed open must clear the handle");
+    assert!(unsafe { take_message(message) }.contains("partition_key"));
+
+    // And a non-UTF-8 range bound is rejected, not fatal.
+    let invalid_bound = [b'a', 0xff];
+    let mut range: oxia_range_options = zeroed();
+    range.min_key_inclusive = slice_of(&invalid_bound);
+    range.max_key_exclusive = slice_of(b"b");
+    let mut keys: *mut oxia_key_stream = ptr::null_mut();
+    let mut message: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { oxia_client_list_stream(client, &range, &mut keys, &mut message) },
+        oxia_error_code::OXIA_ERR_INVALID_ARGUMENT
+    );
+    assert!(unsafe { take_message(message) }.contains("UTF-8"));
+
     unsafe { oxia_client_free(client) };
 }

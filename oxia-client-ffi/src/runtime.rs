@@ -25,15 +25,16 @@
 //! that made a blocking Oxia call from it would deadlock. On the dispatcher
 //! both are merely slow.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as sync_mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::future::LocalBoxFuture;
 use oxia::{OxiaClient as NativeOxiaClient, OxiaClientBuilder, OxiaError};
+use tokio::sync::watch;
 
 use crate::error::panic_text;
 
@@ -42,6 +43,53 @@ type Job = Box<dyn FnOnce(NativeOxiaClient) -> LocalBoxFuture<'static, ()> + Sen
 
 /// A callback to invoke on the dispatcher thread.
 type Completion = Box<dyn FnOnce() + Send>;
+
+/// Counts the stream tasks still running on the client's thread.
+///
+/// Teardown has to wait for them. `oxia-client`'s own `close` does not return
+/// while a subscription handle is alive, and a stream task holds one for as
+/// long as it runs, so closing the client before they have finished
+/// deadlocks. (That is a bug in the native client — `close` is documented to
+/// stop subscriptions — and this count is what keeps it from reaching a C
+/// caller.)
+#[derive(Default)]
+pub(crate) struct LiveStreams {
+    count: Mutex<usize>,
+    drained: Condvar,
+}
+
+impl LiveStreams {
+    fn opened(&self) {
+        *self.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    }
+
+    /// Called by a stream task as it finishes, on the client's thread.
+    pub(crate) fn finished(&self) {
+        let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.drained.notify_all();
+        }
+    }
+
+    /// Waits for every stream task to finish, giving up after `limit` so that
+    /// a stuck task cannot wedge a caller's teardown for good.
+    fn wait_until_drained(&self, limit: std::time::Duration) {
+        let deadline = std::time::Instant::now() + limit;
+        let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        while *count > 0 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let (next, _) = self
+                .drained
+                .wait_timeout(count, left)
+                .unwrap_or_else(|e| e.into_inner());
+            count = next;
+        }
+    }
+}
 
 /// The closure that hands an operation's outcome to a caller's callback.
 type Deliver<T> = Box<dyn FnOnce(Result<T, OxiaError>) + Send>;
@@ -54,6 +102,15 @@ pub struct oxia_client {
     jobs: mpsc::UnboundedSender<Job>,
     /// `None` only while [`Drop`] is draining the dispatcher.
     completions: Option<sync_mpsc::Sender<Completion>>,
+    /// Set to true to tell the long-lived stream tasks to stop.
+    ///
+    /// A one-shot operation's task always finishes on its own, but a stream's
+    /// task waits for the next request from its handle, which may never come:
+    /// the handle can outlive the client. compio's `block_on` does not return
+    /// until every task it spawned has finished, so without this the client's
+    /// thread would never stop and [`Drop`] would wait for it forever.
+    shutdown: watch::Sender<bool>,
+    live_streams: Arc<LiveStreams>,
     worker: Option<JoinHandle<()>>,
     dispatcher: Option<JoinHandle<()>>,
 }
@@ -111,6 +168,7 @@ impl oxia_client {
             })
             .map_err(|err| OxiaError::Disconnected(format!("cannot start a thread: {err}")))?;
 
+        let (shutdown, _) = watch::channel(false);
         let (ready_tx, ready_rx) = sync_mpsc::channel();
         let (jobs, mut job_rx) = mpsc::unbounded::<Job>();
         let worker = std::thread::Builder::new()
@@ -145,6 +203,8 @@ impl oxia_client {
             Ok(Ok(())) => Ok(oxia_client {
                 jobs,
                 completions: Some(completions),
+                shutdown,
+                live_streams: Arc::new(LiveStreams::default()),
                 worker: Some(worker),
                 dispatcher: Some(dispatcher),
             }),
@@ -226,11 +286,68 @@ impl oxia_client {
     pub(crate) fn close(&self) -> Result<(), OxiaError> {
         self.run(|client| async move { client.close().await })
     }
+
+    /// Opens a subscription or a streaming read and returns a handle a foreign
+    /// thread can pull from.
+    ///
+    /// `open` runs on the client's thread and the stream it returns stays
+    /// there — none of the native stream types is `Send`. This blocks until
+    /// the stream is open, or until opening it fails, and then leaves a task
+    /// behind that serves one item per request from the handle. See
+    /// [`crate::streams`] for the protocol.
+    pub(crate) fn open_stream<T, F, Fut, S>(
+        &self,
+        open: F,
+    ) -> Result<crate::streams::StreamHandle<T>, OxiaError>
+    where
+        T: Send + 'static,
+        F: FnOnce(NativeOxiaClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<S, OxiaError>> + 'static,
+        S: futures::Stream<Item = Result<T, OxiaError>> + 'static,
+    {
+        let (ready_tx, ready_rx) = sync_mpsc::channel::<Result<(), OxiaError>>();
+        let (requests, request_rx) = mpsc::unbounded::<()>();
+        let (items_tx, items) = sync_mpsc::channel::<crate::streams::StreamItem<T>>();
+        let (cancel, cancelled) = futures::channel::oneshot::channel::<()>();
+        let shutdown = self.shutdown.subscribe();
+        let live = Arc::clone(&self.live_streams);
+        live.opened();
+
+        let job: Job = Box::new(move |client| {
+            Box::pin(crate::streams::serve(
+                open(client),
+                ready_tx,
+                request_rx,
+                items_tx,
+                cancelled,
+                shutdown,
+                live,
+            ))
+        });
+        if self.jobs.unbounded_send(job).is_err() {
+            return Err(OxiaError::Closed);
+        }
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(crate::streams::StreamHandle::new(requests, items, cancel)),
+            Ok(Err(err)) => Err(err),
+            // The client's thread stopped before it could answer.
+            Err(_) => Err(OxiaError::Closed),
+        }
+    }
 }
 
 impl Drop for oxia_client {
     fn drop(&mut self) {
-        // Close first, so the batchers flush and the operations in flight
+        // Tell the stream tasks to stop before anything waits on the
+        // client's thread: each of them is parked on its handle's next
+        // request, and a handle may outlive this client.
+        let _ = self.shutdown.send(true);
+        // Then wait for them to actually finish and let go of their
+        // subscription handles, because the close below would otherwise
+        // deadlock against one (see `LiveStreams`).
+        self.live_streams
+            .wait_until_drained(std::time::Duration::from_secs(10));
+        // Close next, so the batchers flush and the operations in flight
         // resolve instead of being dropped mid-await.
         let _ = self.close();
         // Then stop the client's thread. A job still queued, or a task still

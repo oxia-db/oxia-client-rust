@@ -73,6 +73,10 @@ pub enum oxia_error_code {
     /// being allowed to unwind into the caller, which would end the process.
     /// The message carries the panic text; please report it.
     OXIA_ERR_PANIC = 16,
+    /// A stream has no more items: it reached its end, it was closed, or the
+    /// client was closed under it. Not an error — the expected way for a loop
+    /// over a stream to stop.
+    OXIA_STREAM_END = 17,
 }
 
 impl From<&OxiaError> for oxia_error_code {

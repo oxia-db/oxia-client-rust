@@ -39,6 +39,9 @@ tls = ["oxia-client/tls"]
 oxia-client = { workspace = true }
 compio = { workspace = true }
 futures = { workspace = true }
+# `select!` and nothing else: the streams module races a native stream against
+# its cancellation. Runtime-agnostic, like the client's own use of tokio.
+tokio = { workspace = true }
 
 [dev-dependencies]
 # The error-mapping test names the gRPC status codes.
