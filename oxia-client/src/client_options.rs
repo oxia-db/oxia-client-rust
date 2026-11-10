@@ -28,6 +28,9 @@ pub struct OxiaClientOptions {
     pub batch_max_size: u32,
     /// Maximum number of requests per batch (default: 1000).
     pub max_requests_per_batch: u32,
+    /// Maximum bytes held for the writes in flight, before new writes wait
+    /// (default: 64MiB; `0` disables the limit).
+    pub max_in_flight_bytes: u64,
     /// Write batches in flight per shard before the open batch waits
     /// (default: 4).
     pub max_write_batches_in_flight: u32,
@@ -55,6 +58,7 @@ impl Default for OxiaClientOptions {
             identity: Uuid::new_v4().to_string(),
             batch_max_size: 128 * 1024,
             max_requests_per_batch: 1000,
+            max_in_flight_bytes: 64 * 1024 * 1024,
             max_write_batches_in_flight: 4,
             max_read_batches_in_flight: 4,
             session_timeout: Duration::from_secs(15),

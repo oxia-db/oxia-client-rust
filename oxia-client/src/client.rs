@@ -21,6 +21,7 @@ use crate::client_builder::OxiaClientBuilder;
 use crate::client_options::OxiaClientOptions;
 use crate::errors::OxiaError;
 use crate::key::KeyOrder;
+use crate::memory_limit::MemoryLimiter;
 use crate::metrics::Metrics;
 use crate::notification_manager::NotificationManager;
 use crate::operations::Pending;
@@ -61,6 +62,8 @@ pub(crate) struct Inner {
     sequence_managers: RefCell<HashMap<u64, SequenceUpdatesManager>>,
     next_subscription_id: Cell<u64>,
     write_manager: Rc<WriteManager>,
+    /// The byte budget for the writes in flight, shared by every shard.
+    memory_limiter: Rc<MemoryLimiter>,
     read_batchers: RefCell<HashMap<i64, Rc<ReadBatcher>>>,
     closed: Cell<bool>,
 }
@@ -218,6 +221,8 @@ impl OxiaClient {
             shard_manager.clone(),
             provider_manager.clone(),
         );
+        let memory_limiter =
+            MemoryLimiter::new(usize::try_from(options.max_in_flight_bytes).unwrap_or(usize::MAX));
         Ok(OxiaClient {
             inner: Rc::new(Inner {
                 options,
@@ -225,6 +230,7 @@ impl OxiaClient {
                 shard_manager,
                 session_manager,
                 write_manager: WriteManager::new(batcher_deps.clone()),
+                memory_limiter,
                 batcher_deps,
                 notification_managers: RefCell::new(HashMap::new()),
                 sequence_managers: RefCell::new(HashMap::new()),
@@ -742,6 +748,12 @@ impl OxiaClient {
         wrap: impl FnOnce(Pending<Req, Resp>) -> WriteOp,
     ) -> Result<Resp, OxiaError> {
         let (op, rx) = pending_write(request, wrap);
+        // Charge the write against the client's byte budget before queuing it
+        // — the batcher's queues are unbounded, so this is where a caller
+        // that outruns the cluster is slowed down — and hold the reservation
+        // until the response arrives, which is as long as the client keeps
+        // the request in memory.
+        let _reservation = self.inner.memory_limiter.reserve(op.size()).await;
         self.inner.write_manager.add(shard_id, op);
         self.await_response(rx).await
     }
@@ -1113,7 +1125,10 @@ impl OxiaClient {
             // Queue the copy when it is sent, before the first await, as
             // `submit_write` does for a single write, so that each copy
             // precedes in its shard's batch the writes issued after this
-            // delete range. Queued only once polled, a copy could follow those
+            // delete range. Not charged against the memory budget, which
+            // would mean awaiting here: a delete range carries two keys and
+            // no value, so what a broadcast holds is bounded by the shard
+            // count. Queued only once polled, a copy could follow those
             // writes, and be applied after them. (A copy rerouted after a
             // split can only follow what the successors already have.)
             let (op, rx) = pending_write(request.clone(), |pending| {
