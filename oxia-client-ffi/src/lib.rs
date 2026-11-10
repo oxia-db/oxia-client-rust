@@ -20,7 +20,7 @@
 //! rules the whole surface follows:
 //!
 //! - **Bytes, not C strings.** Keys and values cross as a pointer and a
-//!   length ([`oxia_slice`] in, [`oxia_bytes`] out), because an Oxia key is
+//!   length (`oxia_slice` in, `oxia_bytes` out), because an Oxia key is
 //!   a protobuf `string` — UTF-8, but allowed to contain a NUL byte — and a
 //!   value is arbitrary binary. Buffers handed back are NUL-terminated past
 //!   their length as a convenience, so a key without interior NULs can be
@@ -29,18 +29,18 @@
 //!   `= {0}` asks for the plain operation with the client's defaults. Only
 //!   the fields a caller sets matter.
 //! - **A code and an optional message.** Every fallible function returns an
-//!   [`oxia_error_code`] and takes a final `char **error_message`. Pass
+//!   `oxia_error_code` and takes a final `char **error_message`. Pass
 //!   `NULL` to ignore the detail; otherwise a non-`OXIA_OK` return sets it
-//!   to a message the caller frees with [`oxia_string_free`].
+//!   to a message the caller frees with `oxia_string_free`.
 //! - **Out-parameters are only written on success.** They are set to `NULL`
 //!   on every error path, so a caller can free unconditionally.
 //! - **Nothing aborts.** Null pointers, non-UTF-8 keys and malformed slices
 //!   come back as `OXIA_ERR_INVALID_ARGUMENT`; a panic inside the client is
 //!   caught at the boundary and returned as `OXIA_ERR_PANIC` rather than
 //!   being allowed to unwind into the caller, which would end the process.
-//! - **One destructor.** [`oxia_client_free`] is the only call that
+//! - **One destructor.** `oxia_client_free` is the only call that
 //!   invalidates a client, and it closes it gracefully first.
-//!   [`oxia_client_close`] is idempotent and leaves the handle valid.
+//!   `oxia_client_close` is idempotent and leaves the handle valid.
 //!
 //! # Threads
 //!
@@ -62,7 +62,7 @@
 //! itself runs on. It is therefore free to block and to make blocking Oxia
 //! calls. Callbacks are invoked one at a time, in the order the operations
 //! completed, and each is invoked exactly once for every submission that
-//! returned `OXIA_OK`. Do not call [`oxia_client_free`] from a callback: it
+//! returned `OXIA_OK`. Do not call `oxia_client_free` from a callback: it
 //! waits for the dispatcher to drain.
 
 // The ABI's type names are the C ones, so that the generated header reads as
@@ -98,6 +98,38 @@ pub use streams::*;
 
 use error::{fail, guard, guard_void, invalid, write_message};
 use mem::{optional_str, required_bytes, required_str};
+
+/// The binary interface this header describes.
+///
+/// Bumped on every change that makes a caller built against an older header
+/// incompatible with a newer library — a changed signature, a renumbered
+/// code, a reordered struct, and also a *field appended to one of the
+/// caller-allocated options structs*, because the library would then read
+/// past what an older caller allocated.
+///
+/// A caller that loads this library separately from the header it was built
+/// against — which is every wrapper SDK shipping a prebuilt binary — should
+/// compare this against `oxia_abi_version` before its first call and
+/// refuse to go on if they differ. Exact equality, not "at least": while
+/// this ABI is pre-1.0 there is no compatibility window to rely on.
+///
+/// This is not the crate's version: see `oxia_version_string` for that,
+/// which moves for every release whether the ABI changed or not.
+pub const OXIA_ABI_VERSION: u32 = 1;
+
+/// The `OXIA_ABI_VERSION` this library was built with.
+///
+/// ```c
+/// if (oxia_abi_version() != OXIA_ABI_VERSION) {
+///     fprintf(stderr, "liboxia_client_ffi is ABI %u, this build expects %u\n",
+///             oxia_abi_version(), OXIA_ABI_VERSION);
+///     return 1;
+/// }
+/// ```
+#[unsafe(no_mangle)]
+pub extern "C" fn oxia_abi_version() -> u32 {
+    OXIA_ABI_VERSION
+}
 
 /// How a client connects and behaves.
 ///
@@ -241,11 +273,11 @@ unsafe fn apply_tls(
 /// Fails fast — within the request timeout — when the cluster is
 /// unreachable, the namespace does not exist, or the first shard assignments
 /// cannot be obtained. On `OXIA_OK`, `*client` owns a client the caller
-/// destroys with [`oxia_client_free`]; on any error it is set to `NULL`.
+/// destroys with `oxia_client_free`; on any error it is set to `NULL`.
 ///
 /// # Safety
 ///
-/// `options` must point at an initialized [`oxia_client_options`] whose
+/// `options` must point at an initialized `oxia_client_options` whose
 /// slices are valid for the call. `client` must point at a writable pointer,
 /// and `error_message` must be `NULL` or point at one.
 #[unsafe(no_mangle)]
@@ -278,14 +310,14 @@ pub unsafe extern "C" fn oxia_client_new(
 /// has finished.
 ///
 /// Idempotent, and the handle stays valid: a later operation on it fails
-/// with `OXIA_ERR_CLOSED`, and [`oxia_client_free`] still has to be called
+/// with `OXIA_ERR_CLOSED`, and `oxia_client_free` still has to be called
 /// to release it. Closing explicitly is how a caller learns that the final
-/// flush succeeded — [`oxia_client_free`] closes too, but has no way to
+/// flush succeeded — `oxia_client_free` closes too, but has no way to
 /// report a failure.
 ///
 /// # Safety
 ///
-/// `client` must be a client from [`oxia_client_new`] that has not been
+/// `client` must be a client from `oxia_client_new` that has not been
 /// freed. `error_message` must be `NULL` or point at a writable `char *`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxia_client_close(
@@ -306,13 +338,13 @@ pub unsafe extern "C" fn oxia_client_close(
 /// Destroys a client, closing it first if it is still open.
 ///
 /// The only call that invalidates the handle, and safe to call after
-/// [`oxia_client_close`]. Does nothing when `client` is `NULL`. Waits for
+/// `oxia_client_close`. Does nothing when `client` is `NULL`. Waits for
 /// the operations in flight to settle and for every pending callback to run,
 /// so it must not be called from a callback.
 ///
 /// # Safety
 ///
-/// `client` must be `NULL`, or a client from [`oxia_client_new`] that has
+/// `client` must be `NULL`, or a client from `oxia_client_new` that has
 /// not been freed yet. No operation on it may be in progress on another
 /// thread.
 #[unsafe(no_mangle)]
@@ -327,7 +359,7 @@ pub unsafe extern "C" fn oxia_client_free(client: *mut oxia_client) {
 /// Writes this library's version, as `MAJOR.MINOR.PATCH`, to `out`.
 ///
 /// Useful to a wrapper SDK that wants to report the core it is built on.
-/// The caller frees the string with [`oxia_string_free`].
+/// The caller frees the string with `oxia_string_free`.
 ///
 /// # Safety
 ///
@@ -454,6 +486,13 @@ mod tests {
     #[test]
     fn freeing_a_null_client_is_a_no_op() {
         unsafe { oxia_client_free(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn the_abi_version_matches_the_constant_the_header_carries() {
+        // The point of the pair: a wrapper compares the constant it compiled
+        // against with what the library it loaded reports.
+        assert_eq!(oxia_abi_version(), OXIA_ABI_VERSION);
     }
 
     #[test]

@@ -86,6 +86,14 @@ static void on_put(oxia_error_code code, const char *message,
 int main(int argc, char **argv) {
     const char *address = argc > 1 ? argv[1] : "localhost:6648";
 
+    // 0. A caller that links the library at run time rather than building it
+    //    must check that it speaks the ABI this header describes.
+    if (oxia_abi_version() != OXIA_ABI_VERSION) {
+        fprintf(stderr, "liboxia_client_ffi is ABI %u, this build expects %u\n",
+                oxia_abi_version(), OXIA_ABI_VERSION);
+        return 1;
+    }
+
     // 1. Connect. A zeroed options struct means "every default"; only
     //    service_address is required.
     oxia_client_options client_options = {0};
