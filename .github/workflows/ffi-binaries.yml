@@ -32,6 +32,11 @@ on:
         description: The release tag to attach the archives to.
         type: string
         required: true
+      dry_run:
+        description: Build and stamp as for a release, but keep the archives as run artifacts.
+        type: boolean
+        required: false
+        default: false
   workflow_dispatch:
     inputs:
       tag:
@@ -55,8 +60,9 @@ jobs:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     permissions:
-      # Only the "Attach to the release" step uses this, and only when a tag
-      # was passed; every other trigger keeps the archives as run artifacts.
+      # Only the "Attach to the release" step uses this, and only for a real
+      # release: a rehearsal and a pull request both keep the archives as run
+      # artifacts instead.
       contents: write
     strategy:
       # One platform failing should not hide the state of the others.
@@ -206,7 +212,7 @@ jobs:
           LD_LIBRARY_PATH="$staging/lib" DYLD_LIBRARY_PATH="$staging/lib" "$RUNNER_TEMP/abi"
 
       - name: Upload as a run artifact
-        if: ${{ !inputs.tag && !github.event.inputs.tag }}
+        if: ${{ inputs.dry_run || (!inputs.tag && !github.event.inputs.tag) }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.name }}
@@ -214,7 +220,7 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to the release
-        if: ${{ inputs.tag || github.event.inputs.tag }}
+        if: ${{ !inputs.dry_run && (inputs.tag || github.event.inputs.tag) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag || github.event.inputs.tag }}

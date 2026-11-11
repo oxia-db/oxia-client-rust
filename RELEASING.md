@@ -14,6 +14,12 @@ git push origin v0.3.0
 
 Then [write the release notes](#writing-the-notes), which is the one step that is not automated.
 
+To try it first, run the `Release` workflow from the Actions tab ("Run workflow") and give it the tag
+you intend to push. The tag does not have to exist. Everything runs — the version is stamped, the
+bump is checked, the crate is packaged and verified, and every platform's archive is built — except
+the three things that cannot be taken back: the publish is a dry run, no GitHub Release is created,
+and the archives are left as artifacts of the run for you to download and inspect.
+
 ## Where the version lives
 
 In the tag, and nowhere else. `oxia-client/Cargo.toml` carries `version = "0.0.0-dev"`, which is
@@ -49,7 +55,8 @@ change fails there — before anything reaches crates.io.
 
 If a step fails, delete the tag (`git push --delete origin vX.Y.Z`), fix the problem, and tag
 again. Nothing is published until step 4, and crates.io cannot be undone past it: a version can be
-yanked, never deleted or replaced.
+yanked, never deleted or replaced. A manual run does steps 2, 3 and 6 and stops short of every
+irreversible one, so it is the cheap way to find out that step 1 or 2 would have refused the tag.
 
 ## Writing the notes
 
