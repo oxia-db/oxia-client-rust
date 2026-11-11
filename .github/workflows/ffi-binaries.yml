@@ -19,10 +19,10 @@
 # to get it without a Rust toolchain — which is the whole point: a wrapper SDK
 # in Python, Node, C++ or C# should not need one, nor a matching MSRV.
 #
-# Called from release-plz.yml with a `tag`, which is when the archives are
-# uploaded. On a pull request that touches the crate it builds the same matrix
-# and keeps the archives as run artifacts instead, so a platform that stops
-# building is found then rather than on release day.
+# Called from release.yml with the tag being released, which is when the
+# archives are uploaded. On a pull request that touches the crate it builds the
+# same matrix and keeps the archives as run artifacts instead, so a platform
+# that stops building is found then rather than on release day.
 name: FFI binaries
 
 on:
@@ -98,6 +98,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
+
+      # The committed version is the `0.0.0-dev` placeholder and the tag is
+      # what records a release's version, so stamp it in before building.
+      # Without this the library would report `0.0.0-dev` through
+      # `oxia_version_string()` out of an archive named after the release —
+      # which is the mismatch that function exists to avoid. On a pull request
+      # there is no tag and the placeholder is the honest answer.
+      - name: Stamp the version from the tag
+        if: ${{ inputs.tag || github.event.inputs.tag }}
+        env:
+          TAG: ${{ inputs.tag || github.event.inputs.tag }}
+        run: python3 .github/scripts/stamp-version.py "$TAG"
 
       - name: Cache cargo
         uses: actions/cache@v4

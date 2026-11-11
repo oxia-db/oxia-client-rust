@@ -14,7 +14,11 @@
 
 [package]
 name = "oxia-client"
-version = "0.2.0"
+# Not a release version, and never published as one: the release workflow
+# stamps the version from the tag being released (see RELEASING.md). A build
+# from a checkout reports this, through `oxia_version_string` among others,
+# so that it cannot be mistaken for a release.
+version = "0.0.0-dev"
 edition = "2024"
 rust-version = "1.99"
 
