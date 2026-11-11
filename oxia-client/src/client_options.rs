@@ -15,6 +15,15 @@
 use std::time::Duration;
 use uuid::Uuid;
 
+/// The default for [`max_in_flight_bytes`](crate::OxiaClientBuilder::max_in_flight_bytes):
+/// 64 MiB.
+///
+/// Public so that a caller which treats "unset" as "whatever the client
+/// does" — a wrapper SDK whose own options use `0` for the default, say —
+/// can resolve that to the same number the client uses, rather than keeping
+/// a copy of it that can drift.
+pub const DEFAULT_MAX_IN_FLIGHT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Configuration options for the Oxia client.
 #[derive(Debug, Clone)]
 pub struct OxiaClientOptions {
@@ -58,7 +67,7 @@ impl Default for OxiaClientOptions {
             identity: Uuid::new_v4().to_string(),
             batch_max_size: 128 * 1024,
             max_requests_per_batch: 1000,
-            max_in_flight_bytes: 64 * 1024 * 1024,
+            max_in_flight_bytes: DEFAULT_MAX_IN_FLIGHT_BYTES,
             max_write_batches_in_flight: 4,
             max_read_batches_in_flight: 4,
             session_timeout: Duration::from_secs(15),

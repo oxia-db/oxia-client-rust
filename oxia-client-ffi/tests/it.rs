@@ -116,10 +116,16 @@ unsafe fn take_message(message: *mut c_char) -> String {
 /// An open client against the shared server, with a short request timeout so
 /// a mistake fails fast.
 fn client() -> *mut oxia_client {
+    client_with_memory_cap(0)
+}
+
+/// As `client`, with the client's byte cap set: `0` asks for the default.
+fn client_with_memory_cap(max_in_flight_bytes: u64) -> *mut oxia_client {
     let address = address().as_bytes();
     let mut options: oxia_client_options = zeroed();
     options.service_address = slice_of(address);
     options.request_timeout_ms = 10_000;
+    options.max_in_flight_bytes = max_in_flight_bytes;
     let mut client: *mut oxia_client = ptr::null_mut();
     let mut message: *mut c_char = ptr::null_mut();
     let code = unsafe { oxia_client_new(&options, &mut client, &mut message) };
@@ -911,6 +917,207 @@ fn a_null_callback_is_rejected_before_anything_is_submitted() {
     unsafe { oxia_client_free(client) };
 }
 
+// ===========================================================================
+// The backpressure the byte cap applies
+// ===========================================================================
+
+/// The cap these tests run under, and a value far larger than it, so that a
+/// single operation fills the budget on its own.
+const TINY_CAP: u64 = 1024;
+const BIG_VALUE: usize = 4096;
+
+/// A recorder whose callback does not return until the test lets it.
+///
+/// The bytes a submission is charged are returned when its callback has run,
+/// so parking inside one holds the budget for as long as the test needs —
+/// which is what makes the refusal below deterministic rather than a race
+/// against the server answering.
+#[derive(Default)]
+struct Gate {
+    recorder: Recorder,
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl Gate {
+    fn wait_until_open(&self) {
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            let (next, timeout) = self
+                .opened
+                .wait_timeout(open, Duration::from_secs(30))
+                .unwrap();
+            open = next;
+            assert!(!timeout.timed_out(), "the gate was never opened");
+        }
+    }
+
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+unsafe impl Sync for Gate {}
+
+extern "C" fn on_put_then_wait(
+    code: oxia_error_code,
+    message: *const c_char,
+    result: *const oxia_put_result,
+    ctx: *mut c_void,
+) {
+    let gate = unsafe { &*(ctx as *const Gate) };
+    let key = if result.is_null() {
+        None
+    } else {
+        unsafe { owned((*result).key) }
+    };
+    gate.recorder
+        .record(code, key, unsafe { message_of(message) });
+    gate.wait_until_open();
+}
+
+/// Submits a put of `BIG_VALUE` bytes without waiting for it.
+unsafe fn put_async(
+    client: *const oxia_client,
+    key: &[u8],
+    callback: oxia_put_callback,
+    ctx: *mut c_void,
+    message: *mut *mut c_char,
+) -> oxia_error_code {
+    let value = vec![b'x'; BIG_VALUE];
+    let mut options: oxia_put_options = zeroed();
+    options.key = slice_of(key);
+    options.value = slice_of(&value);
+    oxia_client_put_async(client, &options, Some(callback), ctx, message)
+}
+
+#[test]
+fn an_async_submit_past_the_byte_cap_is_refused_and_a_retry_later_succeeds() {
+    let client = client_with_memory_cap(TINY_CAP);
+    let gate = Gate::default();
+    let ctx = &gate as *const Gate as *mut c_void;
+
+    // The first put fills the budget on its own, and its callback parks
+    // there, so the budget stays full.
+    assert_eq!(
+        unsafe {
+            put_async(
+                client,
+                b"backpressure/held",
+                on_put_then_wait,
+                ctx,
+                ptr::null_mut(),
+            )
+        },
+        oxia_error_code::OXIA_OK
+    );
+    let seen = gate.recorder.wait_for(1);
+    assert_eq!(seen[0].0, oxia_error_code::OXIA_OK);
+
+    // The next one does not fit, and says so rather than queuing.
+    let mut message: *mut c_char = ptr::null_mut();
+    let code = unsafe {
+        put_async(
+            client,
+            b"backpressure/refused",
+            on_put_then_wait,
+            ctx,
+            &mut message,
+        )
+    };
+    assert_eq!(code, oxia_error_code::OXIA_ERR_QUEUE_FULL);
+    let text = unsafe { take_message(message) };
+    assert!(text.contains("max_in_flight_bytes"), "{text}");
+    assert!(
+        oxia_error_is_retryable(oxia_error_code::OXIA_ERR_QUEUE_FULL),
+        "a full queue is worth retrying"
+    );
+
+    // A refusal is not an acceptance: nothing calls back for it. The one
+    // callback that has run is the first put's, still parked in the gate.
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        gate.recorder.seen.lock().unwrap().len(),
+        1,
+        "a refused submission must not call back"
+    );
+
+    // Letting the first callback return frees its bytes, and the retry fits.
+    gate.release();
+    let mut retried = oxia_error_code::OXIA_ERR_QUEUE_FULL;
+    for _ in 0..50 {
+        retried = unsafe {
+            put_async(
+                client,
+                b"backpressure/refused",
+                on_put_then_wait,
+                ctx,
+                ptr::null_mut(),
+            )
+        };
+        if retried == oxia_error_code::OXIA_OK {
+            break;
+        }
+        // The bytes are returned on the dispatcher thread, so the room may
+        // take a moment to appear.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        retried,
+        oxia_error_code::OXIA_OK,
+        "the room the first callback freed should take the retry"
+    );
+    let seen = gate.recorder.wait_for(2);
+    assert_eq!(seen.len(), 2, "exactly the two accepted puts called back");
+    assert_eq!(seen[1].0, oxia_error_code::OXIA_OK);
+    assert_eq!(
+        seen[1].1.as_deref(),
+        Some(b"backpressure/refused".as_ref()),
+        "the retry is the one that was refused"
+    );
+
+    unsafe { oxia_client_free(client) };
+}
+
+#[test]
+fn the_blocking_form_waits_for_room_instead_of_being_refused() {
+    let client = client_with_memory_cap(TINY_CAP);
+    let value = vec![b'x'; BIG_VALUE];
+
+    // Each of these is larger than the whole budget, which the client admits
+    // when nothing else is in flight — so they take longer, they do not fail.
+    for index in 0..8 {
+        let key = format!("backpressure/blocking/{index}").into_bytes();
+        put(client, &key, &value);
+    }
+
+    // The same from several threads at once, where they really do queue
+    // behind one another.
+    let shared = client as usize;
+    let threads: Vec<_> = (0..4)
+        .map(|index| {
+            std::thread::spawn(move || {
+                let client = shared as *const oxia_client;
+                let value = vec![b'x'; BIG_VALUE];
+                let key = format!("backpressure/blocking/parallel/{index}").into_bytes();
+                put(client, &key, &value);
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("a blocking put failed");
+    }
+
+    let result = get(client, b"backpressure/blocking/parallel/3").expect("the record is there");
+    assert_eq!(
+        unsafe { owned((*result).value) }.map(|bytes| bytes.len()),
+        Some(BIG_VALUE)
+    );
+    unsafe { oxia_get_result_free(result) };
+    unsafe { oxia_client_free(client) };
+}
+
 /// What a callback that bridges into another runtime may well do: block, and
 /// call back into the client. It runs on the dispatcher thread, not on the
 /// client's, so neither stalls nor deadlocks.
@@ -1422,4 +1629,177 @@ fn a_stream_opened_with_bad_options_reports_why() {
     assert!(unsafe { take_message(message) }.contains("UTF-8"));
 
     unsafe { oxia_client_free(client) };
+}
+
+// ===========================================================================
+// Logging
+//
+// `tracing`'s dispatcher is process-global, so all of this is one test rather
+// than several: separate tests would race each other over the level and the
+// sink. Other tests in this binary emit events too, so the assertions are
+// about what arrives and what stops arriving, never about exact counts.
+// ===========================================================================
+
+static DELIVERED: Mutex<Vec<(oxia_log_level, String, String)>> = Mutex::new(Vec::new());
+static REPLACEMENT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+extern "C" fn collect(
+    level: oxia_log_level,
+    target: *const c_char,
+    message: *const c_char,
+    ctx: *mut c_void,
+) {
+    // The context travels through untouched; prove it arrives as handed over.
+    assert_eq!(ctx as usize, 0x5EED);
+    let target = unsafe { CStr::from_ptr(target) }
+        .to_string_lossy()
+        .into_owned();
+    let message = unsafe { CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned();
+    DELIVERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((level, target, message));
+}
+
+extern "C" fn collect_replacement(
+    _level: oxia_log_level,
+    target: *const c_char,
+    _message: *const c_char,
+    _ctx: *mut c_void,
+) {
+    let target = unsafe { CStr::from_ptr(target) }
+        .to_string_lossy()
+        .into_owned();
+    REPLACEMENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(target);
+}
+
+fn delivered() -> Vec<(oxia_log_level, String, String)> {
+    DELIVERED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Lets the events already past their level check arrive before a baseline is
+/// taken.
+///
+/// Changing the level or the sink stops *new* events, but an event another
+/// thread is already delivering is not recalled — and the other tests in this
+/// binary keep their clients busy throughout. So each baseline below is taken
+/// after a pause, not immediately.
+fn let_in_flight_events_settle() {
+    std::thread::sleep(Duration::from_millis(250));
+}
+
+/// Creates and closes a client, which is enough to make the client log: the
+/// listeners and the session keep-alive report themselves stopping.
+fn generate_log_activity() {
+    let client = client();
+    put(client, b"logging/a", b"v");
+    unsafe { oxia_client_free(client) };
+}
+
+#[test]
+fn the_log_bridge_delivers_filters_and_can_be_replaced() {
+    let mut message: *mut c_char = ptr::null_mut();
+    let code = unsafe {
+        oxia_set_log_callback(
+            Some(collect),
+            oxia_log_level::OXIA_LOG_DEBUG,
+            0x5EED as *mut c_void,
+            &mut message,
+        )
+    };
+    // Nothing else in this binary installs a subscriber, so this must win.
+    assert_eq!(
+        code,
+        oxia_error_code::OXIA_OK,
+        "install failed: {}",
+        unsafe { message_of(message) }.unwrap_or_default()
+    );
+
+    // 1. Real client work reaches the callback, with the client's own module
+    //    as the target.
+    generate_log_activity();
+    let seen = delivered();
+    assert!(
+        seen.iter().any(|(_, target, _)| target.starts_with("oxia")),
+        "nothing from the client arrived; got {:?}",
+        seen.iter().map(|(_, t, _)| t).collect::<Vec<_>>()
+    );
+    assert!(
+        seen.iter()
+            .all(|(level, _, _)| *level <= oxia_log_level::OXIA_LOG_DEBUG),
+        "an event more verbose than the level asked for arrived"
+    );
+    assert!(
+        seen.iter().all(|(_, _, text)| !text.is_empty()),
+        "an event arrived with no message"
+    );
+
+    // 2. Turning the level off stops delivery, whoever emits. This and the
+    //    step after it are the regression guard for the level reaching
+    //    `tracing`'s own cached filter: store it without rebuilding the
+    //    interest cache and every macro short-circuits, so nothing is
+    //    delivered however high the level is set.
+    oxia_set_log_level(oxia_log_level::OXIA_LOG_OFF);
+    let_in_flight_events_settle();
+    let before = delivered().len();
+    generate_log_activity();
+    assert_eq!(
+        delivered().len(),
+        before,
+        "events were delivered while the level was OFF"
+    );
+
+    // 3. And raising it again resumes, without reinstalling anything.
+    oxia_set_log_level(oxia_log_level::OXIA_LOG_DEBUG);
+    generate_log_activity();
+    assert!(
+        delivered().len() > before,
+        "raising the level again delivered nothing"
+    );
+
+    // 4. Installing another callback redirects, rather than being refused:
+    //    a caller may start on stderr and move to its own logger.
+    let code = unsafe {
+        oxia_set_log_callback(
+            Some(collect_replacement),
+            oxia_log_level::OXIA_LOG_DEBUG,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(code, oxia_error_code::OXIA_OK);
+    let_in_flight_events_settle();
+    let first_sink_count = delivered().len();
+    generate_log_activity();
+    assert_eq!(
+        delivered().len(),
+        first_sink_count,
+        "the replaced callback was still being called"
+    );
+    assert!(
+        !REPLACEMENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty(),
+        "the replacement callback received nothing"
+    );
+
+    // 5. Clearing it stops delivery altogether.
+    oxia_clear_log_callback();
+    let_in_flight_events_settle();
+    let cleared_at = REPLACEMENT.lock().unwrap_or_else(|e| e.into_inner()).len();
+    generate_log_activity();
+    assert_eq!(
+        REPLACEMENT.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        cleared_at,
+        "events arrived after the callback was cleared"
+    );
+
+    // Leave the bridge off, so the rest of the binary is unaffected.
+    oxia_clear_log_callback();
 }

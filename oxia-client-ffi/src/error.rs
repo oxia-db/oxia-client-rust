@@ -77,6 +77,16 @@ pub enum oxia_error_code {
     /// client was closed under it. Not an error — the expected way for a loop
     /// over a stream to stop.
     OXIA_STREAM_END = 17,
+    /// An asynchronous submission was refused because the client already
+    /// holds `max_in_flight_bytes` of accepted operations. It was not
+    /// accepted, so its callback will not run; retry it once a callback has
+    /// run and freed the room. Only the `_async` entry points return this —
+    /// the blocking ones wait for room instead.
+    OXIA_ERR_QUEUE_FULL = 18,
+    /// Something else in this process already owns `tracing`, so this
+    /// library will not take the log events away from it. Only
+    /// `oxia_set_log_callback` and `oxia_log_to_stderr` return this.
+    OXIA_ERR_ALREADY_SET = 19,
 }
 
 impl From<&OxiaError> for oxia_error_code {
@@ -115,6 +125,10 @@ impl From<&OxiaError> for oxia_error_code {
 /// `OXIA_ERR_GRPC` answers `false`: whether
 /// a gRPC status is retryable depends on the status code, which only the
 /// message carries.
+///
+/// `OXIA_ERR_QUEUE_FULL` answers `true`, being the one code that is purely a
+/// matter of timing, but the retry belongs after a callback has run rather
+/// than immediately: resubmitting in a tight loop only spins.
 #[unsafe(no_mangle)]
 pub extern "C" fn oxia_error_is_retryable(code: oxia_error_code) -> bool {
     matches!(
@@ -123,6 +137,7 @@ pub extern "C" fn oxia_error_is_retryable(code: oxia_error_code) -> bool {
             | oxia_error_code::OXIA_ERR_NO_SHARD_FOR_KEY
             | oxia_error_code::OXIA_ERR_SHARD_MOVED
             | oxia_error_code::OXIA_ERR_DISCONNECTED
+            | oxia_error_code::OXIA_ERR_QUEUE_FULL
     )
 }
 
@@ -313,6 +328,15 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn a_full_submission_queue_is_worth_retrying() {
+        // It has no `OxiaError` behind it: the submission was refused before
+        // the client saw it, and a completion will free the room.
+        assert!(oxia_error_is_retryable(
+            oxia_error_code::OXIA_ERR_QUEUE_FULL
+        ));
     }
 
     #[test]

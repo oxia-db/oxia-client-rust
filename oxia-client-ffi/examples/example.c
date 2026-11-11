@@ -69,6 +69,25 @@ static void print_version(const char *what, const oxia_version *version) {
 // anything to keep has to be copied out.
 // ---------------------------------------------------------------------------
 
+// Runs on whichever thread emitted the event, synchronously, so it must not
+// block and must not call back into the library.
+static const char *level_name(oxia_log_level level) {
+    switch (level) {
+        case OXIA_LOG_ERROR: return "ERROR";
+        case OXIA_LOG_WARN:  return "WARN";
+        case OXIA_LOG_INFO:  return "INFO";
+        case OXIA_LOG_DEBUG: return "DEBUG";
+        case OXIA_LOG_TRACE: return "TRACE";
+        default:             return "?";
+    }
+}
+
+static void on_log(oxia_log_level level, const char *target, const char *message,
+                   void *ctx) {
+    (void)ctx;
+    fprintf(stderr, "log %-5s %s: %s\n", level_name(level), target, message);
+}
+
 static void on_put(oxia_error_code code, const char *message,
                    const oxia_put_result *result, void *ctx) {
     const char *label = (const char *)ctx;
@@ -86,8 +105,24 @@ static void on_put(oxia_error_code code, const char *message,
 int main(int argc, char **argv) {
     const char *address = argc > 1 ? argv[1] : "localhost:6648";
 
-    // 0. A caller that links the library at run time rather than building it
-    //    must check that it speaks the ABI this header describes.
+    // 0a. Send the client's own log events somewhere before anything else:
+    //     the bridge is process-global, so events from connecting are missed
+    //     if it goes in later. A wrapper SDK would hand its own logger here
+    //     instead of printing.
+    //
+    //     WARN, which is what to run with: a healthy client says nothing, so
+    //     this example normally prints no log lines at all. Raise it to
+    //     OXIA_LOG_DEBUG to see the client working — and the HTTP/2 layer,
+    //     which at that level produces around twenty lines for every one of
+    //     the client's own.
+    if (oxia_set_log_callback(on_log, OXIA_LOG_WARN, NULL, NULL) != OXIA_OK) {
+        printf("something else owns tracing in this process; logs go there\n");
+    } else {
+        printf("log bridge installed at WARN (a healthy run logs nothing)\n");
+    }
+
+    // 0b. A caller that links the library at run time rather than building it
+    //     must check that it speaks the ABI this header describes.
     if (oxia_abi_version() != OXIA_ABI_VERSION) {
         fprintf(stderr, "liboxia_client_ffi is ABI %u, this build expects %u\n",
                 oxia_abi_version(), OXIA_ABI_VERSION);

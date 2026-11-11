@@ -271,6 +271,7 @@ pub use bytes::Bytes;
 pub use auth::TokenProvider;
 pub use client::OxiaClient;
 pub use client_builder::OxiaClientBuilder;
+pub use client_options::DEFAULT_MAX_IN_FLIGHT_BYTES;
 pub use errors::OxiaError;
 pub use requests::{
     DeleteBuilder, DeleteRangeBuilder, GetBuilder, ListBuilder, NotificationsBuilder, PutBuilder,

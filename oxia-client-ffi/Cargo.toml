@@ -42,6 +42,10 @@ futures = { workspace = true }
 # `select!` and nothing else: the streams module races a native stream against
 # its cancellation. Runtime-agnostic, like the client's own use of tokio.
 tokio = { workspace = true }
+# The `Subscriber` trait, to bridge the client's log events to a C callback.
+# Not `tracing-subscriber`: the client emits no spans, so the bridge is small
+# enough to write directly and that keeps the dependency out.
+tracing = { workspace = true }
 
 [dev-dependencies]
 # The error-mapping test names the gRPC status codes.
