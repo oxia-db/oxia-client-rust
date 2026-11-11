@@ -42,7 +42,7 @@
  * This is not the crate's version: see `oxia_version_string` for that,
  * which moves for every release whether the ABI changed or not.
  */
-#define OXIA_ABI_VERSION 2
+#define OXIA_ABI_VERSION 1
 
 /**
  * The outcome of an operation.

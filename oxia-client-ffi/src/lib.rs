@@ -124,7 +124,7 @@ use mem::{optional_str, required_bytes, required_str};
 ///
 /// This is not the crate's version: see `oxia_version_string` for that,
 /// which moves for every release whether the ABI changed or not.
-pub const OXIA_ABI_VERSION: u32 = 2;
+pub const OXIA_ABI_VERSION: u32 = 1;
 
 /// The `OXIA_ABI_VERSION` this library was built with.
 ///
