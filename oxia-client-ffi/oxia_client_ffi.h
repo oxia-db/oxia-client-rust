@@ -42,7 +42,7 @@
  * This is not the crate's version: see `oxia_version_string` for that,
  * which moves for every release whether the ABI changed or not.
  */
-#define OXIA_ABI_VERSION 2
+#define OXIA_ABI_VERSION 1
 
 /**
  * The outcome of an operation.
@@ -149,12 +149,64 @@ enum oxia_error_code
    * the blocking ones wait for room instead.
    */
   OXIA_ERR_QUEUE_FULL = 18,
+  /**
+   * Something else in this process already owns `tracing`, so this
+   * library will not take the log events away from it. Only
+   * `oxia_set_log_callback` and `oxia_log_to_stderr` return this.
+   */
+  OXIA_ERR_ALREADY_SET = 19,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
 typedef enum oxia_error_code oxia_error_code;
 #else
 typedef int32_t oxia_error_code;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * How much to log. Ordered by verbosity, so each level admits the ones
+ * before it.
+ */
+enum oxia_log_level
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Nothing at all. What a zeroed argument asks for.
+   */
+  OXIA_LOG_OFF = 0,
+  /**
+   * Failures the library cannot handle itself. The client logs none
+   * today, so do not wait for these to appear.
+   */
+  OXIA_LOG_ERROR = 1,
+  /**
+   * Something went wrong and was retried or worked around: a failed
+   * background task, an expired session, a shard with no leader. Where
+   * the operational value is.
+   */
+  OXIA_LOG_WARN = 2,
+  /**
+   * Lifecycle: sessions, listeners and streams starting and stopping.
+   */
+  OXIA_LOG_INFO = 3,
+  /**
+   * Detail for diagnosing the client itself.
+   */
+  OXIA_LOG_DEBUG = 4,
+  /**
+   * Everything, including per-request detail. Verbose enough to affect
+   * throughput.
+   */
+  OXIA_LOG_TRACE = 5,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum oxia_log_level oxia_log_level;
+#else
+typedef int32_t oxia_log_level;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
@@ -905,6 +957,64 @@ bool oxia_error_is_retryable(oxia_error_code code);
  * `message` must have been set by this library and not yet been freed.
  */
 void oxia_string_free(char *message);
+
+/**
+ * Installs `callback` as the destination for the client's log events, and
+ * admits everything up to `max_level`.
+ *
+ * Process-global, not per-client, and it affects every `tracing` event in
+ * the process — including those of other Rust libraries linked into it,
+ * because that is what owning the dispatcher means. Call it before creating
+ * a client, so that the events from connecting are not missed.
+ *
+ * Calling it again replaces the callback and the level, so a caller may
+ * start with `oxia_log_to_stderr` and move to its own logger. It returns
+ * `OXIA_ERR_ALREADY_SET` only when something *else* in the process already
+ * owns `tracing` — a Rust host application with its own subscriber, say —
+ * in which case this library will not take it away, and its events go
+ * wherever that subscriber sends them.
+ *
+ * The callback runs on whichever thread emitted the event, which includes
+ * the client's own thread. It must not block, and must not call back into
+ * this library.
+ *
+ * # Safety
+ *
+ * `ctx` is passed back untouched and must be usable from any thread.
+ * `error_message` must be `NULL` or point at a writable `char *`.
+ */
+oxia_error_code oxia_set_log_callback(void (*callback)(oxia_log_level,
+                                                       const char*,
+                                                       const char*,
+                                                       void*),
+                                      oxia_log_level max_level,
+                                      void *ctx,
+                                      char **error_message);
+
+/**
+ * Sends the client's log events to standard error, one line each.
+ *
+ * A shortcut for triage and for C and C++ programs that want no bridge of
+ * their own; otherwise as `oxia_set_log_callback`, which it can be replaced
+ * by.
+ *
+ * # Safety
+ *
+ * `error_message` must be `NULL` or point at a writable `char *`.
+ */
+oxia_error_code oxia_log_to_stderr(oxia_log_level max_level, char **error_message);
+
+/**
+ * Changes how much is logged, without touching the destination. Takes
+ * effect immediately, and `OXIA_LOG_OFF` silences the bridge.
+ */
+void oxia_set_log_level(oxia_log_level max_level);
+
+/**
+ * Stops sending log events anywhere. The dispatcher stays installed — it
+ * cannot be given back — but nothing is formatted or delivered.
+ */
+void oxia_clear_log_callback(void);
 
 /**
  * Frees an owned buffer handed over on its own, rather than inside a result

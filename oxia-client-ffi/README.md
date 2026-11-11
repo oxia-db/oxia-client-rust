@@ -206,6 +206,58 @@ subscription read them, so any record may have changed unseen and a consumer kee
 re-read it. A notification type this library does not recognize arrives as
 `OXIA_NOTIFICATION_UNKNOWN` rather than being dropped.
 
+## Logging
+
+The client logs through [`tracing`](https://docs.rs/tracing), and a library must not configure
+that for the application embedding it. Here the application is the wrapper, so it installs a
+bridge:
+
+```c
+static void on_log(oxia_log_level level, const char *target, const char *message, void *ctx) {
+    my_logger_log((void *)ctx, (int)level, target, message);
+}
+
+oxia_set_log_callback(on_log, OXIA_LOG_WARN, my_logger, NULL);
+```
+
+`oxia_log_to_stderr(OXIA_LOG_WARN)` does the same into standard error, for triage and for
+programs that want no bridge of their own. `oxia_set_log_level` changes how much is logged at any
+time, `OXIA_LOG_OFF` silences it, and `oxia_clear_log_callback` stops delivery altogether.
+
+**A log callback runs on whichever thread emitted the event, synchronously — not on the
+dispatcher thread the completion callbacks use.** That difference is deliberate. A completion
+carries ownership of a result and has to arrive exactly once, so queueing it is right; a log line
+is droppable, and queueing those would build an unbounded buffer during exactly the log storm you
+least want one in. A wrapper marshals to its own runtime instead, which it has to do anyway —
+Node cannot touch JS off the loop thread, Python needs the GIL — and only the wrapper knows how
+much it is willing to buffer. So the callback must not block, and must not call back into this
+library.
+
+What to expect in it, for a namespace a client is just using normally:
+
+| Level | What arrives |
+|---|---|
+| `OXIA_LOG_ERROR` | nothing: the client logs at this level nowhere, so do not wait for errors to appear |
+| `OXIA_LOG_WARN` | where the operational value is — a background task failing and retrying, a session expiring and being re-created, a shard with no leader, an unrecognized notification. A healthy client says nothing, so every line means something went wrong and was worked around |
+| `OXIA_LOG_INFO` | lifecycle: sessions, listeners and streams stopping. A plain run of puts and gets reaches none of them, so this is close to silent too |
+| `OXIA_LOG_DEBUG` | client internals **and the HTTP/2 layer's frame-by-frame output, which dominates**: one connect, one put and one get measured 123 lines, 117 of them from `h2` and 6 from `oxia`. Useful for transport problems, costly otherwise |
+| `OXIA_LOG_TRACE` | more of the same again |
+
+`WARN` is the setting to run with. Reach for `DEBUG` to diagnose a connection, and expect to
+filter by `target` when you do.
+
+`target` is the emitting module, such as `oxia::session_manager`, which is what most host logging
+frameworks want as the logger name. `target` and `message` are borrowed for the call.
+
+Two consequences of `tracing` being process-global, rather than per-client:
+
+- Install the bridge **before** creating a client, or the events from connecting are missed.
+- It captures every `tracing` event in the process, including those of other Rust libraries
+  linked into it — that is what owning the dispatcher means. Correspondingly, if something else
+  already owns it (a Rust host application with its own subscriber),
+  `oxia_set_log_callback` returns `OXIA_ERR_ALREADY_SET` and leaves it alone rather than taking
+  the events away.
+
 ## What is not here yet
 
 Everything the Rust client can do is here — every operation, every per-operation option, the
@@ -213,8 +265,11 @@ subscriptions and streaming reads, the whole `oxia_version`, and the client conf
 including timeouts, identity, bearer-token authentication, TLS, the batching limits and the
 memory cap.
 
+The client's log events reach a caller too, through the bridge above.
+
 `auth_token_provider` and `meter_provider` have no C equivalent. A rotating token would need a
-callback and metrics would need an exporter handle; neither is exposed.
+callback of its own, and metrics would need an exporter handle; neither is exposed, so a wrapper
+cannot yet rotate credentials or surface the client's `otel` metrics.
 
 ## Versioning
 
@@ -233,7 +288,11 @@ if (oxia_abi_version() != OXIA_ABI_VERSION) {
 ```
 
 Exact equality, not "at least": while this ABI is pre-1.0 there is no compatibility window to
-rely on. `oxia_version_string()` is the crate's own version, which moves for every release whether
+rely on.
+
+The number only has to move once a binary has been published, because before that there is
+nothing in the wild to be incompatible with. Changes that land before the first release share
+whatever version it ships as. `oxia_version_string()` is the crate's own version, which moves for every release whether
 the ABI changed or not; report it in diagnostics, do not gate on it.
 
 What bumps `OXIA_ABI_VERSION`: a changed signature, a renumbered error code, a reordered struct

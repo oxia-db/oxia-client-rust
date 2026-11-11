@@ -83,6 +83,10 @@ pub enum oxia_error_code {
     /// run and freed the room. Only the `_async` entry points return this —
     /// the blocking ones wait for room instead.
     OXIA_ERR_QUEUE_FULL = 18,
+    /// Something else in this process already owns `tracing`, so this
+    /// library will not take the log events away from it. Only
+    /// `oxia_set_log_callback` and `oxia_log_to_stderr` return this.
+    OXIA_ERR_ALREADY_SET = 19,
 }
 
 impl From<&OxiaError> for oxia_error_code {
