@@ -30,6 +30,17 @@ on:
   push:
     tags:
       - v*
+  # A rehearsal. Everything below runs except the three steps that cannot be
+  # taken back — the publish is a dry run, no GitHub Release is created, and
+  # the FFI archives are kept as run artifacts instead of being attached. The
+  # tag does not have to exist, so a release can be tried out before the tag
+  # that performs it is pushed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to rehearse, as in v0.3.0. Nothing is published.
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -44,16 +55,34 @@ jobs:
       contents: write
     outputs:
       version: ${{ steps.stamp.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # The ref on a tag push; the input on a rehearsal, which may be run
+      # from any branch and against a tag that does not exist yet.
+      - name: Work out the tag
+        id: tag
+        env:
+          PUSHED: ${{ github.ref_name }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            echo "tag=$PUSHED" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$REQUESTED" >> "$GITHUB_OUTPUT"
+          fi
+
       # Releases come from `main`, which `ci.yml` has already tested: this run
       # does not repeat the full suite. A tag on anything else is a mistake,
-      # and publishing to crates.io cannot be undone, so refuse it.
+      # and publishing to crates.io cannot be undone, so refuse it. A
+      # rehearsal publishes nothing, so it may run from a branch.
       - name: Check the tag is on main
+        if: github.event_name == 'push'
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
@@ -70,12 +99,16 @@ jobs:
       - name: Stamp the version from the tag
         id: stamp
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           version="$(python3 .github/scripts/stamp-version.py "$TAG")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "::notice::releasing oxia-client $version from $TAG"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            echo "::notice::releasing oxia-client $version from $TAG"
+          else
+            echo "::notice::rehearsing oxia-client $version from $TAG; nothing will be published"
+          fi
 
       - name: Check whether this version is already published
         id: published
@@ -108,20 +141,27 @@ jobs:
         with:
           package: oxia-client
 
+      # `--allow-dirty` because the stamped version is deliberately not
+      # committed; the tag is what records it.
       - name: Publish to crates.io
-        if: steps.published.outputs.exists == 'false'
+        if: github.event_name == 'push' && steps.published.outputs.exists == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATE_TOKEN }}
-        # `--allow-dirty` because the stamped version is deliberately not
-        # committed; the tag is what records it.
         run: cargo publish -p oxia-client --allow-dirty
+
+      # The same packaging and verification, stopping short of the upload, so
+      # a rehearsal exercises everything the real publish would.
+      - name: Package as if publishing (rehearsal)
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo publish -p oxia-client --allow-dirty --dry-run
 
       # Empty on purpose: the notes are written by hand afterwards, and an
       # existing release's notes are never overwritten by a re-run.
       - name: Create the GitHub Release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.tag.outputs.tag }}
           VERSION: ${{ steps.stamp.outputs.version }}
         run: |
           set -euo pipefail
@@ -142,4 +182,7 @@ jobs:
       contents: write
     uses: ./.github/workflows/ffi-binaries.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ needs.publish.outputs.tag }}
+      # A rehearsal still builds and stamps every platform; it keeps the
+      # archives as run artifacts rather than attaching them to a release.
+      dry_run: ${{ github.event_name == 'workflow_dispatch' }}
