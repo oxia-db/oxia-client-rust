@@ -74,13 +74,16 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
           # musl for callers that want to link statically, or to run on a
-          # distribution whose glibc is older than the runner's.
+          # distribution whose glibc is older than the runner's. These build
+          # in the image below, where musl is the host libc, so there is no
+          # cross toolchain to install from the Ubuntu mirrors — whose outages
+          # used to fail these two jobs before anything was compiled.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-22.04
-            musl: true
+            image: rust:1.99.1-alpine3.24
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-22.04-arm
-            musl: true
+            image: rust:1.99.1-alpine3.24
           - target: aarch64-apple-darwin
             runner: macos-15
           - target: x86_64-apple-darwin
@@ -91,19 +94,13 @@ jobs:
 
       # The gnu targets are built on the oldest runner still supported, so the
       # shared library does not require a newer glibc than a caller's
-      # distribution has. Ubuntu 22.04 is glibc 2.35.
+      # distribution has. Ubuntu 22.04 is glibc 2.35. The musl targets take
+      # their toolchain from the image they build in instead.
       - name: Set up Rust
+        if: ${{ !matrix.image }}
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      # `ring`, which the default `tls` feature pulls in, compiles C for the
-      # target, so musl needs its toolchain.
-      - name: Install the musl toolchain
-        if: matrix.musl
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
 
       # The committed version is the `0.0.0-dev` placeholder and the tag is
       # what records a release's version, so stamp it in before building.
@@ -126,14 +123,23 @@ jobs:
             target
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      # `docker run` rather than a `container:` job because the runner can
+      # only execute JavaScript actions — checkout, cache — inside an Alpine
+      # container on x64, and one of these two jobs is arm64. Only the
+      # registry and the git checkouts are mounted into the image's
+      # CARGO_HOME; mounting over it would hide cargo itself.
+      - name: Build in ${{ matrix.image }}
+        if: matrix.image
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" -w /src \
+            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
+            -v "$HOME/.cargo/git:/usr/local/cargo/git" \
+            "${{ matrix.image }}" \
+            cargo build -p oxia-client-ffi --release --target ${{ matrix.target }}
+
       - name: Build
-        env:
-          # musl-gcc is the linker and the C compiler for both musl targets;
-          # cc-rs reads the target-specific variable.
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CC_aarch64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        if: ${{ !matrix.image }}
         run: cargo build -p oxia-client-ffi --release --target ${{ matrix.target }}
 
       # The header is checked in and CI already fails if it is stale, so it is
@@ -187,9 +193,10 @@ jobs:
           ls -l "$RUNNER_TEMP/$name.tar.gz"
 
       # Proves the header and the library in the archive agree, on the
-      # platforms where this runner can run what it just built.
+      # platforms where this runner can run what it just built. Not the musl
+      # archives: their library is musl-linked and the runner is glibc.
       - name: Check the archive against its own header
-        if: "!matrix.musl && !contains(matrix.target, 'x86_64-apple')"
+        if: "!matrix.image && !contains(matrix.target, 'x86_64-apple')"
         shell: bash
         run: |
           set -euo pipefail
