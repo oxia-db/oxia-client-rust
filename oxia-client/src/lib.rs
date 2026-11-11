@@ -266,6 +266,12 @@ pub(crate) mod proto {
     include!(concat!(env!("OUT_DIR"), "/io.oxia.proto.v1.rs"));
 }
 
+/// This crate's version, as a string.
+///
+/// The C ABI reports it through `oxia_version_string`, so a wrapper SDK can
+/// name the client it is driving without a Rust toolchain to ask.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use bytes::Bytes;
 
 pub use auth::TokenProvider;

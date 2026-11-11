@@ -290,51 +290,24 @@ if (oxia_abi_version() != OXIA_ABI_VERSION) {
 Exact equality, not "at least": while this ABI is pre-1.0 there is no compatibility window to
 rely on.
 
+`oxia_version_string()` is the other number: the version of the `oxia-client` crate inside the
+library — the release it was built from, which is what the archive is named after. It moves for
+every release whether the ABI changed or not; report it in diagnostics, do not gate on it. This
+shim is not versioned separately: its own crate version is an implementation detail and is never
+reported.
+
+What bumps `OXIA_ABI_VERSION`: a changed signature, a renumbered error code, a reordered struct
+— and the one that is easy to miss, **a field appended to one of the caller-allocated options
+structs**. The caller allocates those (`oxia_put_options options = {0}`), so a library that knows
+about a longer struct would read past the end of what an older caller gave it. A new error code
+does not, by itself — `OXIA_ERR_QUEUE_FULL` was appended without a bump — since an older caller
+simply does not recognize it.
+
 The number only has to move once a binary has been published, because before that there is
-nothing in the wild to be incompatible with. Changes that land before the first release share
-whatever version it ships as. `oxia_version_string()` is the crate's own version, which moves for every release whether
-the ABI changed or not; report it in diagnostics, do not gate on it.
-
-What bumps `OXIA_ABI_VERSION`: a changed signature, a renumbered error code, a reordered struct
-— and the one that is easy to miss, **a field appended to one of the caller-allocated options
-structs**. The caller allocates those (`oxia_put_options options = {0}`), so a library that knows
-about a longer struct would read past the end of what an older caller gave it. Version 2 is that
-case: `max_in_flight_bytes` mirrored into `oxia_client_options` grew the struct, and the number
-moved with it. A new error code does not, by itself — `OXIA_ERR_QUEUE_FULL` was appended in the
-same version — since an older caller simply does not recognize it.
-
-This is also why the release does not yet publish version-pinned binaries: the first one it
-publishes is the one wrapper SDKs pin to.
-
-## Versioning
-
-Two numbers, for two different jobs.
-
-`OXIA_ABI_VERSION` is a constant in the header and `oxia_abi_version()` returns what the library
-was built with. A caller that loads the library separately from the header it compiled against —
-which is every wrapper SDK shipping a prebuilt binary — compares them before its first call:
-
-```c
-if (oxia_abi_version() != OXIA_ABI_VERSION) {
-    fprintf(stderr, "liboxia_client_ffi is ABI %u, this build expects %u\n",
-            oxia_abi_version(), OXIA_ABI_VERSION);
-    return 1;
-}
-```
-
-Exact equality, not "at least": while this ABI is pre-1.0 there is no compatibility window to
-rely on. `oxia_version_string()` is the crate's own version, which moves for every release whether
-the ABI changed or not; report it in diagnostics, do not gate on it.
-
-What bumps `OXIA_ABI_VERSION`: a changed signature, a renumbered error code, a reordered struct
-— and the one that is easy to miss, **a field appended to one of the caller-allocated options
-structs**. The caller allocates those (`oxia_put_options options = {0}`), so a library that knows
-about a longer struct would read past the end of what an older caller gave it. The client's
-`max_in_flight_bytes` cap is a live example: mirroring it into `oxia_client_options` grows that
-struct, so it waits for a bump rather than going in quietly.
-
-This is also why the release does not yet publish version-pinned binaries: the first one it
-publishes is the one wrapper SDKs pin to.
+nothing in the wild to be incompatible with. Every change up to the first release shares the
+version that release ships, ABI 1 — `max_in_flight_bytes` appended to `oxia_client_options` is
+one of them, and it grew that struct without moving the number. From the first published archive
+on, that reasoning stops applying: the same change made later moves it.
 
 ## Getting it
 
