@@ -247,6 +247,36 @@ same version — since an older caller simply does not recognize it.
 This is also why the release does not yet publish version-pinned binaries: the first one it
 publishes is the one wrapper SDKs pin to.
 
+## Versioning
+
+Two numbers, for two different jobs.
+
+`OXIA_ABI_VERSION` is a constant in the header and `oxia_abi_version()` returns what the library
+was built with. A caller that loads the library separately from the header it compiled against —
+which is every wrapper SDK shipping a prebuilt binary — compares them before its first call:
+
+```c
+if (oxia_abi_version() != OXIA_ABI_VERSION) {
+    fprintf(stderr, "liboxia_client_ffi is ABI %u, this build expects %u\n",
+            oxia_abi_version(), OXIA_ABI_VERSION);
+    return 1;
+}
+```
+
+Exact equality, not "at least": while this ABI is pre-1.0 there is no compatibility window to
+rely on. `oxia_version_string()` is the crate's own version, which moves for every release whether
+the ABI changed or not; report it in diagnostics, do not gate on it.
+
+What bumps `OXIA_ABI_VERSION`: a changed signature, a renumbered error code, a reordered struct
+— and the one that is easy to miss, **a field appended to one of the caller-allocated options
+structs**. The caller allocates those (`oxia_put_options options = {0}`), so a library that knows
+about a longer struct would read past the end of what an older caller gave it. The client's
+`max_in_flight_bytes` cap is a live example: mirroring it into `oxia_client_options` grows that
+struct, so it waits for a bump rather than going in quietly.
+
+This is also why the release does not yet publish version-pinned binaries: the first one it
+publishes is the one wrapper SDKs pin to.
+
 ## Building
 
 ```bash
