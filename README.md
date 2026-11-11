@@ -28,7 +28,7 @@ other languages.
 
 ```toml
 [dependencies]
-oxia-client = "0.2"
+oxia-client = "0.3"
 compio = { version = "0.19", features = ["macros"] }
 ```
 
@@ -96,7 +96,7 @@ Oxia's main branch). It does **not** support the legacy `io.streamnative.oxia.pr
 
 | `oxia-client` | Oxia server | Rust toolchain | Runtime |
 |---|---|---|---|
-| 0.2.x | serves `io.oxia.proto.v1` (recent releases) | 1.99+ (edition 2024) | compio 0.19, single-threaded |
+| 0.2.x – 0.3.x | serves `io.oxia.proto.v1` (recent releases) | 1.99+ (edition 2024) | compio 0.19, single-threaded |
 | 0.1.x | serves `io.oxia.proto.v1` (recent releases) | 1.85+ (edition 2024) | Tokio |
 
 ## Crates
