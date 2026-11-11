@@ -558,8 +558,8 @@ mod tests {
         let mut version: *mut c_char = ptr::null_mut();
         unsafe { oxia_version_string(&mut version) };
         let text = unsafe { CStr::from_ptr(version) }.to_str().unwrap();
-        // The client's version, not this shim's: the shim has `release =
-        // false` in release-plz.toml, so its own version never moves.
+        // The client's version, not this shim's: the shim is not published
+        // and not released, so its own version never moves.
         assert_eq!(text, oxia::VERSION);
         assert_ne!(text, "");
         unsafe { oxia_string_free(version) };
