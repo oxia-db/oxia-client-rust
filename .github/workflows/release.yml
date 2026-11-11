@@ -127,11 +127,6 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # The published baseline may predate the protox migration and still
-      # build-depend on protoc; the current tree does not need it.
-      - name: Install protobuf compiler (for the published baseline)
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       # Now that the manifest carries the version being released, this asks
       # the question that matters: is this bump big enough for the API change
       # since the last published release? A tag of v0.2.1 over a breaking
