@@ -29,10 +29,22 @@ The [`Release-plz`](./.github/workflows/release-plz.yml) workflow runs on every 
    gh release edit vX.Y.Z --title "oxia-client X.Y.Z" --notes-file notes.md
    ```
 
-Only `oxia-client` is released. The `oxia-client-ffi` shim and the `oxia-perf` tool are internal:
-both have `release = false` in [`release-plz.toml`](./release-plz.toml), so release-plz never
-bumps, publishes, tags, or creates a GitHub Release for them (`oxia-perf` also has
-`publish = false`).
+4. **Attach the FFI binaries.** A final job builds `oxia-client-ffi` for every supported platform
+   and uploads the archives to the release that was just cut — see
+   [`ffi-binaries.yml`](./.github/workflows/ffi-binaries.yml). It is a job of the *same* workflow
+   run rather than a workflow triggered by the release, for the reason noted below: a release
+   created with `GITHUB_TOKEN` does not start new workflow runs, so an `on: release` workflow
+   would never fire.
+
+Only `oxia-client` is released to crates.io. The `oxia-client-ffi` shim and the `oxia-perf` tool
+have `release = false` in [`release-plz.toml`](./release-plz.toml), so release-plz never bumps,
+publishes, tags, or creates a GitHub Release for them (`oxia-perf` also has `publish = false`).
+
+`oxia-client-ffi` is nonetheless *distributed*, as the archives attached to each release: it is
+the core other language SDKs are driven from, and requiring every wrapper author to have a Rust
+toolchain and a matching MSRV is the friction that stops wrappers being written. The archives are
+versioned by the release tag, not by the crate's own version, and each one records the ABI version
+of the header it ships so a caller can tell which ABI it speaks without unpacking it.
 
 ## Required setup (one-time)
 

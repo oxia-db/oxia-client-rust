@@ -1,0 +1,213 @@
+# Copyright 2025-2026 The Oxia Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Builds `oxia-client-ffi` for each supported platform and, on a release,
+# attaches the archives to it.
+#
+# `oxia-client-ffi` is `publish = false`, so these archives are the only way
+# to get it without a Rust toolchain — which is the whole point: a wrapper SDK
+# in Python, Node, C++ or C# should not need one, nor a matching MSRV.
+#
+# Called from release-plz.yml with a `tag`, which is when the archives are
+# uploaded. On a pull request that touches the crate it builds the same matrix
+# and keeps the archives as run artifacts instead, so a platform that stops
+# building is found then rather than on release day.
+name: FFI binaries
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag to attach the archives to.
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: An existing release tag to attach the archives to. Leave empty to build only.
+        type: string
+        required: false
+  pull_request:
+    branches: [main]
+    paths:
+      - oxia-client-ffi/**
+      - oxia-client/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/ffi-binaries.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      # Only the "Attach to the release" step uses this, and only when a tag
+      # was passed; every other trigger keeps the archives as run artifacts.
+      contents: write
+    strategy:
+      # One platform failing should not hide the state of the others.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          # musl for callers that want to link statically, or to run on a
+          # distribution whose glibc is older than the runner's.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+            musl: true
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The gnu targets are built on the oldest runner still supported, so the
+      # shared library does not require a newer glibc than a caller's
+      # distribution has. Ubuntu 22.04 is glibc 2.35.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # `ring`, which the default `tls` feature pulls in, compiles C for the
+      # target, so musl needs its toolchain.
+      - name: Install the musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        env:
+          # musl-gcc is the linker and the C compiler for both musl targets;
+          # cc-rs reads the target-specific variable.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build -p oxia-client-ffi --release --target ${{ matrix.target }}
+
+      # The header is checked in and CI already fails if it is stale, so it is
+      # shipped as-is rather than regenerated here.
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.tag || github.event.inputs.tag || github.sha }}"
+          name="oxia-client-ffi-${version}-${{ matrix.target }}"
+          staging="$RUNNER_TEMP/$name"
+          mkdir -p "$staging/lib" "$staging/include"
+
+          built="target/${{ matrix.target }}/release"
+          # A cdylib is .so on Linux and .dylib on macOS; both ship with the
+          # staticlib, for callers that would rather link it in.
+          for artifact in liboxia_client_ffi.so liboxia_client_ffi.dylib liboxia_client_ffi.a; do
+            if [ -f "$built/$artifact" ]; then
+              cp "$built/$artifact" "$staging/lib/"
+            fi
+          done
+          if [ -z "$(ls -A "$staging/lib")" ]; then
+            echo "::error::no libraries were built for ${{ matrix.target }}"
+            exit 1
+          fi
+
+          cp oxia-client-ffi/oxia_client_ffi.h "$staging/include/"
+          cp oxia-client-ffi/README.md "$staging/"
+          cp LICENSE "$staging/"
+
+          # The ABI version the header declares, which is what a caller
+          # compares against oxia_abi_version() at run time. Recorded here so
+          # the archive says which ABI it speaks without being unpacked.
+          abi="$(sed -n 's/^#define OXIA_ABI_VERSION \([0-9]*\).*/\1/p' \
+            oxia-client-ffi/oxia_client_ffi.h | head -1)"
+          if [ -z "$abi" ]; then
+            echo "::error::could not read OXIA_ABI_VERSION from the header"
+            exit 1
+          fi
+          printf 'version: %s\ntarget: %s\nabi: %s\ncommit: %s\n' \
+            "$version" "${{ matrix.target }}" "$abi" "$GITHUB_SHA" > "$staging/BUILD-INFO"
+
+          tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" "$name"
+          ( cd "$RUNNER_TEMP" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+          {
+            echo "archive=$RUNNER_TEMP/$name.tar.gz"
+            echo "checksum=$RUNNER_TEMP/$name.tar.gz.sha256"
+            echo "name=$name"
+          } >> "$GITHUB_OUTPUT"
+          ls -l "$RUNNER_TEMP/$name.tar.gz"
+
+      # Proves the header and the library in the archive agree, on the
+      # platforms where this runner can run what it just built.
+      - name: Check the archive against its own header
+        if: "!matrix.musl && !contains(matrix.target, 'x86_64-apple')"
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/${{ steps.package.outputs.name }}"
+          cat > "$RUNNER_TEMP/abi.c" <<'EOF'
+          #include <stdio.h>
+          #include "oxia_client_ffi.h"
+          int main(void) {
+              if (oxia_abi_version() != OXIA_ABI_VERSION) {
+                  fprintf(stderr, "library is ABI %u, header says %u\n",
+                          oxia_abi_version(), OXIA_ABI_VERSION);
+                  return 1;
+              }
+              return 0;
+          }
+          EOF
+          cc -std=c11 -Wall -Wextra -Werror -I "$staging/include" \
+            -o "$RUNNER_TEMP/abi" "$RUNNER_TEMP/abi.c" \
+            -L "$staging/lib" -loxia_client_ffi
+          LD_LIBRARY_PATH="$staging/lib" DYLD_LIBRARY_PATH="$staging/lib" "$RUNNER_TEMP/abi"
+
+      - name: Upload as a run artifact
+        if: ${{ !inputs.tag && !github.event.inputs.tag }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: ${{ inputs.tag || github.event.inputs.tag }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.event.inputs.tag }}
+        run: |
+          gh release upload "$TAG" \
+            "${{ steps.package.outputs.archive }}" \
+            "${{ steps.package.outputs.checksum }}" \
+            --repo "$GITHUB_REPOSITORY" --clobber
