@@ -336,6 +336,23 @@ struct, so it waits for a bump rather than going in quietly.
 This is also why the release does not yet publish version-pinned binaries: the first one it
 publishes is the one wrapper SDKs pin to.
 
+## Getting it
+
+Each [release](https://github.com/oxia-db/oxia-client-rust/releases) carries a prebuilt archive
+per platform, so a wrapper SDK needs no Rust toolchain:
+
+| | |
+|---|---|
+| Linux | `x86_64` and `aarch64`, both glibc (built against 2.35) and musl |
+| macOS | `x86_64` and `aarch64` |
+
+Each `oxia-client-ffi-<tag>-<target>.tar.gz` holds `lib/` (the shared library and the static
+library), `include/oxia_client_ffi.h`, the licence, this README, and a `BUILD-INFO` naming the
+release, the target, the commit and **the ABI version of the header it ships** — so you can tell
+which ABI an archive speaks without unpacking it. A `.sha256` sits beside each archive.
+
+Windows is not built: nothing in this workspace is tested on it yet.
+
 ## Building
 
 ```bash
