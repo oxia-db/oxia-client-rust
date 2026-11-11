@@ -568,8 +568,8 @@ typedef struct oxia_version {
   int64_t session_id;
   /**
    * The identity of the client that last wrote the record — the one it
-   * set as `identity`, or a generated id. Reported for every record, not
-   * only for ephemeral ones; `data` is `NULL` when the server sent none.
+   * set as `identity`, or a generated id. Recorded for ephemeral records
+   * only; `data` is `NULL` for every other record.
    */
   struct oxia_bytes client_identity;
 } oxia_version;

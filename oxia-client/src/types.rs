@@ -39,6 +39,7 @@ pub struct Version {
     /// The identifier of the owning session, when the record is ephemeral.
     pub session_id: Option<i64>,
     /// The identity of the client that last modified an ephemeral record.
+    /// It is `None` for non-ephemeral records.
     pub client_identity: Option<String>,
 }
 

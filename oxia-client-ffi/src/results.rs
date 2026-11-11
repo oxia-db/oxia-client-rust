@@ -42,8 +42,8 @@ pub struct oxia_version {
     /// The owning session, meaningful only when `is_ephemeral` is true.
     pub session_id: i64,
     /// The identity of the client that last wrote the record — the one it
-    /// set as `identity`, or a generated id. Reported for every record, not
-    /// only for ephemeral ones; `data` is `NULL` when the server sent none.
+    /// set as `identity`, or a generated id. Recorded for ephemeral records
+    /// only; `data` is `NULL` for every other record.
     pub client_identity: oxia_bytes,
 }
 

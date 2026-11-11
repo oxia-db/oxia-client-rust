@@ -561,6 +561,52 @@ async fn test_concurrent_ephemeral_puts_share_one_session() {
     client.close().await.unwrap();
 }
 
+/// The client identity is recorded on ephemeral records only: a plain put
+/// must not carry one, and overwriting an ephemeral record with a
+/// non-ephemeral put clears both the session and the identity.
+#[compio::test]
+async fn test_client_identity_is_only_set_on_ephemeral_records() {
+    let (_container, address) = start_oxia().await;
+    let client = OxiaClientBuilder::new()
+        .service_address(address)
+        .request_timeout(Duration::from_secs(10))
+        .identity("test-identity")
+        .build()
+        .await
+        .unwrap();
+
+    // A plain put records no identity.
+    let put = client.put("identity/plain", "v1").await.unwrap();
+    assert!(!put.version.is_ephemeral());
+    assert_eq!(put.version.client_identity, None);
+    let got = client.get("identity/plain").await.unwrap();
+    assert_eq!(got.version.client_identity, None);
+
+    // An ephemeral put does.
+    let put = client.put("identity/eph", "v1").ephemeral().await.unwrap();
+    assert!(put.version.is_ephemeral());
+    assert_eq!(
+        put.version.client_identity.as_deref(),
+        Some("test-identity")
+    );
+    let got = client.get("identity/eph").await.unwrap();
+    assert!(got.version.is_ephemeral());
+    assert_eq!(
+        got.version.client_identity.as_deref(),
+        Some("test-identity")
+    );
+
+    // Overwriting it with a non-ephemeral put drops both.
+    let put = client.put("identity/eph", "v2").await.unwrap();
+    assert!(!put.version.is_ephemeral());
+    assert_eq!(put.version.client_identity, None);
+    let got = client.get("identity/eph").await.unwrap();
+    assert!(!got.version.is_ephemeral());
+    assert_eq!(got.version.client_identity, None);
+
+    client.close().await.unwrap();
+}
+
 // ============================================================
 // Multiple Records / Batch Tests
 // ============================================================

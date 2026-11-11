@@ -401,13 +401,8 @@ fn a_version_crosses_over_whole() {
     assert!(version.modified_timestamp >= version.created_timestamp);
     assert!(!version.is_ephemeral);
     assert_eq!(version.session_id, 0);
-    // The server reports the writer's identity on every record, not only on
-    // ephemeral ones; this client did not set one, so it is the generated id.
-    assert!(
-        !unsafe { owned(version.client_identity) }
-            .unwrap()
-            .is_empty()
-    );
+    // The writer's identity is recorded for ephemeral records only.
+    assert_eq!(unsafe { owned(version.client_identity) }, None);
     unsafe { oxia_get_result_free(result) };
     unsafe { oxia_client_free(client) };
 }
