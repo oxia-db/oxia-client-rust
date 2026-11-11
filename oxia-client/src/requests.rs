@@ -177,7 +177,10 @@ impl PutBuilder {
             ephemeral,
             ..
         } = self;
-        let identity = client.identity().to_string();
+        // The identity is sent only for ephemeral puts, matching the Go
+        // client: the server stores it on the record, so a non-ephemeral
+        // record must not come back carrying one.
+        let identity = ephemeral.then(|| client.identity().to_string());
         let value_size = value.len();
         let start = std::time::Instant::now();
         // Re-resolve the shard and (for ephemeral puts) its session on each
@@ -203,7 +206,7 @@ impl PutBuilder {
                             value,
                             expected_version_id,
                             session_id,
-                            client_identity: Some(identity),
+                            client_identity: identity,
                             partition_key,
                             sequence_key_delta: sequence_key_deltas,
                             secondary_indexes,
