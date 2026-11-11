@@ -59,6 +59,8 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # Empty for every other target, which runs on the runner itself.
+    container: ${{ matrix.container }}
     permissions:
       # Only the "Attach to the release" step uses this, and only for a real
       # release: a rehearsal and a pull request both keep the archives as run
@@ -74,36 +76,46 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
           # musl for callers that want to link statically, or to run on a
-          # distribution whose glibc is older than the runner's.
+          # distribution whose glibc is older than the runner's. These build
+          # inside Alpine, where musl is the host libc: no cross toolchain,
+          # and no dependency on the Ubuntu mirrors, whose outages used to
+          # fail these two jobs before anything was compiled.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-22.04
-            musl: true
+            container: rust:1.99.1-alpine3.24
+            cargo_home: /usr/local/cargo
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-22.04-arm
-            musl: true
+            container: rust:1.99.1-alpine3.24
+            cargo_home: /usr/local/cargo
           - target: aarch64-apple-darwin
             runner: macos-15
           - target: x86_64-apple-darwin
             runner: macos-15
     steps:
+      # The image carries the Rust toolchain, gcc and musl-dev — everything
+      # the build itself needs, `ring`'s C included — but not what the actions
+      # around it assume: git for checkout, bash for the script steps, GNU tar
+      # and zstd for the cache, python3 for the version stamp. This runs
+      # before checkout, which needs the git it installs.
+      - name: Install what the actions need
+        if: matrix.container
+        # Explicitly sh: the default shell is the bash this step installs.
+        shell: sh
+        run: apk add --no-cache bash git python3 tar zstd
+
       - name: Checkout
         uses: actions/checkout@v4
 
       # The gnu targets are built on the oldest runner still supported, so the
       # shared library does not require a newer glibc than a caller's
-      # distribution has. Ubuntu 22.04 is glibc 2.35.
+      # distribution has. Ubuntu 22.04 is glibc 2.35. The musl targets take
+      # the toolchain from the container image instead.
       - name: Set up Rust
+        if: ${{ !matrix.container }}
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      # `ring`, which the default `tls` feature pulls in, compiles C for the
-      # target, so musl needs its toolchain.
-      - name: Install the musl toolchain
-        if: matrix.musl
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
 
       # The committed version is the `0.0.0-dev` placeholder and the tag is
       # what records a release's version, so stamp it in before building.
@@ -121,19 +133,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ${{ matrix.cargo_home || '~/.cargo' }}/registry
+            ${{ matrix.cargo_home || '~/.cargo' }}/git
             target
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build
-        env:
-          # musl-gcc is the linker and the C compiler for both musl targets;
-          # cc-rs reads the target-specific variable.
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CC_aarch64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build -p oxia-client-ffi --release --target ${{ matrix.target }}
 
       # The header is checked in and CI already fails if it is stale, so it is
@@ -178,7 +183,16 @@ jobs:
             "$version" "${{ matrix.target }}" "$abi" "$GITHUB_SHA" > "$staging/BUILD-INFO"
 
           tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" "$name"
-          ( cd "$RUNNER_TEMP" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+          # macOS has shasum but not sha256sum; Alpine has it the other way
+          # round. Both write the same `<hash>  <file>` line.
+          (
+            cd "$RUNNER_TEMP"
+            if command -v sha256sum > /dev/null; then
+              sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+            else
+              shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+            fi
+          )
           {
             echo "archive=$RUNNER_TEMP/$name.tar.gz"
             echo "checksum=$RUNNER_TEMP/$name.tar.gz.sha256"
@@ -187,9 +201,13 @@ jobs:
           ls -l "$RUNNER_TEMP/$name.tar.gz"
 
       # Proves the header and the library in the archive agree, on the
-      # platforms where this runner can run what it just built.
+      # platforms where this runner can run what it just built — which, now
+      # that musl builds natively in Alpine, is everything but the x86_64
+      # macOS archive cross-built on an arm64 runner. A musl archive carries
+      # only the static library, because the target links the crt statically
+      # and rustc drops the cdylib; `-loxia_client_ffi` links that instead.
       - name: Check the archive against its own header
-        if: "!matrix.musl && !contains(matrix.target, 'x86_64-apple')"
+        if: "!contains(matrix.target, 'x86_64-apple')"
         shell: bash
         run: |
           set -euo pipefail
