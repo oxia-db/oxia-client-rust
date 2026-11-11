@@ -1,0 +1,145 @@
+# Copyright 2025-2026 The Oxia Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Releases `oxia-client` when a `vX.Y.Z` tag is pushed. See RELEASING.md.
+#
+# The tag is the only place a release's version is written down: the committed
+# version is the `0.0.0-dev` placeholder, and the steps below stamp the tag's
+# version into the manifest before anything is built or published. So pushing
+# the tag is the whole release action — there is no version bump to land first
+# and no release PR to merge.
+#
+# A tag pushed by a person starts this run. That is why the FFI archives can
+# hang off a tag now: the previous arrangement had to build them inside the
+# same run that created the GitHub Release, because a release created with
+# GITHUB_TOKEN does not start new workflow runs.
+name: Release
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish
+    if: github.repository == 'oxia-db/oxia-client-rust'
+    runs-on: ubuntu-latest
+    permissions:
+      # To create the GitHub Release at the tag.
+      contents: write
+    outputs:
+      version: ${{ steps.stamp.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Releases come from `main`, which `ci.yml` has already tested: this run
+      # does not repeat the full suite. A tag on anything else is a mistake,
+      # and publishing to crates.io cannot be undone, so refuse it.
+      - name: Check the tag is on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not an ancestor of main; release only from main"
+            exit 1
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Rejects a tag that is not `vMAJOR.MINOR.PATCH`, so a mistyped tag
+      # fails here rather than publishing a version nobody meant.
+      - name: Stamp the version from the tag
+        id: stamp
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(python3 .github/scripts/stamp-version.py "$TAG")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "::notice::releasing oxia-client $version from $TAG"
+
+      - name: Check whether this version is already published
+        id: published
+        env:
+          VERSION: ${{ steps.stamp.outputs.version }}
+        run: |
+          set -euo pipefail
+          # `versions` lists every published version, yanked ones included: a
+          # yanked version cannot be re-uploaded either.
+          if curl -sS -A "oxia-client-rust-ci (github.com/oxia-db/oxia-client-rust)" \
+              https://crates.io/api/v1/crates/oxia-client \
+              | jq -e --arg v "$VERSION" '.versions // [] | any(.num == $v)' >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::oxia-client $VERSION is already on crates.io; skipping the publish"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The published baseline may predate the protox migration and still
+      # build-depend on protoc; the current tree does not need it.
+      - name: Install protobuf compiler (for the published baseline)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # Now that the manifest carries the version being released, this asks
+      # the question that matters: is this bump big enough for the API change
+      # since the last published release? A tag of v0.2.1 over a breaking
+      # change fails here, before anything reaches crates.io.
+      - name: Check the bump is big enough for the API change
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: oxia-client
+
+      - name: Publish to crates.io
+        if: steps.published.outputs.exists == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATE_TOKEN }}
+        # `--allow-dirty` because the stamped version is deliberately not
+        # committed; the tag is what records it.
+        run: cargo publish -p oxia-client --allow-dirty
+
+      # Empty on purpose: the notes are written by hand afterwards, and an
+      # existing release's notes are never overwritten by a re-run.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.stamp.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::the release for $TAG already exists; leaving it alone"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "oxia-client $VERSION" --notes "" --verify-tag
+          fi
+
+  # Build the FFI for every supported platform and attach the archives to the
+  # release. It stamps the same version in, so the library's
+  # `oxia_version_string()` agrees with the archive it ships in.
+  ffi-binaries:
+    name: FFI binaries
+    needs: publish
+    permissions:
+      contents: write
+    uses: ./.github/workflows/ffi-binaries.yml
+    with:
+      tag: ${{ github.ref_name }}
