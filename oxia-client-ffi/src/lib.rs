@@ -122,7 +122,7 @@ use mem::{optional_str, required_bytes, required_str};
 /// refuse to go on if they differ. Exact equality, not "at least": while
 /// this ABI is pre-1.0 there is no compatibility window to rely on.
 ///
-/// This is not the crate's version: see `oxia_version_string` for that,
+/// This is not the release's version: see `oxia_version_string` for that,
 /// which moves for every release whether the ABI changed or not.
 pub const OXIA_ABI_VERSION: u32 = 1;
 
@@ -395,9 +395,12 @@ pub unsafe extern "C" fn oxia_client_free(client: *mut oxia_client) {
     });
 }
 
-/// Writes this library's version, as `MAJOR.MINOR.PATCH`, to `out`.
+/// Writes the version of the `oxia-client` crate inside this library, as
+/// `MAJOR.MINOR.PATCH`, to `out`.
 ///
-/// Useful to a wrapper SDK that wants to report the core it is built on.
+/// Useful to a wrapper SDK that wants to report the core it is built on. It
+/// is the version of the release the library was built from, which is what
+/// the archive is named after; this shim is not versioned separately.
 /// The caller frees the string with `oxia_string_free`.
 ///
 /// # Safety
@@ -405,7 +408,7 @@ pub unsafe extern "C" fn oxia_client_free(client: *mut oxia_client) {
 /// `out` must be `NULL` or point at a writable `char *`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxia_version_string(out: *mut *mut c_char) {
-    guard_void(|| write_message(out, env!("CARGO_PKG_VERSION")));
+    guard_void(|| write_message(out, oxia::VERSION));
 }
 
 #[cfg(test)]
@@ -551,11 +554,14 @@ mod tests {
     }
 
     #[test]
-    fn the_version_string_is_the_crate_version() {
+    fn the_version_string_is_the_client_crate_version() {
         let mut version: *mut c_char = ptr::null_mut();
         unsafe { oxia_version_string(&mut version) };
         let text = unsafe { CStr::from_ptr(version) }.to_str().unwrap();
-        assert_eq!(text, env!("CARGO_PKG_VERSION"));
+        // The client's version, not this shim's: the shim has `release =
+        // false` in release-plz.toml, so its own version never moves.
+        assert_eq!(text, oxia::VERSION);
+        assert_ne!(text, "");
         unsafe { oxia_string_free(version) };
     }
 }
